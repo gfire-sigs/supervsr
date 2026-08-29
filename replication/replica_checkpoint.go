@@ -83,9 +83,10 @@ func (replica *Replica) afterCompact(entry *pipelineEntry) {
 		return
 	}
 	replica.checkpointTarget = target
+	replica.checkpointTargetRelease = replica.checkpointRelease(target)
 	entry.stage = CommitStageCheckpointData
 	entry.completion.prepare(entry.generation, replica)
-	result, err := replica.deps.StateMachine.StartCheckpoint(CheckpointInput{Op: target, Timestamp: prepareTimestamp(&entry.header), Release: replica.config.CurrentRelease}, &entry.completion)
+	result, err := replica.deps.StateMachine.StartCheckpoint(CheckpointInput{Op: target, Timestamp: prepareTimestamp(&entry.header), Release: replica.checkpointTargetRelease}, &entry.completion)
 	if err != nil {
 		replica.fail(errors.Join(ErrStateMachine, err))
 		return
@@ -195,7 +196,7 @@ func (replica *Replica) buildCheckpointState(candidate BlockCheckpointCandidate,
 		NewestManifestAddress: manifest.Newest.Address, SnapshotRootAddress: manifest.Root.Address,
 		LogicalStorageSize: logical, AcquiredTrailerEncodedSize: acquired.EncodedSize,
 		ReleasedTrailerEncodedSize: released.EncodedSize, SessionTrailerEncodedSize: sessions.EncodedSize,
-		ManifestBlockCount: manifest.BlockCount, Release: replica.config.CurrentRelease,
+		ManifestBlockCount: manifest.BlockCount, Release: replica.checkpointTargetRelease,
 	}
 	validation := CheckpointValidation{
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
@@ -225,6 +226,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		return
 	}
 	replica.checkpoint = replica.pendingCheckpoint
+	targetRelease := replica.checkpoint.Release
 	checkpointID, err := replica.checkpoint.ID()
 	if err != nil {
 		replica.fail(err)
@@ -233,9 +235,15 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 	replica.checkpointID = checkpointID
 	replica.checkpointSessionOp = 0
 	replica.checkpointTarget = 0
+	replica.checkpointTargetRelease = 0
 	replica.checkpointCandidate = BlockCheckpointCandidate{}
 	replica.pendingCheckpoint = CheckpointState{}
 	replica.checkpointManifest = CheckpointManifest{}
+	replica.upgradeWindow = upgradeWindow{}
+	if targetRelease != replica.config.CurrentRelease {
+		replica.beginReleaseActivation(targetRelease)
+		return
+	}
 	if replica.pendingView > replica.view {
 		target := replica.pendingView
 		replica.pendingView = 0
@@ -267,6 +275,7 @@ func (replica *Replica) yieldCheckpointToView(entry *pipelineEntry) {
 	replica.pendingView = 0
 	replica.abortCheckpointCandidate()
 	replica.checkpointTarget = 0
+	replica.checkpointTargetRelease = 0
 	replica.pendingCheckpoint = CheckpointState{}
 	replica.checkpointManifest = CheckpointManifest{}
 	entry.stage = CommitStageIdle

@@ -154,8 +154,8 @@ func (cfg ClusterConfig) Validate(activeCount, standbyCount uint8) error {
 	if cfg.TableCoalescingThresholdPercent == 0 || cfg.TableCoalescingThresholdPercent > 100 {
 		return invalid("TableCoalescingThresholdPercent", "must be between 1 and 100")
 	}
-	if cfg.ReleaseHistoryMax == 0 {
-		return invalid("ReleaseHistoryMax", "must be positive")
+	if cfg.ReleaseHistoryMax == 0 || cfg.ReleaseHistoryMax > uint64(^uint16(0)) || cfg.ReleaseHistoryMax*4 > maximumBody {
+		return invalid("ReleaseHistoryMax", "must fit the Ping body and uint16 count")
 	}
 	if cfg.StorageScansMax == 0 {
 		return invalid("StorageScansMax", "must be positive")

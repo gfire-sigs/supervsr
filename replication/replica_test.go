@@ -71,7 +71,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	}
 	processReplicaUntil(t, replica, 2)
 	applicationReply := bus.clientMessage(t, 2)
-	_, applicationBody, reason := protocol.DecodeFrame(applicationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	applicationHeader, applicationBody, reason := protocol.DecodeFrame(applicationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
 	if reason != protocol.RejectNone || string(applicationBody) != "reply:put" {
 		t.Fatalf("application reply reason=%v body=%q", reason, applicationBody)
 	}
@@ -91,6 +91,101 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	}
 	if machine.commits != 1 {
 		t.Fatalf("duplicate re-executed operation: commits=%d", machine.commits)
+	}
+	prepareHeader, found := wal.RecoveredHeader(2)
+	if !found {
+		t.Fatal("durable prepare header missing")
+	}
+	headersRequest := protocol.Header{Group: config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetHeaders, Author: 0}
+	binary.LittleEndian.PutUint64(headersRequest.Fields[:8], 1)
+	binary.LittleEndian.PutUint64(headersRequest.Fields[8:16], 2)
+	headersStart := bus.replicaCount()
+	if err := replica.Submit(makeReplicaCommand(t, pool, headersRequest, nil)); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaNetworkMessages(t, replica, bus, headersStart+1)
+	headers, headersBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, headersStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || headers.Command != protocol.CommandHeaders || len(headersBody) != 2*protocol.HeaderSize {
+		t.Fatalf("headers command=%d body=%d reason=%v", headers.Command, len(headersBody), reason)
+	}
+	prepareRequest := protocol.Header{Group: config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetPrepare, Author: 0}
+	copy(prepareRequest.Fields[:16], prepareHeader.HeaderChecksum[:])
+	binary.LittleEndian.PutUint64(prepareRequest.Fields[32:40], 2)
+	prepareStart := bus.replicaCount()
+	if err := replica.Submit(makeReplicaCommand(t, pool, prepareRequest, nil)); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaNetworkMessages(t, replica, bus, prepareStart+1)
+	repairedPrepare, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, prepareStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || repairedPrepare.Command != protocol.CommandPrepare || repairedPrepare.HeaderChecksum != prepareHeader.HeaderChecksum {
+		t.Fatalf("prepare repair=%+v reason=%v", repairedPrepare, reason)
+	}
+	replyRequest := protocol.Header{Group: config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetReply, Author: 0}
+	copy(replyRequest.Fields[:16], applicationHeader.HeaderChecksum[:])
+	copy(replyRequest.Fields[32:48], client[:])
+	binary.LittleEndian.PutUint64(replyRequest.Fields[48:56], 2)
+	if protocol.Checksum(replyRequest.Fields[:16]) != applicationHeader.HeaderChecksum || protocol.ClientID(replyRequest.Fields[32:48]) != client {
+		t.Fatal("GetReply wire identity fields reversed")
+	}
+	replyStart := bus.replicaCount()
+	if err := replica.Submit(makeReplicaCommand(t, pool, replyRequest, nil)); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaNetworkMessages(t, replica, bus, replyStart+1)
+	repairedReply, replyBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, replyStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || repairedReply.HeaderChecksum != applicationHeader.HeaderChecksum || string(replyBody) != "reply:put" {
+		t.Fatalf("reply repair=%+v body=%q reason=%v", repairedReply, replyBody, reason)
+	}
+	var metadata [96]byte
+	binary.LittleEndian.PutUint32(metadata[:4], 1)
+	binary.LittleEndian.PutUint32(metadata[4:8], 1)
+	binary.LittleEndian.PutUint32(metadata[8:12], 1)
+	address, ok := config.Cluster.BlockBase()
+	if !ok {
+		t.Fatal("block base overflow")
+	}
+	if err := storage.Resize(address + config.Cluster.BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	blockReference, err := replica.blocks.Write(address, 1, protocol.BlockValue, metadata, []byte{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockRequestBody [32]byte
+	copy(blockRequestBody[:16], blockReference.Checksum[:])
+	binary.LittleEndian.PutUint64(blockRequestBody[16:24], blockReference.Address)
+	blockRequest := protocol.Header{Group: config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetBlocks, Author: 0}
+	blockStart := bus.replicaCount()
+	if err := replica.Submit(makeReplicaCommand(t, pool, blockRequest, blockRequestBody[:])); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaNetworkMessages(t, replica, bus, blockStart+1)
+	repairedBlock, blockBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, blockStart), config.Group, uint32(config.Cluster.BlockSize), 1)
+	if reason != protocol.RejectNone || repairedBlock.HeaderChecksum != blockReference.Checksum || len(blockBody) != 1 || blockBody[0] != 7 {
+		t.Fatalf("block repair=%+v body=%x reason=%v", repairedBlock, blockBody, reason)
+	}
+	getView := protocol.Header{Group: config.Group, View: replica.view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetView, Author: 0}
+	getView.Fields[0] = 5
+	viewStart := bus.replicaCount()
+	if err := replica.Submit(makeReplicaCommand(t, pool, getView, nil)); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaNetworkMessages(t, replica, bus, viewStart+1)
+	view, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, viewStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || view.Command != protocol.CommandView || view.Fields[0] != 5 {
+		t.Fatalf("view response=%+v reason=%v", view, reason)
+	}
+	reconfigure := makeClientRequest(t, pool, config.Group, client, session, 2, replyContext(&applicationHeader), protocol.OperationReconfigure, reconfigurationBody(config.Membership, 0))
+	if err := replica.Submit(reconfigure); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaUntil(t, replica, 3)
+	_, reconfigurationReply, reason := protocol.DecodeFrame(bus.clientMessage(t, 4), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || len(reconfigurationReply) != 4 || ReconfigurationResult(binary.LittleEndian.Uint32(reconfigurationReply)) != ReconfigurationApplied {
+		t.Fatalf("reconfiguration reply=%x reason=%v", reconfigurationReply, reason)
+	}
+	if machine.commits != 1 {
+		t.Fatalf("reconfiguration reached application state machine: commits=%d", machine.commits)
 	}
 }
 
@@ -132,6 +227,19 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	if reason != protocol.RejectNone || pong.Command != protocol.CommandClientPong || binary.LittleEndian.Uint64(pong.Fields[:8]) != 99 || bus.clientDestination(0) != client {
 		t.Fatalf("pong=%+v reason=%v destination=%x", pong, reason, bus.clientDestination(0))
 	}
+	lagging := makeClientRequest(t, pool, config.Group, client, 1, 1, protocol.Checksum{1}, protocol.OperationApplicationMin, nil)
+	if err := replica.Submit(lagging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Process(64); err != nil {
+		t.Fatal(err)
+	}
+	if bus.clientCount() != 1 {
+		t.Fatalf("lagging replica evicted registered client: messages=%d", bus.clientCount())
+	}
+	replica.headOp = 1
+	replica.commitMin = 1
+	replica.commitMax = 1
 	request := makeClientRequest(t, pool, config.Group, client, 1, 1, protocol.Checksum{1}, protocol.OperationApplicationMin, nil)
 	if err := replica.Submit(request); err != nil {
 		t.Fatal(err)
@@ -361,6 +469,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 	session := protocol.Session(replyCommit(&registrationHeader))
 	parent := replyContext(&registrationHeader)
 	for requestNo := protocol.RequestNo(1); requestNo <= 110; requestNo++ {
+
 		request := makeClientRequest(t, pool, config.Group, client, session, requestNo, parent, protocol.OperationNoop, nil)
 		if err := replica.Submit(request); err != nil {
 			t.Fatal(err)
@@ -404,8 +513,44 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 	if reopenedSnapshot.Checkpoint.PrepareOp() != 95 || reopenedSnapshot.CommitMin != 111 {
 		t.Fatalf("reopened checkpoint: %+v", reopenedSnapshot)
 	}
+
 	if _, _, found := reopened.sessions.Reply(client, session, 110); !found {
 		t.Fatal("reopened session reply missing")
+	}
+}
+func makeReplicaCommand(t testing.TB, pool *protocol.FramePool, header protocol.Header, body []byte) *protocol.Frame {
+	t.Helper()
+	frame, err := pool.Acquire(uint32(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frameBody, err := frame.Body()
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(frameBody, body)
+	if err := frame.Seal(&header); err != nil {
+		t.Fatal(err)
+	}
+	return frame
+}
+func processReplicaNetworkMessages(t testing.TB, replica *Replica, bus *captureBus, messages int) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for bus.replicaCount() < messages {
+		if _, err := replica.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		if bus.replicaCount() >= messages {
+			return
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-replica.notify:
+		case <-deadline.C:
+			t.Fatalf("replica messages=%d, want %d", bus.replicaCount(), messages)
+		}
 	}
 }
 
@@ -622,6 +767,22 @@ func (bus *captureBus) replicaMessages() [][]byte {
 	messages := make([][]byte, len(bus.replicas))
 	copy(messages, bus.replicas)
 	return messages
+}
+
+func (bus *captureBus) replicaCount() int {
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	return len(bus.replicas)
+}
+
+func (bus *captureBus) replicaMessage(t testing.TB, index int) []byte {
+	t.Helper()
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	if index >= len(bus.replicas) {
+		t.Fatalf("replica message %d missing", index)
+	}
+	return append([]byte(nil), bus.replicas[index]...)
 }
 
 func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {

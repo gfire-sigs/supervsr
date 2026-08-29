@@ -208,6 +208,10 @@ func (engine *IOEngine) Available() int {
 	return engine.freeLen
 }
 
+func (engine *IOEngine) Drained() bool {
+	return engine.freeLen == len(engine.free)
+}
+
 func (engine *IOEngine) Ready() <-chan struct{} {
 	return engine.notify
 }

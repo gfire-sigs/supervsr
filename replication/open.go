@@ -28,13 +28,29 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if dependencies.Storage == nil || dependencies.MessageBus == nil || dependencies.Clock == nil || dependencies.Entropy == nil || dependencies.StateMachine == nil {
 		return nil, ErrInvalidConfiguration
 	}
+	releases, err := executableReleases(config, dependencies.ReleaseExecutor)
+	if err != nil {
+		return nil, err
+	}
 	validation := SuperblockValidation{
 		Group:                 config.Group,
 		Membership:            config.Membership,
 		ConfigurationChecksum: config.Cluster.Fingerprint(),
 		Cluster:               config.Cluster,
 	}
-	superblocks, err := OpenSuperblockStore(dependencies.Storage, validation)
+	superblocks, err := OpenSuperblockStore(dependencies.Storage, validation, func(durable Superblock) error {
+		target := durable.State.Checkpoint.Release
+		if target == config.CurrentRelease {
+			return nil
+		}
+		if dependencies.ReleaseExecutor == nil || !containsRelease(releases, target) {
+			return ErrReleaseUnavailable
+		}
+		if err := dependencies.ReleaseExecutor.Execute(target); err != nil {
+			return errors.Join(ErrReleaseUnavailable, err)
+		}
+		return ErrReleaseExecutorReturned
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -77,13 +93,14 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 		return nil, err
 	}
 	commitMin := durable.State.Checkpoint.PrepareOp()
+	var upgrades recoveredUpgradeState
 	if recovery.FaultySlots == 0 {
-		commitMin, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.CommitMax)
+		commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, durable.State.CommitMax)
 		if err != nil {
 			return nil, err
 		}
 	}
-	initial, err := deriveInitialState(config, durable, recovery, commitMin, wal, superblocks, memberCount)
+	initial, err := deriveInitialState(config, durable, recovery, commitMin, upgrades, wal, superblocks, memberCount)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +115,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	return replica, nil
 }
 
-func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryReport, commitMin protocol.Op, wal *WAL, superblocks *SuperblockStore, memberCount uint8) (ReplicaInitialState, error) {
+func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryReport, commitMin protocol.Op, upgrades recoveredUpgradeState, wal *WAL, superblocks *SuperblockStore, memberCount uint8) (ReplicaInitialState, error) {
 	status, view, durableView, logView, headOp, err := deriveRecoveredStatus(config, durable, recovery, wal, superblocks)
 	if err != nil {
 		return ReplicaInitialState{}, err
@@ -108,15 +125,17 @@ func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryR
 		return ReplicaInitialState{}, err
 	}
 	initial := ReplicaInitialState{
-		Status:      status,
-		View:        view,
-		DurableView: durableView,
-		LogView:     logView,
-		HeadOp:      commitMin,
-		CommitMin:   commitMin,
-		CommitMax:   durable.State.CommitMax,
-		Checkpoint:  durable.State.Checkpoint,
-		HeadHeader:  committedHeader,
+		Status:        status,
+		View:          view,
+		DurableView:   durableView,
+		LogView:       logView,
+		HeadOp:        commitMin,
+		CommitMin:     commitMin,
+		CommitMax:     durable.State.CommitMax,
+		Checkpoint:    durable.State.Checkpoint,
+		HeadHeader:    committedHeader,
+		upgradeTarget: upgrades.target,
+		upgradeWindow: upgrades.window,
 	}
 	if status == StatusRecoveringHead {
 		initial.HeadOp = headOp
@@ -198,36 +217,51 @@ func startOpenStateMachine(ctx context.Context, machine StateMachine, checkpoint
 	return completed.Err
 }
 
-func replayCommitted(ctx context.Context, config Config, machine StateMachine, wal *WAL, replies *ReplyStore, sessions *SessionTable, sink *startupCompletionSink, from, target protocol.Op) (protocol.Op, error) {
+func replayCommitted(
+	ctx context.Context,
+	config Config,
+	machine StateMachine,
+	wal *WAL,
+	replies *ReplyStore,
+	sessions *SessionTable,
+	sink *startupCompletionSink,
+	from protocol.Op,
+	checkpointRelease protocol.Release,
+	target protocol.Op,
+) (protocol.Op, recoveredUpgradeState, error) {
+	var upgrades recoveredUpgradeState
 	if target < from {
-		return from, ErrWALRecovery
+		return from, upgrades, ErrWALRecovery
 	}
 	prepareBuffer, err := NewAlignedBuffer(wal.Layout().PrepareStride, SectorSize)
 	if err != nil {
-		return from, err
+		return from, upgrades, err
 	}
 	replyFrame := make([]byte, int(config.Cluster.MessageSizeMax))
 	for op := from + 1; op <= target; op++ {
 		if err := ctx.Err(); err != nil {
-			return op - 1, err
+			return op - 1, upgrades, err
 		}
 		frame, err := wal.ReadPrepare(op, prepareBuffer)
 		if err != nil {
-			return op - 1, err
+			return op - 1, upgrades, err
 		}
 		header, body, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount)
 		if reason != protocol.RejectNone {
-			return op - 1, ErrWALRecovery
+			return op - 1, upgrades, ErrWALRecovery
+		}
+		if err := upgrades.observe(config.Cluster, from, checkpointRelease, header, body); err != nil {
+			return op - 1, upgrades, err
 		}
 		token, err := replayPrefetch(ctx, machine, sink, header, body)
 		if err != nil {
-			return op - 1, err
+			return op - 1, upgrades, err
 		}
 		if err := replayExecute(config, machine, replies, sessions, header, body, token, replyFrame); err != nil {
-			return op - 1, err
+			return op - 1, upgrades, err
 		}
 	}
-	return target, nil
+	return target, upgrades, nil
 }
 
 func replayPrefetch(ctx context.Context, machine StateMachine, sink *startupCompletionSink, header protocol.Header, body []byte) (PrefetchToken, error) {

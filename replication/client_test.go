@@ -16,7 +16,7 @@ func TestClientRegistrationRetryReplyAndEviction(t *testing.T) {
 	clock := &manualClientClock{sample: TimeSample{Wall: 1, Monotonic: 1}}
 	events := &clientEventRecorder{}
 	client := newTestClient(t, bus, clock, events)
-	defer client.Close()
+	defer requireClientClose(t, client)
 	if err := client.Register(); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestClientPingPongRaisesViewWithoutRequestResend(t *testing.T) {
 	bus := &clientCaptureBus{}
 	clock := &manualClientClock{sample: TimeSample{Wall: 1, Monotonic: 10}}
 	client := newTestClient(t, bus, clock, &clientEventRecorder{})
-	defer client.Close()
+	defer requireClientClose(t, client)
 	for range 3000 {
 		if err := client.Tick(); err != nil {
 			t.Fatal(err)
@@ -100,7 +100,7 @@ func TestClientReplyCallbackCanSubmit(t *testing.T) {
 	bus := &clientCaptureBus{}
 	events := &clientEventRecorder{}
 	client := newTestClient(t, bus, &manualClientClock{sample: TimeSample{Wall: 1, Monotonic: 1}}, events)
-	defer client.Close()
+	defer requireClientClose(t, client)
 	events.onReply = func(reply ClientReply) {
 		if reply.Operation == protocol.OperationRegister {
 			events.callbackErr = client.Submit(protocol.OperationApplicationMin, []byte("next"))
@@ -119,15 +119,26 @@ func TestClientReplyCallbackCanSubmit(t *testing.T) {
 	if events.callbackErr != nil || len(bus.frames) != 4 {
 		t.Fatalf("callback error=%v routes=%d", events.callbackErr, len(bus.frames))
 	}
-	if err := client.Submit(protocol.OperationApplicationMin, nil); !errors.Is(err, ErrClientInFlight) {
+	if err := client.Submit(protocol.OperationApplicationMin, nil); !errors.Is(err, ErrRequestInFlight) {
 		t.Fatalf("second submit error=%v", err)
 	}
+	next, _, reason := protocol.DecodeFrame(bus.frames[2], protocol.GroupID{1}, 4096, 3)
+	if reason != protocol.RejectNone {
+		t.Fatal(reason)
+	}
+	client.HandleFrame(0, makeClientReply(t, next, 2, 0, func([]byte) {}))
 }
 
 func BenchmarkClientTick(b *testing.B) {
 	client := newTestClient(b, discardClientBus{}, &manualClientClock{sample: TimeSample{Wall: 1, Monotonic: 1}}, &clientEventRecorder{})
-	defer client.Close()
 	if err := client.Register(); err != nil {
+		b.Fatal(err)
+	}
+	registration := client.inflight.header
+	client.HandleFrame(0, makeClientReply(b, registration, 1, 0, func(body []byte) {
+		binary.LittleEndian.PutUint32(body[:4], 1024)
+	}))
+	if err := client.Submit(protocol.OperationApplicationMin, nil); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
@@ -136,6 +147,43 @@ func BenchmarkClientTick(b *testing.B) {
 		if err := client.Tick(); err != nil {
 			b.Fatal(err)
 		}
+	}
+	b.StopTimer()
+	client.HandleFrame(0, makeClientReply(b, client.inflight.header, 2, 0, func([]byte) {}))
+	requireClientClose(b, client)
+}
+
+func TestClientClosePreservesInflightRequest(t *testing.T) {
+	bus := &clientCaptureBus{}
+	client := newTestClient(t, bus, &manualClientClock{sample: TimeSample{Wall: 1, Monotonic: 1}}, &clientEventRecorder{})
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); !errors.Is(err, ErrRequestInFlight) {
+		t.Fatalf("close error=%v", err)
+	}
+	for range 60 {
+		if err := client.Tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(bus.frames) != 4 || client.State() != ClientUnregistered {
+		t.Fatalf("close lost request: routes=%d state=%d", len(bus.frames), client.State())
+	}
+	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3)
+	if reason != protocol.RejectNone {
+		t.Fatal(reason)
+	}
+	client.HandleFrame(0, makeClientReply(t, registration, 1, 0, func(body []byte) {
+		binary.LittleEndian.PutUint32(body[:4], 1024)
+	}))
+	requireClientClose(t, client)
+}
+
+func requireClientClose(t testing.TB, client *Client) {
+	t.Helper()
+	if err := client.Close(); err != nil {
+		t.Errorf("close client: %v", err)
 	}
 }
 

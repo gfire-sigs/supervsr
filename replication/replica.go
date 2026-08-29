@@ -23,25 +23,28 @@ var (
 )
 
 type Dependencies struct {
-	Storage      Storage
-	MessageBus   MessageBus
-	Clock        Clock
-	Entropy      io.Reader
-	StateMachine StateMachine
-	Metrics      *ReplicaMetrics
-	Logger       *zerolog.Logger
+	Storage         Storage
+	MessageBus      MessageBus
+	Clock           Clock
+	Entropy         io.Reader
+	StateMachine    StateMachine
+	ReleaseExecutor ReleaseExecutor
+	Metrics         *ReplicaMetrics
+	Logger          *zerolog.Logger
 }
 
 type ReplicaInitialState struct {
-	Status      Status
-	View        protocol.View
-	DurableView protocol.View
-	LogView     protocol.View
-	HeadOp      protocol.Op
-	CommitMin   protocol.Op
-	CommitMax   protocol.Op
-	Checkpoint  CheckpointState
-	HeadHeader  protocol.Header
+	Status        Status
+	View          protocol.View
+	DurableView   protocol.View
+	LogView       protocol.View
+	HeadOp        protocol.Op
+	CommitMin     protocol.Op
+	CommitMax     protocol.Op
+	Checkpoint    CheckpointState
+	HeadHeader    protocol.Header
+	upgradeTarget protocol.Release
+	upgradeWindow upgradeWindow
 }
 
 type CommitStage uint8
@@ -116,6 +119,20 @@ type joinRecord struct {
 	count      uint8
 }
 
+type repairWrite struct {
+	busy    bool
+	handle  IOHandle
+	message *Message
+	op      protocol.Op
+}
+
+type upgradeWindow struct {
+	checkpoint protocol.Op
+	target     protocol.Release
+	valid      bool
+	started    bool
+}
+
 type Replica struct {
 	config     Config
 	membership Membership
@@ -125,59 +142,84 @@ type Replica struct {
 	logger     zerolog.Logger
 	metrics    *ReplicaMetrics
 
-	status               Status
-	view                 protocol.View
-	durableView          protocol.View
-	logView              protocol.View
-	headOp               protocol.Op
-	commitMin            protocol.Op
-	commitMax            protocol.Op
-	checkpoint           CheckpointState
-	checkpointID         protocol.CheckpointID
-	headChecksum         protocol.Checksum
-	lastPrepareTimestamp uint64
-	lastCommitTimestamp  uint64
-	lastPrimaryCommit    uint64
-	failureDetector      FailureDetector
-	timers               replicaTimers
-	random               DeterministicRandom
-	checkpointSession    []byte
-	checkpointSessionOp  protocol.Op
-	checkpointTarget     protocol.Op
-	checkpointManifest   CheckpointManifest
-	checkpointCandidate  BlockCheckpointCandidate
-	pendingCheckpoint    CheckpointState
+	status                  Status
+	view                    protocol.View
+	durableView             protocol.View
+	logView                 protocol.View
+	headOp                  protocol.Op
+	commitMin               protocol.Op
+	commitMax               protocol.Op
+	checkpoint              CheckpointState
+	checkpointID            protocol.CheckpointID
+	headChecksum            protocol.Checksum
+	lastPrepareTimestamp    uint64
+	lastCommitTimestamp     uint64
+	lastPrimaryCommit       uint64
+	failureDetector         FailureDetector
+	timers                  replicaTimers
+	random                  DeterministicRandom
+	checkpointSession       []byte
+	checkpointSessionOp     protocol.Op
+	checkpointTarget        protocol.Op
+	checkpointTargetRelease protocol.Release
+	checkpointManifest      CheckpointManifest
+	checkpointCandidate     BlockCheckpointCandidate
+	pendingCheckpoint       CheckpointState
 
-	wal              *WAL
-	replies          *ReplyStore
-	superblocks      *SuperblockStore
-	sessions         *SessionTable
-	blocks           *BlockStore
-	trailers         *TrailerStore
-	blockAllocator   *BlockAllocator
-	io               *IOEngine
-	frames           *protocol.FramePool
-	events           *MPSCRing[replicaEvent]
-	notify           chan struct{}
-	pipeline         []pipelineEntry
-	pipelineHead     uint32
-	pipelineLen      uint32
-	requestQueue     []queuedRequest
-	requestHead      uint32
-	requestLen       uint32
-	duplicateReads   []duplicateRead
-	stage            CommitStage
-	stageGeneration  uint64
-	exitViewBits     uint16
-	joins            []joinRecord
-	joinHeaders      []protocol.Header
-	canonicalHeaders []protocol.Header
-	viewIO           IOHandle
-	viewInstall      bool
-	pendingView      protocol.View
-	viewCommit       protocol.Op
-	viewHead         protocol.Op
-	joinViewBits     uint16
+	wal                    *WAL
+	replies                *ReplyStore
+	superblocks            *SuperblockStore
+	sessions               *SessionTable
+	blocks                 *BlockStore
+	trailers               *TrailerStore
+	blockAllocator         *BlockAllocator
+	io                     *IOEngine
+	frames                 *protocol.FramePool
+	events                 *MPSCRing[replicaEvent]
+	notify                 chan struct{}
+	pipeline               []pipelineEntry
+	pipelineHead           uint32
+	pipelineLen            uint32
+	requestQueue           []queuedRequest
+	requestHead            uint32
+	requestLen             uint32
+	duplicateReads         []duplicateRead
+	repairReads            []repairRead
+	stage                  CommitStage
+	stageGeneration        uint64
+	exitViewBits           uint16
+	joins                  []joinRecord
+	joinHeaders            []protocol.Header
+	canonicalHeaders       []protocol.Header
+	viewIO                 IOHandle
+	viewInstall            bool
+	pendingView            protocol.View
+	viewCommit             protocol.Op
+	viewHead               protocol.Op
+	repairBudget           journalRepairBudget
+	repairHeader           protocol.Header
+	repairHeaderValid      bool
+	repairWrite            repairWrite
+	repairHeadersLast      uint64
+	getViewNonce           protocol.Nonce
+	getViewLast            uint64
+	repairViewValid        bool
+	repairView             protocol.View
+	repairViewCommit       protocol.Op
+	repairViewHead         protocol.Op
+	repairViewAncestor     protocol.Op
+	repairViewRebuilt      bool
+	repairViewCount        int
+	repairFrames           []*Message
+	releaseHistory         []protocol.Release
+	releaseReports         []releaseReport
+	upgradeTarget          protocol.Release
+	upgradeWindow          upgradeWindow
+	releaseActivation      protocol.Release
+	releaseReset           SMCompletion
+	releaseResetGeneration uint64
+	releaseResetDone       bool
+	joinViewBits           uint16
 
 	accepting          atomic.Bool
 	submitters         atomic.Int64
@@ -218,6 +260,28 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if !ok {
 		return nil, ErrInvalidConfiguration
 	}
+	repairBudget, err := newJournalRepairBudget(config.Membership.ActiveCount, local)
+	if err != nil {
+		return nil, err
+	}
+	releases, err := executableReleases(config, dependencies.ReleaseExecutor)
+	if err != nil || !containsRelease(releases, initial.Checkpoint.Release) {
+		return nil, ErrReleaseUnavailable
+	}
+	if initial.upgradeTarget != 0 {
+		if initial.upgradeTarget <= config.CurrentRelease || !containsRelease(releases, initial.upgradeTarget) {
+			return nil, ErrWALRecovery
+		}
+		if initial.upgradeWindow.target != 0 && initial.upgradeWindow.target != initial.upgradeTarget {
+			return nil, ErrWALRecovery
+		}
+	}
+	releaseReports := make([]releaseReport, int(config.Membership.ActiveCount))
+	releaseStorage := make([]protocol.Release, int(config.Cluster.ReleaseHistoryMax)*len(releaseReports))
+	for index := range releaseReports {
+		start := index * int(config.Cluster.ReleaseHistoryMax)
+		releaseReports[index].releases = releaseStorage[start : start+int(config.Cluster.ReleaseHistoryMax)]
+	}
 	if blocks == nil {
 		var err error
 		blocks, err = openBlockRuntime(dependencies.Storage, config, initial.Checkpoint)
@@ -242,7 +306,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if err != nil {
 		return nil, err
 	}
-	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + 4
+	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + 4
 	ioEngine, err := NewIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)))
 	if err != nil {
 		return nil, err
@@ -274,6 +338,22 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	for index := range duplicateReads {
 		start := uint64(index) * wal.Layout().ReplyStride
 		duplicateReads[index].buffer = duplicateStorage[start : start+wal.Layout().ReplyStride]
+	}
+	repairStride := max(wal.Layout().PrepareStride, config.Cluster.BlockSize)
+	repairBytes, ok := checkedMul(repairStride, uint64(config.Process.RepairReadsMax))
+	if !ok {
+		_ = ioEngine.Close(context.Background())
+		return nil, ErrInvalidConfiguration
+	}
+	repairStorage, err := NewAlignedBuffer(repairBytes, SectorSize)
+	if err != nil {
+		_ = ioEngine.Close(context.Background())
+		return nil, err
+	}
+	repairReads := make([]repairRead, int(config.Process.RepairReadsMax))
+	for index := range repairReads {
+		start := uint64(index) * repairStride
+		repairReads[index].buffer = repairStorage[start : start+repairStride]
 	}
 	joins := make([]joinRecord, int(config.Membership.ActiveCount))
 	joinHeaders := make([]protocol.Header, int(config.Membership.ActiveCount)*int(config.Cluster.PipelineMax+1))
@@ -322,12 +402,21 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		pipeline:             make([]pipelineEntry, int(config.Cluster.PipelineMax)),
 		requestQueue:         make([]queuedRequest, int(config.Process.PrimaryRequestQueueMax)),
 		duplicateReads:       duplicateReads,
+		repairReads:          repairReads,
 		joins:                joins,
 		joinHeaders:          joinHeaders,
+		repairFrames:         make([]*Message, int(config.Cluster.PipelineMax+1)),
 		canonicalHeaders:     canonicalHeaders,
+		repairBudget:         repairBudget,
+		releaseHistory:       releases,
+		releaseReports:       releaseReports,
+		upgradeTarget:        initial.upgradeTarget,
+		upgradeWindow:        initial.upgradeWindow,
 		stop:                 make(chan struct{}),
 		done:                 make(chan struct{}),
 	}
+	replica.refreshLocalReleaseReport()
+	replica.maybeSelectUpgrade()
 	if err := replica.checkInvariants(); err != nil {
 		_ = ioEngine.Close(context.Background())
 		return nil, err
@@ -420,12 +509,19 @@ func (replica *Replica) Process(limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
+	if replica.releaseActivation != 0 {
+		return replica.processReleaseActivation(limit)
+	}
 	processed := 0
 	for processed < limit {
 		var completion IOCompletion
 		if replica.io.Poll(&completion) {
 			replica.handleIOCompletion(completion)
 			processed++
+			if replica.releaseActivation != 0 {
+				drained, err := replica.processReleaseActivation(limit - processed)
+				return processed + drained, err
+			}
 			continue
 		}
 		var event replicaEvent
@@ -443,6 +539,14 @@ func (replica *Replica) Process(limit int) (int, error) {
 			replica.fail(ErrReplicaInvariant)
 		}
 		processed++
+		if replica.releaseActivation != 0 {
+			drained, err := replica.processReleaseActivation(limit - processed)
+			return processed + drained, err
+		}
+	}
+	if replica.releaseActivation != 0 {
+		drained, err := replica.processReleaseActivation(limit - processed)
+		return processed + drained, err
 	}
 	replica.advanceCommit()
 	if replica.fatalErr != nil {
@@ -556,6 +660,16 @@ func (replica *Replica) releaseOwnedFrames() {
 		entry := replica.pipelineEntry(0)
 		replica.sessions.Abort(entry.replyPlan)
 		replica.popPipeline()
+	}
+	if replica.repairWrite.busy && replica.repairWrite.message != nil {
+		replica.repairWrite.message.Release()
+		replica.repairWrite = repairWrite{}
+	}
+	for index := range replica.repairFrames {
+		if replica.repairFrames[index] != nil {
+			replica.repairFrames[index].Release()
+			replica.repairFrames[index] = nil
+		}
 	}
 }
 

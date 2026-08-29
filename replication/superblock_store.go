@@ -21,9 +21,12 @@ type SuperblockStore struct {
 	buffer     []byte
 }
 
-func OpenSuperblockStore(storage Storage, validation SuperblockValidation) (*SuperblockStore, error) {
+func OpenSuperblockStore(storage Storage, validation SuperblockValidation, beforeRepair ...func(Superblock) error) (*SuperblockStore, error) {
 	if storage == nil || !protocol.HardwareChecksumAvailable() {
 		return nil, ErrHardwareChecksumUnavailable
+	}
+	if len(beforeRepair) > 1 || (len(beforeRepair) == 1 && beforeRepair[0] == nil) {
+		return nil, ErrInvalidConfiguration
 	}
 	minimumSize, ok := validation.Cluster.BlockBase()
 	if !ok {
@@ -83,6 +86,11 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation) (*Sup
 			return nil, errors.Join(ErrUnformatted, err)
 		}
 		return nil, errors.Join(ErrCorrupt, err)
+	}
+	if len(beforeRepair) == 1 {
+		if err := beforeRepair[0](selected.Superblock); err != nil {
+			return nil, err
+		}
 	}
 	store := &SuperblockStore{
 		storage:    storage,

@@ -11,7 +11,7 @@ import (
 
 var (
 	ErrClientState        = errors.New("replication: invalid client state")
-	ErrClientInFlight     = errors.New("replication: client request already in flight")
+	ErrRequestInFlight    = errors.New("replication: client request already in flight")
 	ErrClientBodyTooLarge = errors.New("replication: client request body exceeds negotiated limit")
 )
 
@@ -138,7 +138,7 @@ func (client *Client) Submit(operation protocol.Operation, body []byte) error {
 		return ErrClientState
 	}
 	if client.inflight.frame != nil {
-		return ErrClientInFlight
+		return ErrRequestInFlight
 	}
 	if len(body) > int(client.batchLimit) {
 		return ErrClientBodyTooLarge
@@ -355,14 +355,16 @@ func (client *Client) clearInflight() {
 	}
 	client.inflight = clientInflight{}
 }
-
-func (client *Client) Close() {
+func (client *Client) Close() error {
 	if client.state == ClientClosed {
-		return
+		return nil
 	}
-	client.clearInflight()
+	if client.inflight.frame != nil {
+		return ErrRequestInFlight
+	}
 	client.ping.Stop()
 	client.state = ClientClosed
+	return nil
 }
 
 func (client *Client) State() ClientState            { return client.state }

@@ -193,6 +193,14 @@ func (table *SessionTable) Reply(client protocol.ClientID, session protocol.Sess
 	return record.Reply, slot, true
 }
 
+func (table *SessionTable) RepairReply(client protocol.ClientID, op protocol.Op, checksum protocol.Checksum) (protocol.Header, uint32, bool) {
+	record, slot, found := table.lookup(client)
+	if !found || table.busy[slot] || replyOp(&record.Reply) != op || record.Reply.HeaderChecksum != checksum {
+		return protocol.Header{}, 0, false
+	}
+	return record.Reply, slot, true
+}
+
 func (table *SessionTable) Count() uint32 {
 	return table.count
 }

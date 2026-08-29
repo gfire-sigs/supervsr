@@ -2,6 +2,7 @@ package replication
 
 import (
 	"encoding/binary"
+	"errors"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
@@ -41,6 +42,10 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 	if replica.tickTimer(&replica.timers.pulse) {
 		replica.handlePulseTimeout(sample)
 		replica.timers.pulse.Reset()
+	}
+	if replica.tickTimer(&replica.timers.repair) {
+		replica.handleRepairTimeout(sample)
+		replica.timers.repair.Reset()
 	}
 }
 
@@ -97,6 +102,12 @@ func (replica *Replica) handlePulseTimeout(sample TimeSample) {
 	if replica.membership.ActiveCount > 1 && !sample.Synchronized {
 		return
 	}
+	if replica.upgradeTarget != 0 {
+		if err := replica.createUpgrade(sample); err != nil && !transientControlAdmission(err) {
+			replica.fail(err)
+		}
+		return
+	}
 	if replica.pipelineLen == uint32(len(replica.pipeline)) || !replica.deps.StateMachine.PulseNeeded(replica.lastPrepareTimestamp) {
 		return
 	}
@@ -105,9 +116,15 @@ func (replica *Replica) handlePulseTimeout(sample TimeSample) {
 			return
 		}
 	}
-	if err := replica.createPulse(sample); err != nil && err != ErrReplicaBackpressure && err != ErrIOBackpressure {
+	if err := replica.createPulse(sample); err != nil && !transientControlAdmission(err) {
 		replica.fail(err)
 	}
+}
+
+func transientControlAdmission(err error) bool {
+	return errors.Is(err, ErrReplicaBackpressure) ||
+		errors.Is(err, ErrIOBackpressure) ||
+		errors.Is(err, protocol.ErrFramePoolEmpty)
 }
 
 func (replica *Replica) sendPing(sample TimeSample) {
@@ -121,19 +138,22 @@ func (replica *Replica) sendPing(sample TimeSample) {
 		message.Release()
 		return
 	}
-	binary.LittleEndian.PutUint32(body[:4], uint32(replica.config.CurrentRelease))
+	for index, release := range replica.releaseHistory {
+		binary.LittleEndian.PutUint32(body[index*4:], uint32(release))
+	}
 	header := protocol.Header{Group: replica.config.Group, View: replica.durableView, Release: replica.config.CurrentRelease, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPing, Author: replica.local}
 	copy(header.Fields[:16], replica.checkpointID[:])
 	binary.LittleEndian.PutUint64(header.Fields[16:24], uint64(replica.checkpoint.PrepareOp()))
 	binary.LittleEndian.PutUint64(header.Fields[24:32], max(uint64(1), sample.Monotonic))
-	binary.LittleEndian.PutUint16(header.Fields[32:34], 1)
+	binary.LittleEndian.PutUint16(header.Fields[32:34], uint16(len(replica.releaseHistory)))
 	if message.Seal(&header) == nil {
 		replica.deps.MessageBus.BroadcastReplicas(message)
 	}
 	message.Release()
 }
 
-func (replica *Replica) handlePing(header protocol.Header) {
+func (replica *Replica) handlePing(header protocol.Header, body []byte) {
+	replica.observeReleaseReport(header, body)
 	message, err := replica.frames.Acquire(0)
 	if err != nil {
 		return

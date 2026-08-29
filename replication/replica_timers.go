@@ -10,6 +10,7 @@ type replicaTimers struct {
 	exit       Timeout
 	join       Timeout
 	pulse      Timeout
+	repair     Timeout
 }
 
 func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
@@ -21,6 +22,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		500 * time.Millisecond,
 		500 * time.Millisecond,
 		100 * time.Millisecond,
+		100 * time.Millisecond,
 	}
 	timers := replicaTimers{}
 	destinations := [...]*Timeout{
@@ -31,6 +33,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		&timers.exit,
 		&timers.join,
 		&timers.pulse,
+		&timers.repair,
 	}
 	for index := range periods {
 		timeout, err := NewTimeout(periods[index], process.Tick, 0)

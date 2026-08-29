@@ -18,21 +18,7 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.metrics.framesRejected.Add(1)
 		return false
 	}
-	context := protocol.ValidationContext{
-		Authenticated:           true,
-		Sender:                  header.Author,
-		ActiveCount:             replica.membership.ActiveCount,
-		MemberCount:             replica.membership.ActiveCount + replica.membership.StandbyCount,
-		PipelineMax:             uint8(replica.config.Cluster.PipelineMax),
-		ReleaseHistoryMax:       uint16(replica.config.Cluster.ReleaseHistoryMax),
-		ApplicationBatchSizeMax: uint32(replica.config.Cluster.ApplicationBatchSizeMax),
-		ApplicationReplySizeMax: uint32(replica.config.Cluster.ApplicationReplySizeMax),
-		RepairRequestsMax:       replica.config.Process.RepairRequestsMax,
-		CurrentRelease:          replica.config.CurrentRelease,
-		ClientReleaseMin:        replica.config.ClientReleaseMin,
-		Group:                   replica.config.Group,
-		MessageSizeMax:          uint32(replica.config.Cluster.MessageSizeMax),
-	}
+	context := replica.validationContext(header.Author)
 	if semanticReason := protocol.ValidateSemantics(&header, body, context); semanticReason != protocol.RejectNone {
 		if eviction, reflect := replica.invalidRequestEviction(header, body); reflect {
 			replica.sendEviction(requestClient(&header), eviction)
@@ -48,6 +34,9 @@ func (replica *Replica) handleMessage(message *Message) bool {
 	case protocol.CommandRequest:
 		return replica.handleRequest(message, header, body, sample)
 	case protocol.CommandPrepare:
+		if replica.handleRepairPrepare(message, header, sample) {
+			return true
+		}
 		return replica.handlePrepare(message, header, sample)
 	case protocol.CommandPrepareOK:
 		replica.handlePrepareOK(header)
@@ -59,14 +48,39 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.handleJoinView(header, body)
 	case protocol.CommandView:
 		replica.handleView(header, body)
+	case protocol.CommandHeaders:
+		replica.handleHeaders(body)
+	case protocol.CommandGetView:
+		replica.handleGetView(header)
+	case protocol.CommandGetHeaders:
+		replica.handleGetHeaders(header)
+	case protocol.CommandGetPrepare:
+		replica.handleGetPrepare(header)
+	case protocol.CommandGetReply:
+		replica.handleGetReply(header)
+	case protocol.CommandGetBlocks:
+		replica.handleGetBlocks(header, body)
 	case protocol.CommandClientPing:
 		replica.handleClientPing(header)
 	case protocol.CommandPing:
-		replica.handlePing(header)
+		replica.handlePing(header, body)
 	case protocol.CommandPong:
 		replica.handlePong(header, sample)
 	}
 	return false
+}
+
+func (replica *Replica) validationContext(sender protocol.ReplicaIndex) protocol.ValidationContext {
+	return protocol.ValidationContext{
+		Authenticated: true, Sender: sender,
+		ActiveCount: replica.membership.ActiveCount, MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
+		PipelineMax: uint8(replica.config.Cluster.PipelineMax), ReleaseHistoryMax: uint16(replica.config.Cluster.ReleaseHistoryMax),
+		ApplicationBatchSizeMax: uint32(replica.config.Cluster.ApplicationBatchSizeMax),
+		ApplicationReplySizeMax: uint32(replica.config.Cluster.ApplicationReplySizeMax),
+		RepairRequestsMax:       replica.config.Process.RepairRequestsMax,
+		CurrentRelease:          replica.config.CurrentRelease, ClientReleaseMin: replica.config.ClientReleaseMin,
+		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
+	}
 }
 
 func (replica *Replica) handleRequest(message *Message, header protocol.Header, body []byte, sample TimeSample) bool {
@@ -115,6 +129,11 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 			replica.metrics.clientForks.Add(1)
 			return false
 		case SessionNoSession:
+			session := protocol.Session(binary.LittleEndian.Uint64(header.Fields[48:56]))
+			if protocol.Op(session) > replica.commitMin {
+				replica.metrics.requestsDropped.Add(1)
+				return false
+			}
 			replica.sendEviction(client, protocol.EvictionNoSession)
 			return false
 		case SessionTooLow:
@@ -128,6 +147,10 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 			replica.metrics.requestsDropped.Add(1)
 			return false
 		}
+	}
+	if replica.upgradeTarget != 0 {
+		replica.metrics.requestsDropped.Add(1)
+		return false
 	}
 	if operation >= protocol.OperationApplicationMin {
 		result := replica.deps.StateMachine.Validate(ValidateInput{Operation: operation, Body: body})
@@ -281,9 +304,14 @@ func (replica *Replica) createPrepare(request protocol.Header, requestBody []byt
 		prepare.Release()
 		return err
 	}
-	if operation == protocol.OperationRegister {
+	switch operation {
+	case protocol.OperationRegister:
 		binary.LittleEndian.PutUint32(body[:4], uint32(replica.config.Cluster.ApplicationBatchSizeMax))
-	} else {
+	case protocol.OperationReconfigure:
+		copy(body, requestBody)
+		result := ValidateReconfiguration(body, replica.membership, 0)
+		binary.LittleEndian.PutUint32(body[252:], uint32(result))
+	default:
 		copy(body, requestBody)
 	}
 	timestamp := max(uint64(1), sample.Wall, replica.lastPrepareTimestamp+1, replica.lastCommitTimestamp+1)
@@ -366,6 +394,18 @@ func (replica *Replica) acceptPrepare(message *Message, header protocol.Header) 
 
 func (replica *Replica) handleIOCompletion(completion IOCompletion) {
 	if replica.handleViewPersistence(completion) {
+		return
+	}
+	for index := range replica.repairReads {
+		read := &replica.repairReads[index]
+		if !read.busy || read.handle != completion.Handle || completion.Kind != IORead {
+			continue
+		}
+		replica.finishRepairRead(read, completion)
+		return
+	}
+	if replica.repairWrite.busy && replica.repairWrite.handle == completion.Handle && completion.Kind == IOWALAppend {
+		replica.finishRepairWrite(completion)
 		return
 	}
 	for index := range replica.duplicateReads {
@@ -490,7 +530,10 @@ func (replica *Replica) handleCommit(header protocol.Header, sample TimeSample) 
 }
 
 func (replica *Replica) advanceCommit() {
-	if replica.status != StatusNormal || replica.pipelineLen == 0 || replica.fatalErr != nil {
+	recoveringCommit := replica.status == StatusRecoveringHead && replica.repairViewValid && replica.repairViewRebuilt
+	invalidStatus := replica.status != StatusNormal && !recoveringCommit
+	unavailable := replica.pipelineLen == 0 || replica.fatalErr != nil
+	if invalidStatus || unavailable {
 		return
 	}
 	entry := replica.pipelineEntry(0)
@@ -554,8 +597,14 @@ func (replica *Replica) executeEntry(entry *pipelineEntry) {
 	operation := prepareOperation(&entry.header)
 	client := prepareClient(&entry.header)
 	if client.IsZero() {
-		if operation == protocol.OperationPulse {
+		switch operation {
+		case protocol.OperationPulse:
 			if _, err := replica.commitApplication(entry, nil); err != nil {
+				replica.fail(err)
+				return
+			}
+		case protocol.OperationUpgrade:
+			if err := replica.executeUpgrade(entry); err != nil {
 				replica.fail(err)
 				return
 			}
@@ -585,6 +634,14 @@ func (replica *Replica) executeEntry(entry *pipelineEntry) {
 		replyLength = 64
 	case operation == protocol.OperationNoop:
 		replyLength = 0
+	case operation == protocol.OperationReconfigure:
+		frame, frameErr := entry.prepare.Bytes()
+		if frameErr != nil {
+			err = frameErr
+			break
+		}
+		copy(replyBody[:4], frame[protocol.HeaderSize+252:protocol.HeaderSize+256])
+		replyLength = 4
 	case operation >= protocol.OperationApplicationMin:
 		replyLength, err = replica.commitApplication(entry, replyBody)
 	default:
@@ -708,6 +765,7 @@ func (replica *Replica) finishCommit(entry *pipelineEntry) {
 	}
 	replica.lastCommitTimestamp = prepareTimestamp(&entry.header)
 	replica.metrics.operationsCommitted.Add(1)
+	replica.trackUpgradeWindow(entry)
 	replica.continueCommitMaintenance(entry)
 }
 
