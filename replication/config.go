@@ -127,8 +127,8 @@ func (cfg ClusterConfig) Validate(activeCount, standbyCount uint8) error {
 	if cfg.ApplicationBatchSizeMax == 0 || cfg.ApplicationBatchSizeMax > maximumBody {
 		return invalid("ApplicationBatchSizeMax", "must fit a frame body")
 	}
-	if cfg.ApplicationReplySizeMax > maximumBody {
-		return invalid("ApplicationReplySizeMax", "must fit a frame body")
+	if cfg.ApplicationReplySizeMax < 64 || cfg.ApplicationReplySizeMax > maximumBody {
+		return invalid("ApplicationReplySizeMax", "must be between 64 and the maximum frame body")
 	}
 	if cfg.SuperblockCopies != 4 && cfg.SuperblockCopies != 6 && cfg.SuperblockCopies != 8 {
 		return invalid("SuperblockCopies", "must be 4, 6, or 8")
@@ -326,6 +326,9 @@ func (cfg ProcessConfig) Validate(cluster ClusterConfig) error {
 	}
 	if cfg.Tick <= 0 || cfg.InitialRTT < cfg.Tick || cfg.MaximumRTT < cfg.InitialRTT {
 		return invalid("RTT", "require 0 < Tick <= InitialRTT <= MaximumRTT")
+	}
+	if cfg.Tick >= 50*time.Millisecond {
+		return invalid("Tick", "must be less than half the 100ms failure-detector minimum")
 	}
 	if cfg.RTTMultiplier == 0 {
 		return invalid("RTTMultiplier", "must be positive")

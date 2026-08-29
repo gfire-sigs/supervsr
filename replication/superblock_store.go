@@ -3,6 +3,7 @@ package replication
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
@@ -13,6 +14,7 @@ var (
 )
 
 type SuperblockStore struct {
+	mu         sync.Mutex
 	storage    Storage
 	validation SuperblockValidation
 	current    SuperblockCandidate
@@ -95,10 +97,14 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation) (*Sup
 }
 
 func (store *SuperblockStore) Current() Superblock {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	return store.current.Superblock
 }
 
 func (store *SuperblockStore) Persist(next Superblock) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
 	current := &store.current.Superblock
 	if next.Sequence != current.Sequence+1 || next.ParentChecksum != current.Checksum || durableStateRegressed(&current.State, &next.State) {
 		return ErrInvalidSuperblock

@@ -77,6 +77,7 @@ func TestClusterConfigurationRejectsInvalidBounds(t *testing.T) {
 			cfg.ApplicationReplySizeMax = 0
 		}},
 		{name: "zero batch", mutate: func(cfg *ClusterConfig) { cfg.ApplicationBatchSizeMax = 0 }},
+		{name: "small reply", mutate: func(cfg *ClusterConfig) { cfg.ApplicationReplySizeMax = 63 }},
 		{name: "large reply", mutate: func(cfg *ClusterConfig) { cfg.ApplicationReplySizeMax = cfg.MessageSizeMax }},
 		{name: "superblock copies", mutate: func(cfg *ClusterConfig) { cfg.SuperblockCopies = 5 }},
 		{name: "unaligned block", mutate: func(cfg *ClusterConfig) { cfg.BlockSize++ }},
@@ -116,6 +117,7 @@ func TestProcessConfigurationRejectsInvalidBounds(t *testing.T) {
 		mutate func(*ProcessConfig)
 	}{
 		{name: "zero tick", mutate: func(cfg *ProcessConfig) { cfg.Tick = 0 }},
+		{name: "slow tick", mutate: func(cfg *ProcessConfig) { cfg.Tick = 50 * time.Millisecond }},
 		{name: "RTT below tick", mutate: func(cfg *ProcessConfig) { cfg.InitialRTT = cfg.Tick / 2 }},
 		{name: "maximum RTT below initial", mutate: func(cfg *ProcessConfig) { cfg.MaximumRTT = cfg.InitialRTT / 2 }},
 		{name: "zero RTT multiplier", mutate: func(cfg *ProcessConfig) { cfg.RTTMultiplier = 0 }},

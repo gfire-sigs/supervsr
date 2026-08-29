@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+
+	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
 
 var (
@@ -20,6 +22,10 @@ const (
 	IOWrite
 	IOSync
 	IOResize
+	IOWALAppend
+	IOReplyWrite
+	IOReplyRead
+	IOSuperblockPersist
 )
 
 type IOHandle struct {
@@ -28,19 +34,27 @@ type IOHandle struct {
 }
 
 type IOOperation struct {
-	Kind   IOKind
-	Offset uint64
-	Buffer []byte
-	Size   uint64
+	Kind            IOKind
+	Offset          uint64
+	Buffer          []byte
+	Size            uint64
+	Context         uint64
+	WAL             *WAL
+	ReplyStore      *ReplyStore
+	ExpectedHeader  protocol.Header
+	SuperblockStore *SuperblockStore
+	Superblock      Superblock
+	ReusableThrough protocol.Op
 }
 
 type IOCompletion struct {
-	Handle IOHandle
-	Kind   IOKind
-	Offset uint64
-	Buffer []byte
-	Size   uint64
-	Err    error
+	Handle  IOHandle
+	Kind    IOKind
+	Offset  uint64
+	Buffer  []byte
+	Size    uint64
+	Context uint64
+	Err     error
 }
 
 const (
@@ -119,10 +133,22 @@ func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
 	if engine.freeLen == 0 {
 		return IOHandle{}, ErrIOBackpressure
 	}
-	if operation.Kind < IORead || operation.Kind > IOResize {
+	if operation.Kind < IORead || operation.Kind > IOSuperblockPersist {
 		return IOHandle{}, ErrIOHandle
 	}
 	if (operation.Kind == IORead || operation.Kind == IOWrite) && len(operation.Buffer) == 0 {
+		return IOHandle{}, ErrIOHandle
+	}
+	if operation.Kind == IOWALAppend && (operation.WAL == nil || len(operation.Buffer) == 0) {
+		return IOHandle{}, ErrIOHandle
+	}
+	replyOperation := operation.Kind == IOReplyWrite || operation.Kind == IOReplyRead
+	if replyOperation {
+		if operation.ReplyStore == nil || len(operation.Buffer) == 0 {
+			return IOHandle{}, ErrIOHandle
+		}
+	}
+	if operation.Kind == IOSuperblockPersist && operation.SuperblockStore == nil {
 		return IOHandle{}, ErrIOHandle
 	}
 	engine.freeLen--
@@ -163,11 +189,12 @@ func (engine *IOEngine) Poll(completion *IOCompletion) bool {
 			Index:      index,
 			Generation: slot.generation.Load(),
 		},
-		Kind:   slot.operation.Kind,
-		Offset: slot.operation.Offset,
-		Buffer: slot.operation.Buffer,
-		Size:   slot.operation.Size,
-		Err:    slot.err,
+		Kind:    slot.operation.Kind,
+		Offset:  slot.operation.Offset,
+		Buffer:  slot.operation.Buffer,
+		Size:    slot.operation.Size,
+		Context: slot.operation.Context,
+		Err:     slot.err,
 	}
 	slot.operation = IOOperation{}
 	slot.err = nil
@@ -206,7 +233,7 @@ func (engine *IOEngine) runWorker() {
 		if slot.state.CompareAndSwap(ioSlotCanceled, ioSlotRunning) {
 			slot.err = ErrIOCanceled
 		} else if slot.state.CompareAndSwap(ioSlotQueued, ioSlotRunning) {
-			slot.err = engine.execute(slot.operation)
+			slot.err = engine.execute(&slot.operation)
 		} else {
 			panic("replication: storage request entered worker twice")
 		}
@@ -221,7 +248,7 @@ func (engine *IOEngine) runWorker() {
 	}
 }
 
-func (engine *IOEngine) execute(operation IOOperation) error {
+func (engine *IOEngine) execute(operation *IOOperation) error {
 	switch operation.Kind {
 	case IORead:
 		return engine.storage.ReadAt(operation.Buffer, operation.Offset)
@@ -231,6 +258,16 @@ func (engine *IOEngine) execute(operation IOOperation) error {
 		return engine.storage.Sync()
 	case IOResize:
 		return engine.storage.Resize(operation.Size)
+	case IOWALAppend:
+		return operation.WAL.Append(operation.Buffer, operation.ReusableThrough)
+	case IOReplyWrite:
+		return operation.ReplyStore.Write(uint32(operation.Offset), operation.Buffer)
+	case IOReplyRead:
+		frame, err := operation.ReplyStore.Read(uint32(operation.Offset), operation.ExpectedHeader, operation.Buffer)
+		operation.Size = uint64(len(frame))
+		return err
+	case IOSuperblockPersist:
+		return operation.SuperblockStore.Persist(operation.Superblock)
 	default:
 		return ErrIOHandle
 	}

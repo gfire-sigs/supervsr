@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
@@ -93,6 +94,7 @@ type WALSlot struct {
 }
 
 type WAL struct {
+	mu            sync.Mutex
 	storage       Storage
 	config        ClusterConfig
 	group         protocol.GroupID
@@ -142,11 +144,9 @@ func (wal *WAL) Layout() WALLayout {
 	return wal.layout
 }
 
-func (wal *WAL) Slots() []WALSlot {
-	return wal.slots
-}
-
 func (wal *WAL) Append(frame []byte, reusableThrough protocol.Op) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
 	header, _, reason := protocol.DecodeFrame(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidWAL

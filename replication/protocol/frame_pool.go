@@ -94,6 +94,17 @@ func (frame *Frame) Body() ([]byte, error) {
 	return frame.buffer[HeaderSize:frame.size:frame.size], nil
 }
 
+func (frame *Frame) ResizeBody(bodySize uint32) error {
+	if frame.sealed.Load() || frame.refs.Load() != 1 {
+		return ErrFrameSealed
+	}
+	if uint64(bodySize)+HeaderSize > uint64(frame.pool.messageSizeMax) {
+		return ErrFrameTooLarge
+	}
+	frame.size = bodySize + HeaderSize
+	return nil
+}
+
 func (frame *Frame) Seal(header *Header) error {
 	if frame.sealed.Load() || frame.refs.Load() != 1 {
 		return ErrFrameSealed
