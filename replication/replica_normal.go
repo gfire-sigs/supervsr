@@ -33,7 +33,10 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		Group:                   replica.config.Group,
 		MessageSizeMax:          uint32(replica.config.Cluster.MessageSizeMax),
 	}
-	if protocol.ValidateSemantics(&header, body, context) != protocol.RejectNone {
+	if semanticReason := protocol.ValidateSemantics(&header, body, context); semanticReason != protocol.RejectNone {
+		if eviction, reflect := replica.invalidRequestEviction(header, body); reflect {
+			replica.sendEviction(requestClient(&header), eviction)
+		}
 		replica.metrics.framesRejected.Add(1)
 		return false
 	}
@@ -56,6 +59,8 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.handleJoinView(header, body)
 	case protocol.CommandView:
 		replica.handleView(header, body)
+	case protocol.CommandClientPing:
+		replica.handleClientPing(header)
 	case protocol.CommandPing:
 		replica.handlePing(header)
 	case protocol.CommandPong:
@@ -65,7 +70,11 @@ func (replica *Replica) handleMessage(message *Message) bool {
 }
 
 func (replica *Replica) handleRequest(message *Message, header protocol.Header, body []byte, sample TimeSample) bool {
-	if replica.status != StatusNormal || !replica.isPrimary() || replica.durableView != replica.view {
+	if replica.status != StatusNormal || replica.durableView != replica.view {
+		replica.metrics.requestsDropped.Add(1)
+		return false
+	}
+	if header.View > replica.view {
 		replica.metrics.requestsDropped.Add(1)
 		return false
 	}
@@ -73,11 +82,20 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		replica.metrics.requestsDropped.Add(1)
 		return false
 	}
+	if header.Release < replica.config.ClientReleaseMin {
+		replica.sendEviction(requestClient(&header), protocol.EvictionClientReleaseTooLow)
+		return false
+	}
 	operation := protocol.Operation(header.Fields[68])
 	client := requestClient(&header)
 	if operation == protocol.OperationRegister {
-		if _, found := replica.sessions.Session(client); found {
-			replica.metrics.requestsDropped.Add(1)
+		if session, found := replica.sessions.Session(client); found {
+			cached, _, ready := replica.sessions.Reply(client, session, 0)
+			if ready && replyRequestChecksum(&cached) == header.HeaderChecksum {
+				replica.sendCachedReply(client, session, 0)
+			} else {
+				replica.metrics.clientForks.Add(1)
+			}
 			return false
 		}
 	} else {
@@ -96,6 +114,15 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		case SessionClientFork:
 			replica.metrics.clientForks.Add(1)
 			return false
+		case SessionNoSession:
+			replica.sendEviction(client, protocol.EvictionNoSession)
+			return false
+		case SessionTooLow:
+			replica.sendEviction(client, protocol.EvictionSessionTooLow)
+			return false
+		case SessionReleaseMismatch:
+			replica.sendEviction(client, protocol.EvictionSessionReleaseMismatch)
+			return false
 		case SessionAdmit:
 		default:
 			replica.metrics.requestsDropped.Add(1)
@@ -103,10 +130,16 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		}
 	}
 	if operation >= protocol.OperationApplicationMin {
-		if result := replica.deps.StateMachine.Validate(ValidateInput{Operation: operation, Body: body}); result != ValidationOK {
+		result := replica.deps.StateMachine.Validate(ValidateInput{Operation: operation, Body: body})
+		if eviction, reject := validationEviction(result); reject {
+			replica.sendEviction(client, eviction)
 			replica.metrics.framesRejected.Add(1)
 			return false
 		}
+	}
+	if !replica.isPrimary() {
+		replica.metrics.requestsDropped.Add(1)
+		return false
 	}
 	requestNo := protocol.RequestNo(binary.LittleEndian.Uint32(header.Fields[64:68]))
 	if replica.pipelineConflict(client, requestNo, header.HeaderChecksum) {
@@ -122,6 +155,115 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		replica.fail(err)
 	}
 	return false
+}
+
+func (replica *Replica) invalidRequestEviction(header protocol.Header, body []byte) (protocol.EvictionReason, bool) {
+	if header.Command != protocol.CommandRequest || header.Author != 0 || header.View > replica.view {
+		return protocol.EvictionReserved, false
+	}
+	if replica.status != StatusNormal || replica.durableView != replica.view {
+		return protocol.EvictionReserved, false
+	}
+	if replica.membership.ActiveCount > 1 && !replica.deps.Clock.Now().Synchronized {
+		return protocol.EvictionReserved, false
+	}
+	fields := header.Fields[:]
+	if !zeroBytes(fields[16:32]) || !zeroBytes(fields[69:72]) || !zeroBytes(fields[76:]) || requestClient(&header).IsZero() {
+		return protocol.EvictionReserved, false
+	}
+	operation := protocol.Operation(fields[68])
+	session := binary.LittleEndian.Uint64(fields[48:56])
+	request := binary.LittleEndian.Uint32(fields[64:68])
+	if operation == protocol.OperationRegister {
+		if !zeroBytes(fields[:16]) || session != 0 || request != 0 {
+			return protocol.EvictionReserved, false
+		}
+	} else if session == 0 || request == 0 {
+		return protocol.EvictionReserved, false
+	}
+	switch {
+	case header.Release < replica.config.ClientReleaseMin:
+		return protocol.EvictionClientReleaseTooLow, true
+	case header.Release > replica.config.CurrentRelease:
+		return protocol.EvictionClientReleaseTooHigh, true
+	case !validClientOperation(operation):
+		return protocol.EvictionInvalidOperation, true
+	case uint32(len(body)) > uint32(replica.config.Cluster.ApplicationBatchSizeMax):
+		return protocol.EvictionInvalidBodySize, true
+	case !validClientBody(operation, body):
+		return protocol.EvictionInvalidBody, true
+	default:
+		return protocol.EvictionReserved, false
+	}
+}
+
+func validClientBody(operation protocol.Operation, body []byte) bool {
+	switch operation {
+	case protocol.OperationRegister:
+		return (len(body) == 0 || len(body) == 256) && zeroBytes(body)
+	case protocol.OperationNoop:
+		return len(body) == 0
+	case protocol.OperationReconfigure:
+		return len(body) == 256 && binary.LittleEndian.Uint32(body[252:]) == 0
+	default:
+		return operation >= protocol.OperationApplicationMin
+	}
+}
+func validClientOperation(operation protocol.Operation) bool {
+	return operation == protocol.OperationRegister ||
+		operation == protocol.OperationNoop ||
+		operation == protocol.OperationReconfigure ||
+		operation >= protocol.OperationApplicationMin
+}
+
+func validationEviction(result ValidationResult) (protocol.EvictionReason, bool) {
+	switch result {
+	case ValidationOK:
+		return protocol.EvictionReserved, false
+	case ValidationInvalidOperation:
+		return protocol.EvictionInvalidOperation, true
+	case ValidationInvalidBody:
+		return protocol.EvictionInvalidBody, true
+	case ValidationInvalidBodySize:
+		return protocol.EvictionInvalidBodySize, true
+	default:
+		return protocol.EvictionReserved, false
+	}
+}
+
+func (replica *Replica) sendEviction(client protocol.ClientID, reason protocol.EvictionReason) {
+	message, err := replica.frames.Acquire(0)
+	if err != nil {
+		return
+	}
+	header := protocol.Header{
+		Group: replica.config.Group, View: replica.logView, Release: replica.config.CurrentRelease,
+		Protocol: protocol.ProtocolVersion, Command: protocol.CommandEviction, Author: replica.local,
+	}
+	copy(header.Fields[:16], client[:])
+	header.Fields[127] = byte(reason)
+	if message.Seal(&header) == nil {
+		replica.deps.MessageBus.SendClient(client, message)
+	}
+	message.Release()
+}
+
+func (replica *Replica) handleClientPing(ping protocol.Header) {
+	message, err := replica.frames.Acquire(0)
+	if err != nil {
+		return
+	}
+	header := protocol.Header{
+		Group: replica.config.Group, View: replica.logView, Release: replica.config.CurrentRelease,
+		Protocol: protocol.ProtocolVersion, Command: protocol.CommandClientPong, Author: replica.local,
+	}
+	copy(header.Fields[:8], ping.Fields[16:24])
+	var client protocol.ClientID
+	copy(client[:], ping.Fields[:16])
+	if message.Seal(&header) == nil {
+		replica.deps.MessageBus.SendClient(client, message)
+	}
+	message.Release()
 }
 
 func (replica *Replica) createPrepare(request protocol.Header, requestBody []byte, sample TimeSample) error {

@@ -19,6 +19,8 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 		return true
 	case protocol.CommandPing, protocol.CommandPong:
 		return false
+	case protocol.CommandRequest, protocol.CommandClientPing:
+		return false
 	case protocol.CommandView:
 		return false
 	case protocol.CommandPrepare, protocol.CommandCommit:

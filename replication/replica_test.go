@@ -54,12 +54,23 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 
 	session := protocol.Session(replyCommit(&registrationHeader))
 	parent := replyContext(&registrationHeader)
+	machine.validation = ValidationInvalidBody
+	rejected := makeClientRequest(t, pool, config.Group, client, session, 1, parent, protocol.OperationApplicationMin, []byte("bad"))
+	if err := replica.Submit(rejected); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaMessages(t, replica, 2)
+	rejection, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || protocol.EvictionReason(rejection.Fields[127]) != protocol.EvictionInvalidBody {
+		t.Fatalf("application rejection=%+v reason=%v", rejection, reason)
+	}
+	machine.validation = ValidationOK
 	request := makeClientRequest(t, pool, config.Group, client, session, 1, parent, protocol.OperationApplicationMin, []byte("put"))
 	if err := replica.Submit(request); err != nil {
 		t.Fatal(err)
 	}
 	processReplicaUntil(t, replica, 2)
-	applicationReply := bus.clientMessage(t, 1)
+	applicationReply := bus.clientMessage(t, 2)
 	_, applicationBody, reason := protocol.DecodeFrame(applicationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
 	if reason != protocol.RejectNone || string(applicationBody) != "reply:put" {
 		t.Fatalf("application reply reason=%v body=%q", reason, applicationBody)
@@ -72,14 +83,131 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	if err := replica.Submit(duplicate); err != nil {
 		t.Fatal(err)
 	}
-	processReplicaMessages(t, replica, 3)
-	duplicateReply := bus.clientMessage(t, 2)
+	processReplicaMessages(t, replica, 4)
+	duplicateReply := bus.clientMessage(t, 3)
 	_, duplicateBody, reason := protocol.DecodeFrame(duplicateReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
 	if reason != protocol.RejectNone || string(duplicateBody) != "reply:put" {
 		t.Fatalf("duplicate reply reason=%v body=%q", reason, duplicateBody)
 	}
 	if machine.commits != 1 {
 		t.Fatalf("duplicate re-executed operation: commits=%d", machine.commits)
+	}
+}
+
+func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	bus := &captureBus{}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: bus,
+		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+		}},
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, replica)
+	pool, err := protocol.NewFramePool(2, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.ClientID{8}
+	ping, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pingHeader := protocol.Header{Group: config.Group, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandClientPing}
+	copy(pingHeader.Fields[:16], client[:])
+	binary.LittleEndian.PutUint64(pingHeader.Fields[16:24], 99)
+	if err := ping.Seal(&pingHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(ping); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaMessages(t, replica, 1)
+	pong, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || pong.Command != protocol.CommandClientPong || binary.LittleEndian.Uint64(pong.Fields[:8]) != 99 || bus.clientDestination(0) != client {
+		t.Fatalf("pong=%+v reason=%v destination=%x", pong, reason, bus.clientDestination(0))
+	}
+	request := makeClientRequest(t, pool, config.Group, client, 1, 1, protocol.Checksum{1}, protocol.OperationApplicationMin, nil)
+	if err := replica.Submit(request); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaMessages(t, replica, 2)
+	eviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || eviction.Command != protocol.CommandEviction || protocol.EvictionReason(eviction.Fields[127]) != protocol.EvictionNoSession {
+		t.Fatalf("eviction=%+v reason=%v", eviction, reason)
+	}
+	invalid := makeClientRequest(t, pool, config.Group, client, 1, 2, protocol.Checksum{1}, protocol.OperationUpgrade, nil)
+	if err := replica.Submit(invalid); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaMessages(t, replica, 3)
+	invalidEviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 2), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone || protocol.EvictionReason(invalidEviction.Fields[127]) != protocol.EvictionInvalidOperation {
+		t.Fatalf("invalid operation eviction=%+v reason=%v", invalidEviction, reason)
+	}
+	malformed, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformedHeader := protocol.Header{Group: config.Group, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandRequest}
+	malformedHeader.Fields[16] = 1
+	copy(malformedHeader.Fields[32:48], client[:])
+	binary.LittleEndian.PutUint64(malformedHeader.Fields[48:56], 1)
+	binary.LittleEndian.PutUint32(malformedHeader.Fields[64:68], 3)
+	malformedHeader.Fields[68] = byte(protocol.OperationApplicationMin)
+	if err := malformed.Seal(&malformedHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(malformed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Process(64); err != nil {
+		t.Fatal(err)
+	}
+	future, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	futureHeader := protocol.Header{Group: config.Group, View: 1, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandRequest}
+	futureHeader.Fields[0] = 1
+	copy(futureHeader.Fields[32:48], client[:])
+	binary.LittleEndian.PutUint64(futureHeader.Fields[48:56], 1)
+	binary.LittleEndian.PutUint32(futureHeader.Fields[64:68], 4)
+	futureHeader.Fields[68] = byte(protocol.OperationApplicationMin)
+	if err := future.Seal(&futureHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Process(64); err != nil {
+		t.Fatal(err)
+	}
+	if bus.clientCount() != 3 {
+		t.Fatalf("drop-only requests produced %d client messages", bus.clientCount())
+	}
+}
+func TestValidationEvictionMapping(t *testing.T) {
+	tests := []struct {
+		result ValidationResult
+		reason protocol.EvictionReason
+		reject bool
+	}{
+		{ValidationOK, protocol.EvictionReserved, false},
+		{ValidationInvalidOperation, protocol.EvictionInvalidOperation, true},
+		{ValidationInvalidBody, protocol.EvictionInvalidBody, true},
+		{ValidationInvalidBodySize, protocol.EvictionInvalidBodySize, true},
+	}
+	for _, test := range tests {
+		reason, reject := validationEviction(test.result)
+		if reason != test.reason || reject != test.reject {
+			t.Fatalf("result=%d reason=%d reject=%v", test.result, reason, reject)
+		}
 	}
 }
 
@@ -437,16 +565,22 @@ func (clock *observingClock) Observe(_ protocol.ReplicaIndex, _, _, _ uint64) er
 }
 
 type captureBus struct {
-	mu       sync.Mutex
-	clients  [][]byte
-	replicas [][]byte
+	mu           sync.Mutex
+	clients      [][]byte
+	destinations []protocol.ClientID
+	replicas     [][]byte
 }
 
 func (bus *captureBus) SendReplica(_ protocol.ReplicaIndex, message *Message) {
 	bus.capture(message, false)
 }
-func (bus *captureBus) SendClient(_ protocol.ClientID, message *Message) { bus.capture(message, true) }
-func (bus *captureBus) BroadcastReplicas(message *Message)               { bus.capture(message, false) }
+func (bus *captureBus) SendClient(client protocol.ClientID, message *Message) {
+	bus.mu.Lock()
+	bus.destinations = append(bus.destinations, client)
+	bus.mu.Unlock()
+	bus.capture(message, true)
+}
+func (bus *captureBus) BroadcastReplicas(message *Message) { bus.capture(message, false) }
 
 func (bus *captureBus) capture(message *Message, client bool) {
 	frame, _ := message.Bytes()
@@ -474,6 +608,12 @@ func (bus *captureBus) clientMessage(t testing.TB, index int) []byte {
 		t.Fatalf("client message %d missing", index)
 	}
 	return append([]byte(nil), bus.clients[index]...)
+}
+
+func (bus *captureBus) clientDestination(index int) protocol.ClientID {
+	bus.mu.Lock()
+	defer bus.mu.Unlock()
+	return bus.destinations[index]
 }
 
 func (bus *captureBus) replicaMessages() [][]byte {
@@ -659,11 +799,14 @@ type testStateMachine struct {
 	resetCompletion *SMCompletion
 	compacts        int
 	checkpoints     int
+	validation      ValidationResult
 }
 
-func (machine *testStateMachine) Capacities() StateMachineCapacities      { return machine.capacities }
-func (machine *testStateMachine) Validate(ValidateInput) ValidationResult { return ValidationOK }
-func (machine *testStateMachine) PulseNeeded(uint64) bool                 { return machine.pulseNeeded }
+func (machine *testStateMachine) Capacities() StateMachineCapacities { return machine.capacities }
+func (machine *testStateMachine) Validate(ValidateInput) ValidationResult {
+	return machine.validation
+}
+func (machine *testStateMachine) PulseNeeded(uint64) bool { return machine.pulseNeeded }
 func (machine *testStateMachine) StartPrefetch(PrefetchInput, *SMCompletion) (StartResult[PrefetchToken], error) {
 	return Ready(PrefetchToken(1)), nil
 }
