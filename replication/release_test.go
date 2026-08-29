@@ -170,6 +170,124 @@ func TestOpenRecoversPartialUpgradeBar(t *testing.T) {
 	closeReplica(t, reopened)
 }
 
+func TestUpgradeHandoffReopensAtTargetRelease(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	capacities := StateMachineCapacities{
+		RequestBytes:  uint32(config.Cluster.ApplicationBatchSizeMax),
+		ReplyBytes:    uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax:   uint32(config.Cluster.PipelineMax),
+		CheckpointMax: 1,
+	}
+	handoffErr := errors.New("release process replaced")
+	executor := &testReleaseExecutor{releases: []protocol.Release{1, 2}, err: handoffErr}
+	machine := &testStateMachine{capacities: capacities}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine, ReleaseExecutor: executor,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, ok := checkpointAfter(config.Cluster, 0)
+	if !ok {
+		t.Fatal("checkpoint unavailable")
+	}
+	trigger, ok := checkpointTrigger(config.Cluster, checkpoint)
+	if !ok {
+		t.Fatal("checkpoint trigger unavailable")
+	}
+	commitUpgrade := func(op protocol.Op) {
+		t.Helper()
+		replica.handlePulseTimeout(TimeSample{Wall: uint64(op), Monotonic: uint64(op), Synchronized: true})
+		processReplicaUntil(t, replica, op)
+	}
+	for op := protocol.Op(1); op <= checkpoint+2; op++ {
+		commitUpgrade(op)
+	}
+	window := replica.upgradeWindow
+	replica.beginViewChangeNow(replica.view + 1)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for replica.status != StatusNormal {
+		if _, err := replica.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-replica.notify:
+		case <-deadline.C:
+			t.Fatal("view change did not install")
+		default:
+		}
+	}
+	if replica.upgradeTarget != 2 || replica.upgradeWindow != window {
+		t.Fatalf("upgrade changed across view change: target=%d window=%+v want=%+v", replica.upgradeTarget, replica.upgradeWindow, window)
+	}
+	for op := checkpoint + 3; op < trigger; op++ {
+		commitUpgrade(op)
+	}
+	replica.handlePulseTimeout(TimeSample{Wall: uint64(trigger), Monotonic: uint64(trigger), Synchronized: true})
+	for executor.calls == 0 {
+		_, processErr := replica.Process(64)
+		if processErr != nil && !errors.Is(processErr, handoffErr) {
+			t.Fatal(processErr)
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-replica.notify:
+		case <-deadline.C:
+			t.Fatal("release handoff did not execute")
+		default:
+		}
+	}
+	if durable := replica.superblocks.Current().State.Checkpoint; durable.Release != 2 || durable.PrepareOp() != checkpoint {
+		t.Fatalf("durable checkpoint release=%d op=%d", durable.Release, durable.PrepareOp())
+	}
+	closeReplica(t, replica)
+	storage.Crash()
+
+	recoveryHandoff := &testReleaseExecutor{releases: []protocol.Release{1, 2}, err: handoffErr}
+	if _, err := Open(context.Background(), config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities},
+		ReleaseExecutor: recoveryHandoff,
+	}); !errors.Is(err, handoffErr) {
+		t.Fatalf("old release open error = %v", err)
+	}
+	if recoveryHandoff.calls != 1 || recoveryHandoff.target != 2 || storage.operation != 0 {
+		t.Fatalf("recovery handoff calls=%d target=%d storage operations=%d", recoveryHandoff.calls, recoveryHandoff.target, storage.operation)
+	}
+	storage.Crash()
+
+	targetConfig := config
+	targetConfig.CurrentRelease = 2
+	targetExecutor := &testReleaseExecutor{releases: []protocol.Release{2}}
+	reopened, err := Open(context.Background(), targetConfig, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 300, Monotonic: 300, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{3}), StateMachine: &testStateMachine{capacities: capacities},
+		ReleaseExecutor: targetExecutor,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened.upgradeTarget != 0 || reopened.upgradeWindow.started || !reopened.accepting.Load() || targetExecutor.calls != 0 {
+		t.Fatalf("target reopen target=%d window=%+v accepting=%t calls=%d", reopened.upgradeTarget, reopened.upgradeWindow, reopened.accepting.Load(), targetExecutor.calls)
+	}
+	pool, err := protocol.NewFramePool(1, uint32(targetConfig.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := makeClientRequest(t, pool, targetConfig.Group, protocol.ClientID{9}, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	if err := reopened.Submit(request); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaUntil(t, reopened, trigger+1)
+	closeReplica(t, reopened)
+}
+
 func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
 	machine := &testStateMachine{
