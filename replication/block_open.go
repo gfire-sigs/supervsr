@@ -41,6 +41,18 @@ func openBlockRuntime(storage Storage, config Config, checkpoint CheckpointState
 	return &blockRuntime{store: store, trailers: trailers, allocator: allocator}, nil
 }
 
+func newBlockRepairRuntime(storage Storage, config Config) (*blockRuntime, error) {
+	store, err := NewBlockStore(storage, config.Cluster, config.Group, config.CurrentRelease)
+	if err != nil {
+		return nil, err
+	}
+	trailers, err := NewTrailerStore(store)
+	if err != nil {
+		return nil, err
+	}
+	return &blockRuntime{store: store, trailers: trailers}, nil
+}
+
 func readCheckpointFreeSet(trailers *TrailerStore, address uint64, lastChecksum, aggregate protocol.Checksum, encodedSize, snapshot, blockCount uint64) (FixedBitSet, error) {
 	set, err := NewFixedBitSet(blockCount)
 	if err != nil {

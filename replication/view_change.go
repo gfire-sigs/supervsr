@@ -307,6 +307,7 @@ func (replica *Replica) recordJoinView(header protocol.Header, body []byte) {
 		logView:    protocol.View(binary.LittleEndian.Uint32(header.Fields[56:60])),
 		count:      uint8(count),
 	}
+	replica.observePeerCheckpoint(header.Author, record.checkpoint)
 	headers := replica.joinHeaderSlice(sender)
 	clear(headers)
 	for index := range count {
@@ -480,8 +481,44 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	if header.Author != replica.membership.Primary(header.View) || header.View < replica.view || len(body) < CheckpointStateSize {
 		return
 	}
+	validation := CheckpointValidation{
+		Group:          replica.config.Group,
+		MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
+		MemberCount:    replica.membership.ActiveCount + replica.membership.StandbyCount,
+		BlockSize:      replica.config.Cluster.BlockSize,
+		ClientsMax:     replica.config.Cluster.ClientsMax,
+	}
+	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
+	checkpoint, err := DecodeCheckpointState(body[:CheckpointStateSize], validation)
+	if err != nil {
+		return
+	}
+	replica.observePeerCheckpoint(header.Author, checkpoint.PrepareOp())
 	head := protocol.Op(binary.LittleEndian.Uint64(header.Fields[16:24]))
 	commit := protocol.Op(binary.LittleEndian.Uint64(header.Fields[24:32]))
+	count := (len(body) - CheckpointStateSize) / protocol.HeaderSize
+	if count == 0 || count > len(replica.canonicalHeaders) || CheckpointStateSize+count*protocol.HeaderSize != len(body) {
+		return
+	}
+	for index := range count {
+		candidate, reason := protocol.DecodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		if reason != protocol.RejectNone {
+			return
+		}
+		replica.canonicalHeaders[index] = candidate
+	}
+	if checkpoint.PrepareOp() > replica.checkpoint.PrepareOp() {
+		if !replica.validStateSyncView(checkpoint, head, commit, count) {
+			return
+		}
+		replica.beginStateSync(checkpoint, header.View, commit, head, replica.canonicalHeaders[:count])
+		replica.getViewNonce = protocol.Nonce{}
+		replica.getViewLast = 0
+		return
+	}
+	if checkpoint.PrepareOp() != replica.checkpoint.PrepareOp() {
+		return
+	}
 	recoveringHead := replica.status == StatusRecoveringHead
 	if recoveringHead {
 		var nonce protocol.Nonce
@@ -498,29 +535,6 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		if replica.status != StatusViewChange || replica.durableView != header.View || replica.viewIO != (IOHandle{}) {
 			return
 		}
-	}
-	validation := CheckpointValidation{
-		Group:          replica.config.Group,
-		MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
-		MemberCount:    replica.membership.ActiveCount + replica.membership.StandbyCount,
-		BlockSize:      replica.config.Cluster.BlockSize,
-		ClientsMax:     replica.config.Cluster.ClientsMax,
-	}
-	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
-	checkpoint, err := DecodeCheckpointState(body[:CheckpointStateSize], validation)
-	if err != nil || checkpoint.PrepareOp() != replica.checkpoint.PrepareOp() {
-		return
-	}
-	count := (len(body) - CheckpointStateSize) / protocol.HeaderSize
-	if count == 0 || count > len(replica.canonicalHeaders) {
-		return
-	}
-	for index := range count {
-		candidate, reason := protocol.DecodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
-		if reason != protocol.RejectNone {
-			return
-		}
-		replica.canonicalHeaders[index] = candidate
 	}
 	if recoveringHead {
 		if !replica.validRecoveringView(header.View, commit, head, count) {
@@ -540,6 +554,28 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	}
 	replica.getViewNonce = protocol.Nonce{}
 	replica.getViewLast = 0
+}
+
+func (replica *Replica) validStateSyncView(checkpoint CheckpointState, head, commit protocol.Op, count int) bool {
+	checkpointOp := checkpoint.PrepareOp()
+	if count <= 0 || protocol.Op(count-1) > head || commit < checkpointOp || head < commit || prepareOp(&replica.canonicalHeaders[0]) != head {
+		return false
+	}
+	for index := range count {
+		op := head - protocol.Op(index)
+		candidate := replica.canonicalHeaders[index]
+		if prepareOp(&candidate) != op {
+			return false
+		}
+		if index+1 < count && prepareParent(&candidate) != replica.canonicalHeaders[index+1].HeaderChecksum {
+			return false
+		}
+		if op == checkpointOp {
+			checkpointHeader, reason := protocol.DecodeHeader(checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+			return reason == protocol.RejectNone && checkpointHeader.HeaderChecksum == candidate.HeaderChecksum
+		}
+	}
+	return false
 }
 
 func (replica *Replica) validRecoveringView(view protocol.View, commit, head protocol.Op, count int) bool {

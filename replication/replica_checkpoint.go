@@ -143,6 +143,10 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 	next.Sequence++
 	next.State.Checkpoint = checkpoint
 	next.State.CommitMax = replica.commitMax
+	if replica.syncRangeRepaired {
+		next.State.SyncMin = 0
+		next.State.SyncMax = 0
+	}
 	handle, err := replica.io.Submit(IOOperation{Kind: IOSuperblockPersist, SuperblockStore: replica.superblocks, Superblock: next})
 	if err != nil {
 		replica.abortCheckpointCandidate()
@@ -233,6 +237,8 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		return
 	}
 	replica.checkpointID = checkpointID
+	replica.clearBlockCatalog()
+	replica.seedScrubCatalog(replica.checkpoint)
 	replica.checkpointSessionOp = 0
 	replica.checkpointTarget = 0
 	replica.checkpointTargetRelease = 0
@@ -240,6 +246,9 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 	replica.pendingCheckpoint = CheckpointState{}
 	replica.checkpointManifest = CheckpointManifest{}
 	replica.upgradeWindow = upgradeWindow{}
+	if replica.syncRangeRepaired {
+		replica.syncRangeRepaired = false
+	}
 	if targetRelease != replica.config.CurrentRelease {
 		replica.beginReleaseActivation(targetRelease)
 		return
@@ -286,6 +295,8 @@ func (replica *Replica) yieldCheckpointToView(entry *pipelineEntry) {
 func (replica *Replica) completeCommitEntry() {
 	replica.popPipeline()
 	replica.stage = CommitStageIdle
-	replica.dequeueRequest()
-	replica.advanceCommit()
+	if replica.stateSync.stage == SyncStageIdle {
+		replica.dequeueRequest()
+		replica.advanceCommit()
+	}
 }

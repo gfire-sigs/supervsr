@@ -29,22 +29,24 @@ type Dependencies struct {
 	Entropy         io.Reader
 	StateMachine    StateMachine
 	ReleaseExecutor ReleaseExecutor
+	BlockValidator  BlockValidator
 	Metrics         *ReplicaMetrics
 	Logger          *zerolog.Logger
 }
 
 type ReplicaInitialState struct {
-	Status        Status
-	View          protocol.View
-	DurableView   protocol.View
-	LogView       protocol.View
-	HeadOp        protocol.Op
-	CommitMin     protocol.Op
-	CommitMax     protocol.Op
-	Checkpoint    CheckpointState
-	HeadHeader    protocol.Header
-	upgradeTarget protocol.Release
-	upgradeWindow upgradeWindow
+	Status            Status
+	View              protocol.View
+	DurableView       protocol.View
+	LogView           protocol.View
+	HeadOp            protocol.Op
+	CommitMin         protocol.Op
+	CommitMax         protocol.Op
+	Checkpoint        CheckpointState
+	HeadHeader        protocol.Header
+	upgradeTarget     protocol.Release
+	upgradeWindow     upgradeWindow
+	syncRangeRepaired bool
 }
 
 type CommitStage uint8
@@ -199,9 +201,17 @@ type Replica struct {
 	repairBudget           journalRepairBudget
 	repairHeader           protocol.Header
 	repairHeaderValid      bool
+	blockRepairBudget      blockRepairBudget
+	blockRepairTargets     []blockRepairTarget
+	blockRepairIO          []blockRepairIO
+	peerCheckpointOps      []protocol.Op
 	repairWrite            repairWrite
 	repairHeadersLast      uint64
 	getViewNonce           protocol.Nonce
+	blockRequirements      []BlockRequirement
+	blockCatalog           []BlockRequirement
+	blockCatalogCount      int
+	scrub                  scrubRuntime
 	getViewLast            uint64
 	repairViewValid        bool
 	repairView             protocol.View
@@ -216,6 +226,8 @@ type Replica struct {
 	upgradeTarget          protocol.Release
 	upgradeWindow          upgradeWindow
 	releaseActivation      protocol.Release
+	stateSync              stateSyncRuntime
+	syncRangeRepaired      bool
 	releaseReset           SMCompletion
 	releaseResetGeneration uint64
 	releaseResetDone       bool
@@ -264,6 +276,11 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if err != nil {
 		return nil, err
 	}
+	memberCount := config.Membership.ActiveCount + config.Membership.StandbyCount
+	blockBudget, err := newBlockRepairBudget(memberCount, local, config.Process.RepairRequestsMax)
+	if err != nil {
+		return nil, err
+	}
 	releases, err := executableReleases(config, dependencies.ReleaseExecutor)
 	if err != nil || !containsRelease(releases, initial.Checkpoint.Release) {
 		return nil, ErrReleaseUnavailable
@@ -306,7 +323,8 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if err != nil {
 		return nil, err
 	}
-	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + 4
+	blockIOCount := max(config.Process.RepairReadsMax, config.Process.ScrubWriteConcurrency)
+	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + blockIOCount + 4
 	ioEngine, err := NewIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)))
 	if err != nil {
 		return nil, err
@@ -355,6 +373,22 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		start := uint64(index) * repairStride
 		repairReads[index].buffer = repairStorage[start : start+repairStride]
 	}
+	blockRepairBytes, ok := checkedMul(config.Cluster.BlockSize, uint64(blockIOCount))
+	if !ok {
+		_ = ioEngine.Close(context.Background())
+		return nil, ErrInvalidConfiguration
+	}
+	blockRepairStorage, err := NewAlignedBuffer(blockRepairBytes, SectorSize)
+	if err != nil {
+		_ = ioEngine.Close(context.Background())
+		return nil, err
+	}
+	blockRepairIO := make([]blockRepairIO, int(blockIOCount))
+	for index := range blockRepairIO {
+		start := uint64(index) * config.Cluster.BlockSize
+		blockRepairIO[index].buffer = blockRepairStorage[start : start+config.Cluster.BlockSize]
+	}
+	targetCapacity := int(memberCount)*int(config.Process.RepairRequestsMax+1) + int(config.Process.ScrubReadConcurrency) + 5
 	joins := make([]joinRecord, int(config.Membership.ActiveCount))
 	joinHeaders := make([]protocol.Header, int(config.Membership.ActiveCount)*int(config.Cluster.PipelineMax+1))
 	canonicalHeaders := make([]protocol.Header, int(config.Cluster.PipelineMax+1))
@@ -380,6 +414,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		commitMin:            initial.CommitMin,
 		commitMax:            initial.CommitMax,
 		checkpoint:           initial.Checkpoint,
+		syncRangeRepaired:    initial.syncRangeRepaired,
 		checkpointID:         checkpointID,
 		headChecksum:         initial.HeadHeader.HeaderChecksum,
 		lastPrepareTimestamp: prepareTimestamp(&initial.HeadHeader),
@@ -408,13 +443,21 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		repairFrames:         make([]*Message, int(config.Cluster.PipelineMax+1)),
 		canonicalHeaders:     canonicalHeaders,
 		repairBudget:         repairBudget,
+		blockRepairBudget:    blockBudget,
+		blockRepairTargets:   make([]blockRepairTarget, targetCapacity),
+		blockRepairIO:        blockRepairIO,
+		blockRequirements:    make([]BlockRequirement, targetCapacity),
+		peerCheckpointOps:    make([]protocol.Op, int(memberCount)),
 		releaseHistory:       releases,
 		releaseReports:       releaseReports,
 		upgradeTarget:        initial.upgradeTarget,
+		blockCatalog:         make([]BlockRequirement, targetCapacity),
 		upgradeWindow:        initial.upgradeWindow,
+		stateSync:            stateSyncRuntime{headers: make([]protocol.Header, int(config.Cluster.PipelineMax+1))},
 		stop:                 make(chan struct{}),
 		done:                 make(chan struct{}),
 	}
+	replica.seedScrubCatalog(initial.Checkpoint)
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 	if err := replica.checkInvariants(); err != nil {
@@ -516,7 +559,11 @@ func (replica *Replica) Process(limit int) (int, error) {
 	for processed < limit {
 		var completion IOCompletion
 		if replica.io.Poll(&completion) {
-			replica.handleIOCompletion(completion)
+			if replica.stateSync.stage == SyncStageCancelingGrid {
+				replica.handleStateSyncDrainIO(completion)
+			} else {
+				replica.handleIOCompletion(completion)
+			}
 			processed++
 			if replica.releaseActivation != 0 {
 				drained, err := replica.processReleaseActivation(limit - processed)
@@ -530,11 +577,17 @@ func (replica *Replica) Process(limit int) (int, error) {
 		}
 		switch event.kind {
 		case replicaEventMessage:
-			if !replica.handleMessage(event.message) {
+			if replica.stateSync.stage != SyncStageIdle {
+				event.message.Release()
+			} else if !replica.handleMessage(event.message) {
 				event.message.Release()
 			}
 		case replicaEventSMCompletion:
-			replica.handleSMCompletion(event)
+			if replica.stateSync.stage == SyncStageCancelingGrid || replica.stateSync.stage == SyncStageUpdatingCheckpoint {
+				replica.handleStateSyncDrainSM(event)
+			} else {
+				replica.handleSMCompletion(event)
+			}
 		default:
 			replica.fail(ErrReplicaInvariant)
 		}
@@ -548,7 +601,10 @@ func (replica *Replica) Process(limit int) (int, error) {
 		drained, err := replica.processReleaseActivation(limit - processed)
 		return processed + drained, err
 	}
-	replica.advanceCommit()
+	if replica.stateSync.stage == SyncStageIdle || replica.stateSync.stage == SyncStageCancelingCommit {
+		replica.advanceCommit()
+	}
+	replica.dispatchStateSync()
 	if replica.fatalErr != nil {
 		return processed, replica.fatalErr
 	}
@@ -773,6 +829,9 @@ func (replica *Replica) handleSMCompletion(event replicaEvent) {
 		default:
 			replica.fail(ErrReplicaInvariant)
 		}
+		return
+	}
+	if replica.handleStateSyncCompletion(event.completion, event.generation, result) {
 		return
 	}
 	replica.metrics.staleCompletions.Add(1)

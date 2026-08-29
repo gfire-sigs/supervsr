@@ -60,6 +60,8 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.handleGetReply(header)
 	case protocol.CommandGetBlocks:
 		replica.handleGetBlocks(header, body)
+	case protocol.CommandBlock:
+		replica.handleBlock(header, body)
 	case protocol.CommandClientPing:
 		replica.handleClientPing(header)
 	case protocol.CommandPing:
@@ -393,7 +395,13 @@ func (replica *Replica) acceptPrepare(message *Message, header protocol.Header) 
 }
 
 func (replica *Replica) handleIOCompletion(completion IOCompletion) {
+	if replica.handleStateSyncPersistence(completion) {
+		return
+	}
 	if replica.handleViewPersistence(completion) {
+		return
+	}
+	if replica.handleBlockRepairIO(completion) {
 		return
 	}
 	for index := range replica.repairReads {

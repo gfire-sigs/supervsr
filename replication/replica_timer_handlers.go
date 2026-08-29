@@ -153,6 +153,7 @@ func (replica *Replica) sendPing(sample TimeSample) {
 }
 
 func (replica *Replica) handlePing(header protocol.Header, body []byte) {
+	replica.observePeerCheckpoint(header.Author, protocol.Op(binary.LittleEndian.Uint64(header.Fields[16:24])))
 	replica.observeReleaseReport(header, body)
 	message, err := replica.frames.Acquire(0)
 	if err != nil {

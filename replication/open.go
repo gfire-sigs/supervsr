@@ -71,36 +71,43 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if err != nil {
 		return nil, err
 	}
-	sessions, err := NewSessionTable(SessionTableConfig{
-		ClientsMax:              uint32(config.Cluster.ClientsMax),
-		Group:                   config.Group,
-		ActiveCount:             config.Membership.ActiveCount,
-		MessageSizeMax:          uint32(config.Cluster.MessageSizeMax),
-		ApplicationReplySizeMax: uint32(config.Cluster.ApplicationReplySizeMax),
-	})
+	sessions, err := newOpenSessionTable(config)
 	if err != nil {
 		return nil, err
 	}
-	blocks, err := openBlockRuntime(dependencies.Storage, config, durable.State.Checkpoint)
+	resumeStateSync := durable.State.SyncMin != 0
+	var blocks *blockRuntime
+	if resumeStateSync {
+		blocks, err = newBlockRepairRuntime(dependencies.Storage, config)
+	} else {
+		blocks, err = openBlockRuntime(dependencies.Storage, config, durable.State.Checkpoint)
+		if err == nil {
+			err = loadSessionTrailer(blocks, durable.State.Checkpoint, sessions)
+		}
+	}
 	if err != nil {
-		return nil, err
-	}
-	if err := loadSessionTrailer(blocks, durable.State.Checkpoint, sessions); err != nil {
-		return nil, err
-	}
-	startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
-	if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, startup); err != nil {
 		return nil, err
 	}
 	commitMin := durable.State.Checkpoint.PrepareOp()
 	var upgrades recoveredUpgradeState
-	if recovery.FaultySlots == 0 {
-		commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, durable.State.CommitMax)
-		if err != nil {
+	if !resumeStateSync {
+		startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
+		if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, startup); err != nil {
 			return nil, err
 		}
+		if recovery.FaultySlots == 0 {
+			commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, durable.State.CommitMax)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	initial, err := deriveInitialState(config, durable, recovery, commitMin, upgrades, wal, superblocks, memberCount)
+	var initial ReplicaInitialState
+	if resumeStateSync {
+		initial, err = deriveInterruptedStateSync(config, durable, memberCount)
+	} else {
+		initial, err = deriveInitialState(config, durable, recovery, commitMin, upgrades, wal, superblocks, memberCount)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -108,11 +115,62 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if err != nil {
 		return nil, err
 	}
-	if err := loadOpenSuffix(replica, recovery, commitMin); err != nil {
+	if resumeStateSync {
+		err = replica.resumeInterruptedStateSync(durable, memberCount)
+	} else {
+		err = loadOpenSuffix(replica, recovery, commitMin)
+	}
+	if err != nil {
 		_ = replica.Close(context.Background())
 		return nil, err
 	}
 	return replica, nil
+}
+
+func newOpenSessionTable(config Config) (*SessionTable, error) {
+	return NewSessionTable(SessionTableConfig{
+		ClientsMax:              uint32(config.Cluster.ClientsMax),
+		Group:                   config.Group,
+		ActiveCount:             config.Membership.ActiveCount,
+		MessageSizeMax:          uint32(config.Cluster.MessageSizeMax),
+		ApplicationReplySizeMax: uint32(config.Cluster.ApplicationReplySizeMax),
+	})
+}
+
+func deriveInterruptedStateSync(config Config, durable Superblock, memberCount uint8) (ReplicaInitialState, error) {
+	header, reason := protocol.DecodeHeader(durable.State.Checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount)
+	if reason != protocol.RejectNone {
+		return ReplicaInitialState{}, ErrInvalidCheckpoint
+	}
+	return ReplicaInitialState{
+		Status: StatusRecovering, View: durable.State.View, DurableView: durable.State.View, LogView: durable.State.LogView,
+		HeadOp: durable.State.Checkpoint.PrepareOp(), CommitMin: durable.State.Checkpoint.PrepareOp(), CommitMax: durable.State.CommitMax,
+		Checkpoint: durable.State.Checkpoint, HeadHeader: header, syncRangeRepaired: true,
+	}, nil
+}
+
+func (replica *Replica) resumeInterruptedStateSync(durable Superblock, memberCount uint8) error {
+	count := int(durable.ViewHeaderCount)
+	if count == 0 || count > len(replica.stateSync.headers) {
+		return ErrInvalidSuperblock
+	}
+	for index := range count {
+		header, reason := protocol.DecodeHeader(durable.ViewHeaders[index][:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), memberCount)
+		if reason != protocol.RejectNone {
+			return ErrInvalidSuperblock
+		}
+		replica.stateSync.headers[index] = header
+	}
+	replica.stateSync.checkpoint = durable.State.Checkpoint
+	replica.stateSync.view = durable.State.View
+	replica.stateSync.commit = durable.State.CommitMax
+	replica.stateSync.head = prepareOp(&replica.stateSync.headers[count-1])
+	replica.stateSync.count = count
+	replica.installStateSyncCheckpoint()
+	if replica.fatalErr != nil {
+		return replica.fatalErr
+	}
+	return nil
 }
 
 func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryReport, commitMin protocol.Op, upgrades recoveredUpgradeState, wal *WAL, superblocks *SuperblockStore, memberCount uint8) (ReplicaInitialState, error) {
@@ -125,17 +183,18 @@ func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryR
 		return ReplicaInitialState{}, err
 	}
 	initial := ReplicaInitialState{
-		Status:        status,
-		View:          view,
-		DurableView:   durableView,
-		LogView:       logView,
-		HeadOp:        commitMin,
-		CommitMin:     commitMin,
-		CommitMax:     durable.State.CommitMax,
-		Checkpoint:    durable.State.Checkpoint,
-		HeadHeader:    committedHeader,
-		upgradeTarget: upgrades.target,
-		upgradeWindow: upgrades.window,
+		Status:            status,
+		View:              view,
+		DurableView:       durableView,
+		LogView:           logView,
+		HeadOp:            commitMin,
+		CommitMin:         commitMin,
+		CommitMax:         durable.State.CommitMax,
+		Checkpoint:        durable.State.Checkpoint,
+		HeadHeader:        committedHeader,
+		upgradeTarget:     upgrades.target,
+		upgradeWindow:     upgrades.window,
+		syncRangeRepaired: durable.State.SyncMin != 0,
 	}
 	if status == StatusRecoveringHead {
 		initial.HeadOp = headOp

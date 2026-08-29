@@ -134,6 +134,12 @@ func (replica *Replica) handleGetBlocks(request protocol.Header, body []byte) {
 }
 
 func (replica *Replica) startRepairRead(kind repairReadKind, peer protocol.ReplicaIndex, op protocol.Op, client protocol.ClientID, checksum protocol.Checksum, offset, size uint64) bool {
+	if replica.stateSync.stage != SyncStageIdle {
+		return false
+	}
+	if replica.activeRepairReads() >= int(replica.config.Process.RepairReadsMax) {
+		return false
+	}
 	for index := range replica.repairReads {
 		read := &replica.repairReads[index]
 		if read.busy {
@@ -237,6 +243,9 @@ func (replica *Replica) sendRepairFrame(peer protocol.ReplicaIndex, frame []byte
 }
 
 func (replica *Replica) handleRepairTimeout(sample TimeSample) {
+	if replica.continueBlockRepair(sample.Monotonic) {
+		return
+	}
 	replica.repairBudget.Expire(sample.Monotonic)
 	if replica.repairViewValid {
 		replica.continueRecoveringView(sample.Monotonic)
@@ -255,6 +264,7 @@ func (replica *Replica) handleRepairTimeout(sample TimeSample) {
 	}
 	missing, found := replica.newestMissingHeader()
 	if !found {
+		replica.continueScrub(sample.Monotonic)
 		return
 	}
 	interval := uint64(replica.config.Process.InitialRTT)
