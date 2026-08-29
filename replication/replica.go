@@ -141,11 +141,20 @@ type Replica struct {
 	failureDetector      FailureDetector
 	timers               replicaTimers
 	random               DeterministicRandom
+	checkpointSession    []byte
+	checkpointSessionOp  protocol.Op
+	checkpointTarget     protocol.Op
+	checkpointManifest   CheckpointManifest
+	checkpointCandidate  BlockCheckpointCandidate
+	pendingCheckpoint    CheckpointState
 
 	wal              *WAL
 	replies          *ReplyStore
 	superblocks      *SuperblockStore
 	sessions         *SessionTable
+	blocks           *BlockStore
+	trailers         *TrailerStore
+	blockAllocator   *BlockAllocator
 	io               *IOEngine
 	frames           *protocol.FramePool
 	events           *MPSCRing[replicaEvent]
@@ -165,6 +174,7 @@ type Replica struct {
 	canonicalHeaders []protocol.Header
 	viewIO           IOHandle
 	viewInstall      bool
+	pendingView      protocol.View
 	viewCommit       protocol.Op
 	viewHead         protocol.Op
 	joinViewBits     uint16
@@ -183,6 +193,10 @@ type Replica struct {
 }
 
 func newReplica(config Config, dependencies Dependencies, initial ReplicaInitialState, wal *WAL, replyStore *ReplyStore, sessions *SessionTable, superblocks *SuperblockStore) (*Replica, error) {
+	return newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, nil)
+}
+
+func newReplicaWithBlocks(config Config, dependencies Dependencies, initial ReplicaInitialState, wal *WAL, replyStore *ReplyStore, sessions *SessionTable, superblocks *SuperblockStore, blocks *blockRuntime) (*Replica, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -203,6 +217,13 @@ func newReplica(config Config, dependencies Dependencies, initial ReplicaInitial
 	quorums, ok := QuorumsFor(config.Membership.ActiveCount, uint8(min(config.Cluster.ReplicationQuorumMax, uint64(^uint8(0)))))
 	if !ok {
 		return nil, ErrInvalidConfiguration
+	}
+	if blocks == nil {
+		var err error
+		blocks, err = openBlockRuntime(dependencies.Storage, config, initial.Checkpoint)
+		if err != nil {
+			return nil, err
+		}
 	}
 	eventCapacity := uint64(2)
 	minimumEvents := config.Cluster.PipelineMax*4 + uint64(config.Process.PrimaryRequestQueueMax) + 8
@@ -286,12 +307,16 @@ func newReplica(config Config, dependencies Dependencies, initial ReplicaInitial
 		failureDetector:      NewFailureDetector(initialTime.Monotonic),
 		timers:               timers,
 		random:               NewDeterministicRandom(uint64(local) + 1),
+		checkpointSession:    make([]byte, sessions.TrailerSize()),
 		wal:                  wal,
 		replies:              replyStore,
 		superblocks:          superblocks,
 		sessions:             sessions,
 		io:                   ioEngine,
 		frames:               frames,
+		blocks:               blocks.store,
+		trailers:             blocks.trailers,
+		blockAllocator:       blocks.allocator,
 		events:               events,
 		notify:               make(chan struct{}, 1),
 		pipeline:             make([]pipelineEntry, int(config.Cluster.PipelineMax)),
@@ -312,6 +337,11 @@ func newReplica(config Config, dependencies Dependencies, initial ReplicaInitial
 }
 
 func (replica *Replica) Snapshot() ReplicaSnapshot {
+	committing := false
+	if replica.pipelineLen > 0 {
+		entry := replica.pipelineEntry(0)
+		committing = entry.stage >= CommitStageCheckpointDurable && prepareOp(&entry.header) == replica.commitMin
+	}
 	return ReplicaSnapshot{
 		Status:      replica.status,
 		View:        replica.view,
@@ -322,6 +352,7 @@ func (replica *Replica) Snapshot() ReplicaSnapshot {
 		CommitMax:   replica.commitMax,
 		Checkpoint:  replica.checkpoint,
 		PipelineLen: replica.pipelineLen,
+		Committing:  committing,
 		Primary:     replica.membership.Primary(replica.view),
 	}
 }
@@ -609,12 +640,25 @@ func (replica *Replica) handleSMCompletion(event replicaEvent) {
 		if &entry.completion != event.completion || entry.generation != event.generation {
 			continue
 		}
-		if result.Err != nil || result.Kind != SMCompletionPrefetch || entry.stage != CommitStagePrefetch {
+		if result.Err != nil {
 			replica.fail(errors.Join(ErrStateMachine, result.Err))
 			return
 		}
-		entry.token = result.Prefetch
-		entry.stage = CommitStageStall
+		switch result.Kind {
+		case SMCompletionPrefetch:
+			if entry.stage != CommitStagePrefetch {
+				replica.fail(ErrReplicaInvariant)
+				return
+			}
+			entry.token = result.Prefetch
+			entry.stage = CommitStageStall
+		case SMCompletionCompact:
+			replica.applyCompact(entry, result.Compact)
+		case SMCompletionCheckpoint:
+			replica.applyCheckpoint(entry, result.Manifest)
+		default:
+			replica.fail(ErrReplicaInvariant)
+		}
 		return
 	}
 	replica.metrics.staleCompletions.Add(1)

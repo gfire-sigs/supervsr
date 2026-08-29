@@ -59,6 +59,7 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, proce
 	}
 	repairHeaders := false
 	faulty := uint32(0)
+	firstFaulty := -1
 	for slot := range count {
 		context := WALRecoveryContext{
 			PhysicalSlot: uint64(slot),
@@ -87,6 +88,9 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, proce
 			wal.slots[slot].Dirty = true
 			wal.slots[slot].Faulty = true
 			faulty++
+			if firstFaulty == -1 {
+				firstFaulty = slot
+			}
 		case WALRecoveryFail:
 			return WALRecoveryReport{}, fmt.Errorf("%w: impossible physical slot %d", ErrWALRecovery, slot)
 		default:
@@ -94,7 +98,7 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, proce
 		}
 	}
 	if faulty != 0 && wal.memberCount == 1 {
-		return WALRecoveryReport{}, ErrWALUncertainSolo
+		return WALRecoveryReport{}, fmt.Errorf("%w: %d faulty slots, first physical slot %d header=%+v prepare=%+v", ErrWALUncertainSolo, faulty, firstFaulty, headerCandidates[firstFaulty], prepareCandidates[firstFaulty])
 	}
 	if repairHeaders {
 		if err := wal.storage.WriteAt(wal.headerRing, wal.layout.HeaderBase); err != nil {

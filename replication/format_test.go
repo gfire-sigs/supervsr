@@ -196,7 +196,11 @@ func (storage *crashStorage) Resize(size uint64) error {
 	if storage.fail() {
 		return ErrStorage
 	}
-	storage.working = make([]byte, int(size))
+	if size <= uint64(len(storage.working)) {
+		storage.working = storage.working[:size]
+		return nil
+	}
+	storage.working = append(storage.working, make([]byte, int(size)-len(storage.working))...)
 	return nil
 }
 

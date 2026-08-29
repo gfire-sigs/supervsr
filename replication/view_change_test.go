@@ -142,7 +142,52 @@ func installJoinRecord(replica *Replica, sender uint8, head, commit protocol.Op,
 	copy(replica.joinHeaderSlice(sender), headers)
 }
 
+func TestViewChangeWaitsForCheckpointTransition(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	machine := &testStateMachine{capacities: StateMachineCapacities{
+		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+	}}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, replica)
+	replica.pipelineLen = 1
+	replica.pipeline[0].header = initial.HeadHeader
+	replica.pipeline[0].stage = CommitStageCheckpointData
+	replica.beginViewChange(1)
+	if replica.view != 0 || replica.pendingView != 1 || replica.viewIO != (IOHandle{}) {
+		t.Fatalf("checkpoint did not defer view: view=%d pending=%d io=%+v", replica.view, replica.pendingView, replica.viewIO)
+	}
+	replica.pipelineLen = 0
+	replica.pipeline[0] = pipelineEntry{}
+	if !replica.resumePendingViewChange() {
+		t.Fatal("pending view did not resume")
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for replica.durableView != 1 {
+		if _, err := replica.Process(8); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-deadline.C:
+			t.Fatalf("view persistence stalled: %+v", replica.Snapshot())
+		default:
+		}
+	}
+	if replica.fatalErr != nil {
+		t.Fatal(replica.fatalErr)
+	}
+}
 func threeReplicaFormat(t testing.TB) (Config, *crashStorage) {
+
 	t.Helper()
 	cluster := compactTestClusterConfig()
 	membership := Membership{Members: [MembersMax]protocol.MemberID{{1}, {2}, {3}}, ActiveCount: 3, LocalMember: protocol.MemberID{2}}

@@ -198,6 +198,89 @@ func TestReplicaConcurrentCloseOwnsShutdownOnce(t *testing.T) {
 	}
 }
 
+func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	bus := &captureBus{}
+	capacities := StateMachineCapacities{
+		RequestBytes:  uint32(config.Cluster.ApplicationBatchSizeMax),
+		ReplyBytes:    uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax:   uint32(config.Cluster.PipelineMax),
+		CheckpointMax: 1,
+	}
+	machine := &testStateMachine{capacities: capacities}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: bus,
+		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := protocol.NewFramePool(2, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.ClientID{12}
+	registration := makeClientRequest(t, pool, config.Group, client, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	if err := replica.Submit(registration); err != nil {
+		t.Fatal(err)
+	}
+	processReplicaUntil(t, replica, 1)
+	registrationHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone {
+		t.Fatalf("registration reply: %v", reason)
+	}
+	session := protocol.Session(replyCommit(&registrationHeader))
+	parent := replyContext(&registrationHeader)
+	for requestNo := protocol.RequestNo(1); requestNo <= 110; requestNo++ {
+		request := makeClientRequest(t, pool, config.Group, client, session, requestNo, parent, protocol.OperationNoop, nil)
+		if err := replica.Submit(request); err != nil {
+			t.Fatal(err)
+		}
+		processReplicaUntil(t, replica, protocol.Op(requestNo)+1)
+		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		if replyReason != protocol.RejectNone {
+			t.Fatalf("request %d reply: %v", requestNo, replyReason)
+		}
+		parent = replyContext(&reply)
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for snapshot := replica.Snapshot(); snapshot.Checkpoint.PrepareOp() != 95 || snapshot.PipelineLen != 0; snapshot = replica.Snapshot() {
+		if _, err := replica.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-replica.notify:
+		case <-deadline.C:
+			t.Fatalf("checkpoint did not finish: %+v", replica.Snapshot())
+		default:
+		}
+	}
+	if machine.compacts != 7 || machine.checkpoints != 1 {
+		t.Fatalf("maintenance compacts=%d checkpoints=%d", machine.compacts, machine.checkpoints)
+	}
+	closeReplica(t, replica)
+	storage.Crash()
+	reopened, err := Open(context.Background(), config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 20, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, reopened)
+	reopenedSnapshot := reopened.Snapshot()
+	if reopenedSnapshot.Checkpoint.PrepareOp() != 95 || reopenedSnapshot.CommitMin != 111 {
+		t.Fatalf("reopened checkpoint: %+v", reopenedSnapshot)
+	}
+	if _, _, found := reopened.sessions.Reply(client, session, 110); !found {
+		t.Fatal("reopened session reply missing")
+	}
+}
+
 func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *WAL, *ReplyStore, *SessionTable, *SuperblockStore) {
 	t.Helper()
 	cluster := compactTestClusterConfig()
@@ -231,6 +314,9 @@ func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *
 	}
 	wal, err := NewWAL(storage, cluster, config.Group, 1)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.Recover(superblock.State.Checkpoint, superblock.State.CommitMax, config.Process); err != nil {
 		t.Fatal(err)
 	}
 	replies, err := NewReplyStore(storage, cluster, config.Group, 1)
@@ -571,6 +657,8 @@ type testStateMachine struct {
 	resetPending    bool
 	resetStarted    chan struct{}
 	resetCompletion *SMCompletion
+	compacts        int
+	checkpoints     int
 }
 
 func (machine *testStateMachine) Capacities() StateMachineCapacities      { return machine.capacities }
@@ -586,9 +674,11 @@ func (machine *testStateMachine) Commit(input CommitInput, _ PrefetchToken, repl
 	return length, nil
 }
 func (machine *testStateMachine) StartCompact(CompactInput, *SMCompletion) (StartResult[CompactResult], error) {
+	machine.compacts++
 	return Ready(CompactResult{}), nil
 }
 func (machine *testStateMachine) StartCheckpoint(CheckpointInput, *SMCompletion) (StartResult[CheckpointManifest], error) {
+	machine.checkpoints++
 	return Ready(CheckpointManifest{}), nil
 }
 func (machine *testStateMachine) StartOpen(OpenCheckpointInput, *SMCompletion) (StartResult[OpenResult], error) {

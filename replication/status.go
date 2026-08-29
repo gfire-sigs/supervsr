@@ -43,6 +43,7 @@ type ReplicaSnapshot struct {
 	CommitMax   protocol.Op
 	Checkpoint  CheckpointState
 	PipelineLen uint32
+	Committing  bool
 	Primary     protocol.ReplicaIndex
 }
 
@@ -95,7 +96,14 @@ func validateReplicaSnapshot(snapshot ReplicaSnapshot, config ClusterConfig, loc
 		if snapshot.CommitMin != snapshot.CommitMax {
 			return invalid("normal primary commit bounds differ")
 		}
-		if snapshot.HeadOp-snapshot.CommitMin != protocol.Op(snapshot.PipelineLen) {
+		pending := snapshot.PipelineLen
+		if snapshot.Committing {
+			if pending == 0 {
+				return invalid("commit maintenance has no pipeline entry")
+			}
+			pending--
+		}
+		if snapshot.HeadOp-snapshot.CommitMin != protocol.Op(pending) {
 			return invalid("normal primary pipeline length differs from head")
 		}
 	}

@@ -59,6 +59,20 @@ func TestCheckpointRejectsInvalidReferenceAndReservation(t *testing.T) {
 	}
 }
 
+func TestCheckpointRejectsOversizedEWAHTrailer(t *testing.T) {
+	validation, superblock := validSuperblockFixture(t)
+	checkpointValidation := checkpointValidationFor(t, validation)
+	state := superblock.State.Checkpoint
+	state.LogicalStorageSize += validation.Cluster.BlockSize
+	state.AcquiredTrailerLastAddress = checkpointValidation.BlockBase
+	state.AcquiredTrailerLastChecksum = protocol.Checksum{1}
+	state.AcquiredAggregateChecksum = protocol.Checksum{2}
+	state.AcquiredTrailerEncodedSize = 24
+	if err := state.Validate(checkpointValidation); !errors.Is(err, ErrInvalidCheckpoint) {
+		t.Fatalf("oversized EWAH error = %v", err)
+	}
+}
+
 func TestSuperblockCopiesShareLogicalChecksum(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	var first, second [SuperblockBytes]byte
@@ -246,6 +260,7 @@ func checkpointValidationFor(t testing.TB, validation SuperblockValidation) Chec
 		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
 		BlockBase:      blockBase,
 		BlockSize:      validation.Cluster.BlockSize,
+		ClientsMax:     validation.Cluster.ClientsMax,
 	}
 }
 

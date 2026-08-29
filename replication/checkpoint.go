@@ -46,6 +46,7 @@ type CheckpointValidation struct {
 	MemberCount    uint8
 	BlockBase      uint64
 	BlockSize      uint64
+	ClientsMax     uint64
 }
 
 func (state *CheckpointState) Encode(destination []byte) error {
@@ -123,11 +124,26 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 	if state.Release == 0 || state.LogicalStorageSize < validation.BlockBase || validation.BlockSize == 0 || (state.LogicalStorageSize-validation.BlockBase)%validation.BlockSize != 0 {
 		return ErrInvalidCheckpoint
 	}
+	blockCount := (state.LogicalStorageSize - validation.BlockBase) / validation.BlockSize
 	emptyChecksum := protocol.ChecksumBytes(nil)
-	if !validTrailerReference(state.AcquiredTrailerLastAddress, state.AcquiredTrailerEncodedSize, state.AcquiredTrailerLastChecksum, state.AcquiredAggregateChecksum, emptyChecksum) ||
-		!validTrailerReference(state.ReleasedTrailerLastAddress, state.ReleasedTrailerEncodedSize, state.ReleasedTrailerLastChecksum, state.ReleasedAggregateChecksum, emptyChecksum) ||
-		!validTrailerReference(state.SessionTrailerLastAddress, state.SessionTrailerEncodedSize, state.SessionTrailerLastChecksum, state.SessionAggregateChecksum, emptyChecksum) {
+	if !validEWAHTrailerReference(state.AcquiredTrailerLastAddress, state.AcquiredTrailerEncodedSize, state.AcquiredTrailerLastChecksum, state.AcquiredAggregateChecksum, emptyChecksum, blockCount) {
 		return ErrInvalidCheckpoint
+	}
+	if !validEWAHTrailerReference(state.ReleasedTrailerLastAddress, state.ReleasedTrailerEncodedSize, state.ReleasedTrailerLastChecksum, state.ReleasedAggregateChecksum, emptyChecksum, blockCount) {
+		return ErrInvalidCheckpoint
+	}
+	sessionSize, ok := checkedMul(validation.ClientsMax, protocol.HeaderSize+8)
+	if !ok || !validSessionTrailerReference(state.SessionTrailerLastAddress, state.SessionTrailerEncodedSize, state.SessionTrailerLastChecksum, state.SessionAggregateChecksum, emptyChecksum, sessionSize) {
+		return ErrInvalidCheckpoint
+	}
+	references := [...]uint64{
+		state.AcquiredTrailerLastAddress, state.ReleasedTrailerLastAddress, state.SessionTrailerLastAddress,
+		state.OldestManifestAddress, state.NewestManifestAddress, state.SnapshotRootAddress,
+	}
+	for _, address := range references {
+		if address != 0 && !validCheckpointBlockAddress(address, validation.BlockBase, validation.BlockSize, state.LogicalStorageSize) {
+			return ErrInvalidCheckpoint
+		}
 	}
 	if !validManifestReferences(state) || !validOptionalReference(state.SnapshotRootAddress, state.SnapshotRootChecksum) {
 		return ErrInvalidCheckpoint
@@ -147,11 +163,31 @@ func (state *CheckpointState) PrepareOp() protocol.Op {
 	return protocol.Op(binary.LittleEndian.Uint64(state.Header[224:232]))
 }
 
-func validTrailerReference(address, encodedSize uint64, last, aggregate, empty protocol.Checksum) bool {
+func validEWAHTrailerReference(address, encodedSize uint64, last, aggregate, empty protocol.Checksum, blockCount uint64) bool {
 	if address == 0 {
 		return encodedSize == 0 && last.IsZero() && aggregate == empty
 	}
-	return encodedSize != 0
+	words := blockCount / 64
+	if blockCount%64 != 0 {
+		words++
+	}
+	maximumWords, ok := checkedAdd(words, 1)
+	if !ok {
+		return false
+	}
+	maximumBytes, ok := checkedMul(maximumWords, 8)
+	return ok && encodedSize != 0 && encodedSize%8 == 0 && encodedSize <= maximumBytes && !last.IsZero()
+}
+
+func validSessionTrailerReference(address, encodedSize uint64, last, aggregate, empty protocol.Checksum, expectedSize uint64) bool {
+	if address == 0 {
+		return encodedSize == 0 && last.IsZero() && aggregate == empty
+	}
+	return encodedSize == expectedSize && expectedSize != 0 && !last.IsZero()
+}
+
+func validCheckpointBlockAddress(address, base, blockSize, logical uint64) bool {
+	return address >= base && address < logical && (address-base)%blockSize == 0
 }
 
 func validManifestReferences(state *CheckpointState) bool {

@@ -156,6 +156,7 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 		Group:          validation.Group,
 		MessageSizeMax: uint32(validation.Cluster.MessageSizeMax),
 		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
+		ClientsMax:     validation.Cluster.ClientsMax,
 	}
 	checkpointValidation.BlockBase, _ = validation.Cluster.BlockBase()
 	checkpointValidation.BlockSize = validation.Cluster.BlockSize
@@ -223,6 +224,7 @@ func decodeDurableReplicaState(source []byte, validation SuperblockValidation) (
 		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
 		BlockBase:      blockBase,
 		BlockSize:      validation.Cluster.BlockSize,
+		ClientsMax:     validation.Cluster.ClientsMax,
 	})
 	if err != nil {
 		return DurableReplicaState{}, err

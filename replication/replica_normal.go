@@ -260,6 +260,8 @@ func (replica *Replica) handleIOCompletion(completion IOCompletion) {
 			}
 		case IOReplyWrite:
 			replica.finishCommit(entry)
+		case IOSuperblockPersist:
+			replica.finishCheckpointPersistence(entry)
 		default:
 			replica.fail(ErrReplicaInvariant)
 		}
@@ -346,7 +348,7 @@ func (replica *Replica) handleCommit(header protocol.Header, sample TimeSample) 
 }
 
 func (replica *Replica) advanceCommit() {
-	if replica.pipelineLen == 0 || replica.fatalErr != nil {
+	if replica.status != StatusNormal || replica.pipelineLen == 0 || replica.fatalErr != nil {
 		return
 	}
 	entry := replica.pipelineEntry(0)
@@ -564,14 +566,7 @@ func (replica *Replica) finishCommit(entry *pipelineEntry) {
 	}
 	replica.lastCommitTimestamp = prepareTimestamp(&entry.header)
 	replica.metrics.operationsCommitted.Add(1)
-	entry.stage = CommitStageCheckpointDurable
-	entry.stage = CommitStageCompact
-	entry.stage = CommitStageCheckpointData
-	entry.stage = CommitStageCheckpointSuperblock
-	replica.popPipeline()
-	replica.stage = CommitStageIdle
-	replica.dequeueRequest()
-	replica.advanceCommit()
+	replica.continueCommitMaintenance(entry)
 }
 
 func (replica *Replica) sendReply(entry *pipelineEntry) {

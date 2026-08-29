@@ -65,8 +65,12 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if err != nil {
 		return nil, err
 	}
-	if durable.State.Checkpoint.SessionTrailerLastAddress != 0 {
-		return nil, ErrSessionEncoding
+	blocks, err := openBlockRuntime(dependencies.Storage, config, durable.State.Checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadSessionTrailer(blocks, durable.State.Checkpoint, sessions); err != nil {
+		return nil, err
 	}
 	startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
 	if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, startup); err != nil {
@@ -83,7 +87,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if err != nil {
 		return nil, err
 	}
-	replica, err := newReplica(config, dependencies, initial, wal, replyStore, sessions, superblocks)
+	replica, err := newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, blocks)
 	if err != nil {
 		return nil, err
 	}

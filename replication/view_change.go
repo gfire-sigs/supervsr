@@ -52,9 +52,17 @@ func (replica *Replica) handleExitView(header protocol.Header) {
 }
 
 func (replica *Replica) beginViewChange(target protocol.View) {
-	if target <= replica.view || replica.status == StatusRecoveringHead || replica.viewIO != (IOHandle{}) {
+	if target <= replica.view || replica.status == StatusRecoveringHead {
 		return
 	}
+	if replica.viewIO != (IOHandle{}) || replica.checkpointTransitionActive() {
+		replica.pendingView = max(replica.pendingView, target)
+		return
+	}
+	replica.beginViewChangeNow(target)
+}
+
+func (replica *Replica) beginViewChangeNow(target protocol.View) {
 	replica.status = StatusViewChange
 	replica.view = target
 	replica.exitViewBits = 0
@@ -152,6 +160,9 @@ func (replica *Replica) handleViewPersistence(completion IOCompletion) bool {
 	}
 	replica.durableView = replica.view
 	if !replica.viewInstall {
+		if replica.resumePendingViewChange() {
+			return true
+		}
 		replica.sendJoinView()
 		return true
 	}
@@ -165,10 +176,24 @@ func (replica *Replica) handleViewPersistence(completion IOCompletion) bool {
 			replica.countPrepareAck(entry, replica.local)
 		}
 	}
+	if replica.resumePendingViewChange() {
+		return true
+	}
+
 	if replica.isPrimary() {
 		replica.broadcastView()
 	}
 	replica.advanceCommit()
+	return true
+}
+func (replica *Replica) resumePendingViewChange() bool {
+	if replica.pendingView <= replica.view {
+		replica.pendingView = 0
+		return false
+	}
+	target := replica.pendingView
+	replica.pendingView = 0
+	replica.beginViewChangeNow(target)
 	return true
 }
 
@@ -452,7 +477,13 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	if replica.status != StatusViewChange || replica.durableView != header.View || replica.viewIO != (IOHandle{}) {
 		return
 	}
-	validation := CheckpointValidation{Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax), MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount, BlockSize: replica.config.Cluster.BlockSize}
+	validation := CheckpointValidation{
+		Group:          replica.config.Group,
+		MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
+		MemberCount:    replica.membership.ActiveCount + replica.membership.StandbyCount,
+		BlockSize:      replica.config.Cluster.BlockSize,
+		ClientsMax:     replica.config.Cluster.ClientsMax,
+	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
 	checkpoint, err := DecodeCheckpointState(body[:CheckpointStateSize], validation)
 	if err != nil || checkpoint.PrepareOp() != replica.checkpoint.PrepareOp() {
