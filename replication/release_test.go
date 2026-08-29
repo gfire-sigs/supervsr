@@ -248,10 +248,32 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	if executor.calls != 0 {
 		t.Fatal("release executed before IO completion")
 	}
+	replica.submitters.Add(1)
 	close(blocked.release)
 
 	deadline := time.NewTimer(time.Second)
 	defer deadline.Stop()
+	for !ioEngine.Drained() {
+		select {
+		case <-ioEngine.Ready():
+			if _, err := replica.Process(64); err != nil {
+				t.Fatal(err)
+			}
+		case <-deadline.C:
+			t.Fatal("IO did not drain")
+		}
+	}
+	if executor.calls != 0 {
+		t.Fatal("release executed while a submitter owned admission")
+	}
+	late, err := replica.frames.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replica.events.TryPush(replicaEvent{kind: replicaEventMessage, message: late}) {
+		t.Fatal("late admitted message was not queued")
+	}
+	replica.submitters.Add(-1)
 	for executor.calls == 0 {
 		_, processErr := replica.Process(64)
 		if processErr != nil && !errors.Is(processErr, executeErr) {

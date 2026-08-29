@@ -307,8 +307,13 @@ func (replica *Replica) processReleaseActivation(limit int) (int, error) {
 		}
 		var event replicaEvent
 		if !replica.events.TryPop(&event) {
-			drained = true
-			break
+			if replica.submitters.Load() != 0 {
+				break
+			}
+			if !replica.events.TryPop(&event) {
+				drained = true
+				break
+			}
 		}
 		switch event.kind {
 		case replicaEventMessage:
@@ -327,12 +332,22 @@ func (replica *Replica) processReleaseActivation(limit int) (int, error) {
 		}
 		processed++
 	}
-	if replica.fatalErr == nil && drained && replica.releaseResetDone && replica.io.Drained() {
+	if replica.releaseReadyToExecute(drained) {
 		target := replica.releaseActivation
 		replica.releaseOwnedFrames()
 		replica.executeRelease(target)
 	}
 	return processed, replica.fatalErr
+}
+
+func (replica *Replica) releaseReadyToExecute(eventsDrained bool) bool {
+	if replica.fatalErr != nil || !eventsDrained || !replica.releaseResetDone {
+		return false
+	}
+	if !replica.io.Drained() {
+		return false
+	}
+	return replica.submitters.Load() == 0
 }
 
 func (replica *Replica) executeRelease(target protocol.Release) {
