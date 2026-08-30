@@ -18,13 +18,14 @@ const (
 )
 
 type packet struct {
-	frame     []byte
-	client    protocol.ClientID
-	sequence  uint64
-	deliverAt uint64
-	from      protocol.ReplicaIndex
-	to        protocol.ReplicaIndex
-	kind      packetKind
+	frame      []byte
+	client     protocol.ClientID
+	sequence   uint64
+	deliverAt  uint64
+	from       protocol.ReplicaIndex
+	to         protocol.ReplicaIndex
+	kind       packetKind
+	fromMember bool
 }
 
 type corruption struct {
@@ -32,7 +33,6 @@ type corruption struct {
 	mask   byte
 	armed  bool
 }
-
 type Network struct {
 	mu          sync.Mutex
 	pool        *protocol.FramePool
@@ -46,6 +46,7 @@ type Network struct {
 	corrupt     corruption
 	fault       error
 	queue       []packet
+	members     [replication.MembersMax]protocol.MemberID
 	links       [replication.MembersMax][replication.MembersMax]bool
 	replicas    [replication.MembersMax]func(*protocol.Frame) error
 	clients     map[protocol.ClientID]func(protocol.ReplicaIndex, []byte)
@@ -64,6 +65,7 @@ func NewNetwork(memberCount uint8, messageSizeMax uint32, maximumPackets uint32)
 		queue: make([]packet, 0, int(maximumPackets)), clients: make(map[protocol.ClientID]func(protocol.ReplicaIndex, []byte)),
 	}
 	for from := range memberCount {
+		network.members[from][15] = from + 1
 		for to := range memberCount {
 			network.links[from][to] = true
 		}
@@ -160,7 +162,17 @@ func (network *Network) DeliverReady() (int, error) {
 		}
 		if replicaSubmit != nil {
 			frame, err := network.pool.AcquireEncoded(packet.frame)
+			if err == nil {
+				if packet.fromMember {
+					err = frame.BindReplica(network.members[packet.from], packet.from)
+				} else {
+					err = frame.BindClient()
+				}
+			}
 			if err != nil {
+				if frame != nil {
+					frame.Release()
+				}
 				return delivered, err
 			}
 			if err := replicaSubmit(frame); err != nil {
@@ -231,7 +243,7 @@ func (network *Network) enqueue(from protocol.ReplicaIndex, fromMember bool, kin
 		network.sequence++
 		network.queue = append(network.queue, packet{
 			frame: frame, client: client, sequence: network.sequence, deliverAt: network.now + network.delay,
-			from: from, to: to, kind: kind,
+			from: from, to: to, kind: kind, fromMember: fromMember,
 		})
 	}
 }

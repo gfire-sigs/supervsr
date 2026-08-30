@@ -16,9 +16,13 @@ func (replica *Replica) handleMessage(message *Message) bool {
 	header, body, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
 	if reason != protocol.RejectNone {
 		replica.metrics.framesRejected.Add(1)
+		if reason == protocol.RejectCommand {
+			replica.fail(ErrProtocolInvariant)
+		}
 		return false
 	}
-	context := replica.validationContext(header.Author)
+	source, _, sender := message.Source()
+	context := replica.validationContext(source, sender)
 	if semanticReason := protocol.ValidateSemantics(&header, body, context); semanticReason != protocol.RejectNone {
 		if eviction, reflect := replica.invalidRequestEviction(header, body); reflect {
 			replica.sendEviction(requestClient(&header), eviction)
@@ -72,9 +76,9 @@ func (replica *Replica) handleMessage(message *Message) bool {
 	return false
 }
 
-func (replica *Replica) validationContext(sender protocol.ReplicaIndex) protocol.ValidationContext {
+func (replica *Replica) validationContext(source protocol.FrameSource, sender protocol.ReplicaIndex) protocol.ValidationContext {
 	return protocol.ValidationContext{
-		Authenticated: true, Sender: sender,
+		Authenticated: source != protocol.FrameSourceUnbound, ReplicaSource: source == protocol.FrameSourceReplica, Sender: sender,
 		ActiveCount: replica.membership.ActiveCount, MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
 		PipelineMax: uint8(replica.config.Cluster.PipelineMax), ReleaseHistoryMax: uint16(replica.config.Cluster.ReleaseHistoryMax),
 		ApplicationBatchSizeMax: uint32(replica.config.Cluster.ApplicationBatchSizeMax),

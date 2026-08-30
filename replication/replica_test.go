@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,6 +189,108 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatalf("reconfiguration reached application state machine: commits=%d", machine.commits)
 	}
 }
+func TestReplicaRejectsUnboundAndUnknownMemberFrames(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	metrics := &ReplicaMetrics{}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+		}},
+		Metrics: metrics,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, replica)
+	pool, err := protocol.NewFramePool(3, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := makeClientRequest(t, pool, config.Group, protocol.ClientID{7}, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	encoded, err := bound.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unbound, err := pool.AcquireEncoded(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound.Release()
+	if err := replica.Submit(unbound); !errors.Is(err, ErrAuthentication) {
+		t.Fatalf("unbound submit error = %v, want %v", err, ErrAuthentication)
+	}
+	unbound.Release()
+	unknownMember, err := pool.AcquireEncoded(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unknownMember.BindReplica(protocol.MemberID{2}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(unknownMember); !errors.Is(err, ErrAuthentication) {
+		t.Fatalf("unknown member submit error = %v, want %v", err, ErrAuthentication)
+	}
+	unknownMember.Release()
+	wrongIdentity, err := pool.AcquireEncoded(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wrongIdentity.BindReplica(protocol.MemberID{2}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(wrongIdentity); !errors.Is(err, ErrAuthentication) {
+		t.Fatalf("wrong identity submit error = %v, want %v", err, ErrAuthentication)
+	}
+	wrongIdentity.Release()
+	if rejected := metrics.Snapshot().FramesRejected; rejected != 3 {
+		t.Fatalf("rejected frames = %d, want 3", rejected)
+	}
+}
+func TestReplicaFailStopsUnknownSupportedCommand(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+		}},
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, replica)
+	pool, err := protocol.NewFramePool(2, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := makeClientRequest(t, pool, config.Group, protocol.ClientID{7}, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	requestBytes, err := request.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := append([]byte(nil), requestBytes...)
+	request.Release()
+	encoded[114] = 0xff
+	checksum := protocol.ChecksumBytes(encoded[protocol.HeaderChecksumFrom:])
+	copy(encoded[:16], checksum[:])
+	unknown, err := pool.AcquireEncoded(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unknown.BindClient(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Submit(unknown); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.Process(1); !errors.Is(err, ErrProtocolInvariant) {
+		t.Fatalf("process error = %v, want %v", err, ErrProtocolInvariant)
+	}
+}
 
 func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
@@ -217,6 +320,9 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	copy(pingHeader.Fields[:16], client[:])
 	binary.LittleEndian.PutUint64(pingHeader.Fields[16:24], 99)
 	if err := ping.Seal(&pingHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := ping.BindClient(); err != nil {
 		t.Fatal(err)
 	}
 	if err := replica.Submit(ping); err != nil {
@@ -271,6 +377,9 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	if err := malformed.Seal(&malformedHeader); err != nil {
 		t.Fatal(err)
 	}
+	if err := malformed.BindClient(); err != nil {
+		t.Fatal(err)
+	}
 	if err := replica.Submit(malformed); err != nil {
 		t.Fatal(err)
 	}
@@ -288,6 +397,9 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	binary.LittleEndian.PutUint32(futureHeader.Fields[64:68], 4)
 	futureHeader.Fields[68] = byte(protocol.OperationApplicationMin)
 	if err := future.Seal(&futureHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := future.BindClient(); err != nil {
 		t.Fatal(err)
 	}
 	if err := replica.Submit(future); err != nil {
@@ -532,6 +644,9 @@ func makeReplicaCommand(t testing.TB, pool *protocol.FramePool, header protocol.
 	if err := frame.Seal(&header); err != nil {
 		t.Fatal(err)
 	}
+	if err := frame.BindReplica(protocol.MemberID{byte(header.Author) + 1}, header.Author); err != nil {
+		t.Fatal(err)
+	}
 	return frame
 }
 func processReplicaNetworkMessages(t testing.TB, replica *Replica, bus *captureBus, messages int) {
@@ -638,6 +753,9 @@ func makeClientRequest(t testing.TB, pool *protocol.FramePool, group protocol.Gr
 	binary.LittleEndian.PutUint32(header.Fields[64:68], uint32(request))
 	header.Fields[68] = byte(operation)
 	if err := frame.Seal(&header); err != nil {
+		t.Fatal(err)
+	}
+	if err := frame.BindClient(); err != nil {
 		t.Fatal(err)
 	}
 	return frame
@@ -822,6 +940,9 @@ func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {
 	if err := ping.Seal(&pingHeader); err != nil {
 		t.Fatal(err)
 	}
+	if err := ping.BindReplica(protocol.MemberID{1}, 0); err != nil {
+		t.Fatal(err)
+	}
 	pong, err := pool.Acquire(0)
 	if err != nil {
 		t.Fatal(err)
@@ -830,6 +951,9 @@ func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {
 	binary.LittleEndian.PutUint64(pongHeader.Fields[:8], 11)
 	binary.LittleEndian.PutUint64(pongHeader.Fields[8:16], 22)
 	if err := pong.Seal(&pongHeader); err != nil {
+		t.Fatal(err)
+	}
+	if err := pong.BindReplica(protocol.MemberID{1}, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := replica.Submit(ping); err != nil {

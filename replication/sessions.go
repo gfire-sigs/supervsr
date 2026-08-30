@@ -329,6 +329,7 @@ func (table *SessionTable) validateOccupied(reply protocol.Header, session proto
 	}
 	context := protocol.ValidationContext{
 		Authenticated:           true,
+		ReplicaSource:           true,
 		Sender:                  reply.Author,
 		ActiveCount:             table.config.ActiveCount,
 		MemberCount:             table.config.ActiveCount,

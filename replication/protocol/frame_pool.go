@@ -11,6 +11,15 @@ var (
 	ErrFramePoolEmpty   = errors.New("protocol: frame pool exhausted")
 	ErrFrameTooLarge    = errors.New("protocol: frame exceeds configured maximum")
 	ErrFrameSealed      = errors.New("protocol: frame is immutable")
+	ErrFrameSource      = errors.New("protocol: invalid authenticated frame source")
+)
+
+type FrameSource uint8
+
+const (
+	FrameSourceUnbound FrameSource = iota
+	FrameSourceClient
+	FrameSourceReplica
 )
 
 type FramePool struct {
@@ -24,10 +33,12 @@ type FramePool struct {
 type Frame struct {
 	pool   *FramePool
 	buffer []byte
+	member MemberID
 	index  uint32
 	next   atomic.Uint32
 	refs   atomic.Int32
 	sealed atomic.Bool
+	source atomic.Uint32
 	size   uint32
 }
 
@@ -91,6 +102,40 @@ func (pool *FramePool) AcquireEncoded(encoded []byte) (*Frame, error) {
 	frame.sealed.Store(true)
 	frame.refs.Store(1)
 	return frame, nil
+}
+func (frame *Frame) BindClient() error {
+	return frame.bindSource(1)
+}
+
+func (frame *Frame) BindReplica(member MemberID, sender ReplicaIndex) error {
+	if member.IsZero() || !frame.sealed.Load() || frame.refs.Load() != 1 || !frame.source.CompareAndSwap(0, math.MaxUint32) {
+		return ErrFrameSource
+	}
+	frame.member = member
+	frame.source.Store(uint32(sender) + 2)
+	return nil
+}
+
+func (frame *Frame) Source() (FrameSource, MemberID, ReplicaIndex) {
+	if frame.refs.Load() <= 0 {
+		return FrameSourceUnbound, MemberID{}, 0
+	}
+	source := frame.source.Load()
+	switch source {
+	case 0, math.MaxUint32:
+		return FrameSourceUnbound, MemberID{}, 0
+	case 1:
+		return FrameSourceClient, MemberID{}, 0
+	default:
+		return FrameSourceReplica, frame.member, ReplicaIndex(source - 2)
+	}
+}
+
+func (frame *Frame) bindSource(source uint32) error {
+	if !frame.sealed.Load() || frame.refs.Load() != 1 || !frame.source.CompareAndSwap(0, source) {
+		return ErrFrameSource
+	}
+	return nil
 }
 
 func (pool *FramePool) Available() uint32 {
@@ -165,6 +210,8 @@ func (frame *Frame) Release() {
 		panic("protocol: frame reference underflow")
 	}
 	frame.sealed.Store(false)
+	frame.source.Store(0)
+	frame.member = MemberID{}
 	frame.size = 0
 	frame.pool.push(frame)
 }

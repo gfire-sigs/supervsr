@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"testing"
 	"time"
 
@@ -31,6 +32,19 @@ func TestCanonicalSuffixSelectionAndNegativeTruncation(t *testing.T) {
 	commit, head, count, resolved = replica.selectCanonicalSuffix()
 	if !resolved || commit != 0 || head != 1 || count != 2 {
 		t.Fatalf("truncation = commit %d head %d count %d resolved %t", commit, head, count, resolved)
+	}
+}
+func TestCanonicalSuffixFailsWhenEveryActiveReplicaIsUncertain(t *testing.T) {
+	replica, root, _, _ := canonicalFixture(t)
+	replica.status = StatusViewChange
+	replica.view = 3
+	for sender := range uint8(3) {
+		installJoinRecord(replica, sender, 1, 0, []protocol.Header{{}, root}, 0b10, 0)
+	}
+	replica.joinViewBits = 0b111
+	replica.tryInstallCanonicalView()
+	if !errors.Is(replica.fatalErr, ErrUnrecoverableConsensusState) {
+		t.Fatalf("fatal error = %v, want %v", replica.fatalErr, ErrUnrecoverableConsensusState)
 	}
 }
 
@@ -131,6 +145,9 @@ func TestExitViewQuorumPersistsBeforeJoin(t *testing.T) {
 		}
 		header := protocol.Header{Group: config.Group, View: 0, Protocol: protocol.ProtocolVersion, Command: protocol.CommandExitView, Author: protocol.ReplicaIndex(author)}
 		if err := message.Seal(&header); err != nil {
+			t.Fatal(err)
+		}
+		if err := message.BindReplica(config.Membership.Members[header.Author], header.Author); err != nil {
 			t.Fatal(err)
 		}
 		if err := replica.Submit(message); err != nil {

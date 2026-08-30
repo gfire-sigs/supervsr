@@ -207,6 +207,7 @@ func (client *Client) HandleFrame(sender protocol.ReplicaIndex, frame []byte) {
 		return
 	}
 	context := protocol.ValidationContext{
+		ReplicaSource: true,
 		Authenticated: true, Sender: sender, ActiveCount: client.config.ActiveCount, MemberCount: client.config.ActiveCount,
 		PipelineMax: 15, ReleaseHistoryMax: 1, ApplicationBatchSizeMax: client.config.MessageSizeMax - protocol.HeaderSize,
 		ApplicationReplySizeMax: client.config.MessageSizeMax - protocol.HeaderSize, RepairRequestsMax: 1,

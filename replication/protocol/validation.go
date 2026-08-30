@@ -4,6 +4,7 @@ import "encoding/binary"
 
 type ValidationContext struct {
 	Authenticated           bool
+	ReplicaSource           bool
 	Sender                  ReplicaIndex
 	ActiveCount             uint8
 	MemberCount             uint8
@@ -22,11 +23,18 @@ func ValidateSemantics(header *Header, body []byte, context ValidationContext) R
 	if !context.Authenticated {
 		return RejectAuthentication
 	}
-	if context.ActiveCount == 0 || context.MemberCount < context.ActiveCount || context.Sender >= ReplicaIndex(context.MemberCount) {
+	if context.ActiveCount == 0 || context.MemberCount < context.ActiveCount {
 		return RejectAuthor
 	}
+	if context.ReplicaSource {
+		if context.Sender >= ReplicaIndex(context.MemberCount) {
+			return RejectAuthor
+		}
+	} else if header.Command != CommandRequest && header.Command != CommandClientPing {
+		return RejectAuthentication
+	}
 	primary := ReplicaIndex(uint32(header.View) % uint32(context.ActiveCount))
-	if !validAuthor(header.Command, header.Author, context.Sender, primary) {
+	if !validAuthor(header.Command, header.Author, context.Sender, context.ReplicaSource, primary) {
 		return RejectAuthor
 	}
 	if !validRelease(header, context) {
@@ -35,7 +43,7 @@ func ValidateSemantics(header *Header, body []byte, context ValidationContext) R
 	return validateCommand(header, body, context)
 }
 
-func validAuthor(command Command, author, sender, primary ReplicaIndex) bool {
+func validAuthor(command Command, author, sender ReplicaIndex, replicaSource bool, primary ReplicaIndex) bool {
 	switch command {
 	case CommandRequest, CommandClientPing, CommandBlock:
 		return author == 0
@@ -44,7 +52,7 @@ func validAuthor(command Command, author, sender, primary ReplicaIndex) bool {
 	case CommandPing, CommandPong, CommandClientPong, CommandPrepareOK, CommandExitView,
 		CommandJoinView, CommandGetView, CommandGetHeaders, CommandGetPrepare, CommandGetReply,
 		CommandHeaders, CommandEviction, CommandGetBlocks:
-		return author == sender
+		return replicaSource && author == sender
 	default:
 		return false
 	}

@@ -73,12 +73,13 @@ type localTransport struct {
 
 type localBus struct {
 	transport  *localTransport
+	member     protocol.MemberID
 	from       protocol.ReplicaIndex
 	fromMember bool
 }
 
 func (bus localBus) SendReplica(to protocol.ReplicaIndex, message *replication.Message) {
-	bus.transport.sendReplica(to, message)
+	bus.transport.sendReplica(bus.member, bus.from, bus.fromMember, to, message)
 }
 
 func (bus localBus) SendClient(to protocol.ClientID, message *replication.Message) {
@@ -97,17 +98,27 @@ func (bus localBus) BroadcastReplicas(message *replication.Message) {
 		if bus.fromMember && to == bus.from {
 			continue
 		}
-		bus.transport.sendReplica(to, message)
+		bus.transport.sendReplica(bus.member, bus.from, bus.fromMember, to, message)
 	}
 }
 
-func (transport *localTransport) sendReplica(to protocol.ReplicaIndex, message *replication.Message) {
+func (transport *localTransport) sendReplica(member protocol.MemberID, from protocol.ReplicaIndex, fromMember bool, to protocol.ReplicaIndex, message *replication.Message) {
 	encoded, err := message.Bytes()
 	if err != nil {
 		return
 	}
 	frame, err := transport.pool.AcquireEncoded(encoded)
+	if err == nil {
+		if fromMember {
+			err = frame.BindReplica(member, from)
+		} else {
+			err = frame.BindClient()
+		}
+	}
 	if err != nil {
+		if frame != nil {
+			frame.Release()
+		}
 		event := transport.logger.Warn()
 		event.Err(err)
 		event.Uint8("replica", uint8(to))
@@ -250,7 +261,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 			replicaLogger,
 		)
 		replica, err := replication.Open(ctx, config, replication.Dependencies{
-			Storage: storage, MessageBus: localBus{transport: cluster.transport, from: protocol.ReplicaIndex(index), fromMember: true},
+			Storage: storage, MessageBus: localBus{transport: cluster.transport, member: identity.members[index], from: protocol.ReplicaIndex(index), fromMember: true},
 			Clock: clock, Entropy: rand.Reader, StateMachine: machine, Logger: &replicaLogger,
 		})
 		if err != nil {

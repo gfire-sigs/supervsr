@@ -12,19 +12,33 @@ func TestCommandAuthorRules(t *testing.T) {
 		CommandHeaders, CommandEviction, CommandGetBlocks,
 	}
 	for _, command := range actualSender {
-		if !validAuthor(command, 2, 2, 1) || validAuthor(command, 1, 2, 1) {
+		if !validAuthor(command, 2, 2, true, 1) || validAuthor(command, 1, 2, true, 1) || validAuthor(command, 2, 2, false, 1) {
 			t.Fatalf("command %d actual-sender author rule failed", command)
 		}
 	}
 	for _, command := range []Command{CommandRequest, CommandClientPing, CommandBlock} {
-		if !validAuthor(command, 0, 2, 1) || validAuthor(command, 2, 2, 1) {
+		if !validAuthor(command, 0, 2, true, 1) || validAuthor(command, 2, 2, true, 1) {
 			t.Fatalf("command %d zero-author rule failed", command)
 		}
 	}
 	for _, command := range []Command{CommandPrepare, CommandReply, CommandCommit, CommandView} {
-		if !validAuthor(command, 1, 2, 1) || validAuthor(command, 2, 2, 1) {
+		if !validAuthor(command, 1, 2, true, 1) || validAuthor(command, 2, 2, true, 1) {
 			t.Fatalf("command %d primary-author rule failed", command)
 		}
+	}
+}
+func TestClientSourceCannotSendReplicaControlCommands(t *testing.T) {
+	context := testValidationContext()
+	context.ReplicaSource = false
+	clientPing := Header{Command: CommandClientPing, Release: 1}
+	clientPing.Fields[0] = 1
+	binary.LittleEndian.PutUint64(clientPing.Fields[16:24], 1)
+	if reason := ValidateSemantics(&clientPing, nil, context); reason != RejectNone {
+		t.Fatalf("client ping reason = %d, want %d", reason, RejectNone)
+	}
+	exitView := Header{Command: CommandExitView, Author: context.Sender}
+	if reason := ValidateSemantics(&exitView, nil, context); reason != RejectAuthentication {
+		t.Fatalf("replica control reason = %d, want %d", reason, RejectAuthentication)
 	}
 }
 

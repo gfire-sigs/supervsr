@@ -16,10 +16,14 @@ import (
 )
 
 var (
-	ErrReplicaClosed       = errors.New("replication: replica is closed")
-	ErrReplicaRunning      = errors.New("replication: replica run loop already started")
-	ErrReplicaBackpressure = errors.New("replication: replica event queue exhausted")
-	ErrClockUnsynchronized = errors.New("replication: cluster clock is not synchronized")
+	ErrAuthentication              = errors.New("replication: unauthenticated frame")
+	ErrProtocolInvariant           = errors.New("replication: protocol invariant violated")
+	ErrQuorumUnavailable           = errors.New("replication: quorum unavailable")
+	ErrUnrecoverableConsensusState = errors.New("replication: consensus state is unrecoverable")
+	ErrReplicaClosed               = errors.New("replication: replica is closed")
+	ErrReplicaRunning              = errors.New("replication: replica run loop already started")
+	ErrReplicaBackpressure         = errors.New("replication: replica event queue exhausted")
+	ErrClockUnsynchronized         = errors.New("replication: cluster clock is not synchronized")
 )
 
 type Dependencies struct {
@@ -501,6 +505,14 @@ func (replica *Replica) Submit(frame *protocol.Frame) error {
 	defer replica.submitters.Add(-1)
 	if !replica.accepting.Load() {
 		return ErrReplicaClosed
+	}
+	source, member, sender := frame.Source()
+	memberCount := replica.membership.ActiveCount + replica.membership.StandbyCount
+	invalidReplicaSource := source == protocol.FrameSourceReplica &&
+		(uint8(sender) >= memberCount || member != replica.membership.Members[sender])
+	if source == protocol.FrameSourceUnbound || invalidReplicaSource {
+		replica.metrics.framesRejected.Add(1)
+		return ErrAuthentication
 	}
 	if _, err := frame.Bytes(); err != nil {
 		return err

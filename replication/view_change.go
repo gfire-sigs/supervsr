@@ -7,8 +7,6 @@ import (
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
 
-var ErrViewChangeUnresolved = errors.New("replication: canonical view suffix is unresolved")
-
 func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 	if header.View <= replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
 		return false
@@ -346,6 +344,9 @@ func (replica *Replica) joinHeaderSlice(sender uint8) []protocol.Header {
 func (replica *Replica) tryInstallCanonicalView() {
 	commit, head, count, resolved := replica.selectCanonicalSuffix()
 	if !resolved || commit < replica.commitMin {
+		if countAckBits(replica.joinViewBits) == replica.membership.ActiveCount {
+			replica.fail(ErrUnrecoverableConsensusState)
+		}
 		return
 	}
 	localAvailable := commit-replica.commitMin <= protocol.Op(replica.pipelineLen) &&
@@ -361,7 +362,6 @@ func (replica *Replica) tryInstallCanonicalView() {
 	}
 	replica.status = StatusRecoveringHead
 	replica.recordRecoveringView(replica.view, commit, head, count)
-	return
 }
 
 func (replica *Replica) selectCanonicalSuffix() (protocol.Op, protocol.Op, int, bool) {
@@ -392,7 +392,7 @@ func (replica *Replica) selectCanonicalSuffix() (protocol.Op, protocol.Op, int, 
 	for op := committed; op <= maximumHead; op++ {
 		candidate, found, conflict := replica.canonicalCandidate(op)
 		if conflict {
-			replica.fail(ErrReplicaInvariant)
+			replica.fail(errors.Join(ErrUnrecoverableConsensusState, ErrReplicaInvariant))
 			return 0, 0, 0, false
 		}
 		negatives, copies := replica.canonicalEvidence(op, candidate, found)

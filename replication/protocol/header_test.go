@@ -10,6 +10,7 @@ import (
 func testValidationContext() ValidationContext {
 	return ValidationContext{
 		Authenticated:           true,
+		ReplicaSource:           true,
 		Sender:                  1,
 		ActiveCount:             3,
 		MemberCount:             3,
@@ -147,6 +148,43 @@ func TestFramePoolOwnershipAndBackpressure(t *testing.T) {
 	first.Release()
 	if pool.Available() != pool.Capacity() {
 		t.Fatalf("available = %d, want %d", pool.Available(), pool.Capacity())
+	}
+}
+func TestFrameSourceBindsOnceAndResetsOnRelease(t *testing.T) {
+	pool, err := NewFramePool(1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := frame.BindClient(); !errors.Is(err, ErrFrameSource) {
+		t.Fatalf("unsealed bind error = %v, want %v", err, ErrFrameSource)
+	}
+	header := Header{Group: GroupID{1}, Protocol: ProtocolVersion, Command: CommandExitView}
+	if err := frame.Seal(&header); err != nil {
+		t.Fatal(err)
+	}
+	member := MemberID{9}
+	if err := frame.BindReplica(member, 3); err != nil {
+		t.Fatal(err)
+	}
+	source, authenticatedMember, sender := frame.Source()
+	if source != FrameSourceReplica || authenticatedMember != member || sender != 3 {
+		t.Fatalf("source = %d member = %x sender = %d", source, authenticatedMember, sender)
+	}
+	if err := frame.BindClient(); !errors.Is(err, ErrFrameSource) {
+		t.Fatalf("second bind error = %v, want %v", err, ErrFrameSource)
+	}
+	frame.Release()
+	reused, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reused.Release()
+	if source, _, _ := reused.Source(); source != FrameSourceUnbound {
+		t.Fatalf("reused source = %d, want %d", source, FrameSourceUnbound)
 	}
 }
 

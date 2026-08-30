@@ -176,7 +176,7 @@ func (replica *Replica) finishRepairRead(read *repairRead, completion IOCompleti
 	if !ok || header.HeaderChecksum != checksum {
 		return
 	}
-	context := replica.validationContext(header.Author)
+	context := replica.validationContext(protocol.FrameSourceReplica, header.Author)
 	context.MessageSizeMax = maximum
 	if protocol.ValidateSemantics(&header, frame[protocol.HeaderSize:], context) != protocol.RejectNone {
 		return

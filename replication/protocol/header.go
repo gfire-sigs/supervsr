@@ -113,7 +113,7 @@ func DecodeHeader(source []byte, expectedGroup GroupID, messageSizeMax uint32, m
 		return Header{}, RejectEpoch
 	}
 	if !header.Command.IsDefined() {
-		return Header{}, RejectCommand
+		return header, RejectCommand
 	}
 	if memberCount == 0 || uint8(header.Author) >= memberCount {
 		return Header{}, RejectAuthor
