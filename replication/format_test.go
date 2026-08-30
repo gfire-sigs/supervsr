@@ -28,6 +28,19 @@ func TestFormatCreatesRepairableInitialQuorum(t *testing.T) {
 	}
 }
 
+func TestOpenSuperblockStoreDistinguishesIncompatibleConfiguration(t *testing.T) {
+	cfg, validation := formatFixture(t)
+	storage := &crashStorage{}
+	if err := Format(t.Context(), cfg, FormatDependencies{Storage: storage}); err != nil {
+		t.Fatal(err)
+	}
+	storage.Crash()
+	validation.ConfigurationChecksum[0] ^= 0xff
+	if _, err := OpenSuperblockStore(storage, validation); !errors.Is(err, ErrIncompatibleConfiguration) {
+		t.Fatalf("open error = %v, want %v", err, ErrIncompatibleConfiguration)
+	}
+}
+
 func TestFormatCrashBeforeWriteQuorumRemainsUnformatted(t *testing.T) {
 	cfg, validation := formatFixture(t)
 	probe := &crashStorage{}

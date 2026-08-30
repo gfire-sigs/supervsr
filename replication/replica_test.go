@@ -1081,6 +1081,32 @@ func TestReplicaSingleExitSuspicionDoesNotChangeView(t *testing.T) {
 	}
 }
 
+func TestReplicaAbdicationReportsUnavailableQuorum(t *testing.T) {
+	membership := Membership{
+		Members:     [MembersMax]protocol.MemberID{{1}, {2}, {3}},
+		ActiveCount: 3,
+		LocalMember: protocol.MemberID{1},
+	}
+	frames, err := protocol.NewFramePool(1, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := &ReplicaMetrics{}
+	bus := &captureBus{}
+	replica := Replica{
+		config: Config{Group: protocol.GroupID{1}}, membership: membership, local: 0,
+		quorums: Quorums{ViewChange: 2}, status: StatusNormal, pipeline: make([]pipelineEntry, 1),
+		pipelineLen: 1, frames: frames, metrics: metrics, deps: Dependencies{MessageBus: bus},
+	}
+	replica.handleAbdicationTimeout()
+	if snapshot := metrics.Snapshot(); snapshot.QuorumUnavailable != 1 {
+		t.Fatalf("quorum unavailable metric = %d", snapshot.QuorumUnavailable)
+	}
+	if bus.replicaCount() != 1 {
+		t.Fatalf("exit-view messages = %d", bus.replicaCount())
+	}
+}
+
 func TestUnsynchronizedMultiReplicaClockSuppressesPulse(t *testing.T) {
 	membership := Membership{
 		Members:     [MembersMax]protocol.MemberID{{1}, {2}},
@@ -1088,17 +1114,32 @@ func TestUnsynchronizedMultiReplicaClockSuppressesPulse(t *testing.T) {
 		LocalMember: protocol.MemberID{1},
 	}
 	machine := &testStateMachine{pulseNeeded: true}
+	metrics := &ReplicaMetrics{}
 	replica := Replica{
 		config:     Config{Membership: membership},
 		membership: membership,
 		local:      0,
 		status:     StatusNormal,
 		deps:       Dependencies{StateMachine: machine},
+		metrics:    metrics,
 		pipeline:   make([]pipelineEntry, 1),
 	}
 	replica.handlePulseTimeout(TimeSample{Wall: 10, Monotonic: 10})
 	if replica.pipelineLen != 0 || replica.headOp != 0 {
 		t.Fatalf("unsynchronized pulse admitted: head=%d pipeline=%d", replica.headOp, replica.pipelineLen)
+	}
+	if snapshot := metrics.Snapshot(); snapshot.ClockDisagreements != 1 {
+		t.Fatalf("clock disagreement metric = %d", snapshot.ClockDisagreements)
+	}
+}
+
+func TestOpenMetricsDistinguishInvalidConfiguration(t *testing.T) {
+	metrics := &ReplicaMetrics{}
+	if _, err := Open(t.Context(), Config{}, Dependencies{Metrics: metrics}); !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("open error = %v", err)
+	}
+	if snapshot := metrics.Snapshot(); snapshot.IncompatibleConfigurations != 1 {
+		t.Fatalf("incompatible configuration metric = %d", snapshot.IncompatibleConfigurations)
 	}
 }
 

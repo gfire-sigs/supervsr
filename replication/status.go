@@ -34,17 +34,19 @@ const (
 )
 
 type ReplicaSnapshot struct {
-	Status      Status
-	View        protocol.View
-	DurableView protocol.View
-	LogView     protocol.View
-	HeadOp      protocol.Op
-	CommitMin   protocol.Op
-	CommitMax   protocol.Op
-	Checkpoint  CheckpointState
-	PipelineLen uint32
-	Committing  bool
-	Primary     protocol.ReplicaIndex
+	Status              Status
+	View                protocol.View
+	DurableView         protocol.View
+	LogView             protocol.View
+	HeadOp              protocol.Op
+	CommitMin           protocol.Op
+	CommitMax           protocol.Op
+	Checkpoint          CheckpointState
+	PipelineLen         uint32
+	CommitStage         CommitStage
+	PrepareWritePending bool
+	Committing          bool
+	Primary             protocol.ReplicaIndex
 }
 
 func validStatusTransition(from, to Status, cause TransitionCause) bool {

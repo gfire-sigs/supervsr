@@ -3,6 +3,7 @@ package replication
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
@@ -24,15 +25,72 @@ type checkpointGraph struct {
 	limit      int
 }
 
+type checkpointGraphScratch struct {
+	reachable        FixedBitSet
+	protected        FixedBitSet
+	nodes            []checkpointGraphNode
+	byAddress        map[uint64]int
+	stack            []int
+	outputs          []BlockRequirement
+	buffer           []byte
+	trailerAddresses []uint64
+	trailerBuffer    []byte
+	releaseAddresses []uint64
+}
+
+func newCheckpointGraphScratch(limit int, bitCapacity, blockSize uint64) (checkpointGraphScratch, error) {
+	reachable, err := NewFixedBitSet(bitCapacity)
+	if err != nil {
+		return checkpointGraphScratch{}, err
+	}
+	protected, err := NewFixedBitSet(bitCapacity)
+	if err != nil {
+		return checkpointGraphScratch{}, err
+	}
+	return checkpointGraphScratch{
+		reachable: reachable, protected: protected,
+		nodes: make([]checkpointGraphNode, 0, limit), byAddress: make(map[uint64]int, limit),
+		stack: make([]int, 0, limit), outputs: make([]BlockRequirement, limit),
+		buffer: make([]byte, blockSize), trailerBuffer: make([]byte, blockSize),
+	}, nil
+}
+
+func (scratch *checkpointGraphScratch) reset(blockCount, bitCapacity uint64) error {
+	if scratch.reachable.Len() < blockCount {
+		if err := scratch.reachable.grow(bitCapacity); err != nil {
+			return err
+		}
+		if err := scratch.protected.grow(bitCapacity); err != nil {
+			return err
+		}
+	}
+	clear(scratch.reachable.words)
+	clear(scratch.protected.words)
+	clear(scratch.nodes)
+	clear(scratch.byAddress)
+	clear(scratch.outputs)
+	scratch.nodes = scratch.nodes[:0]
+	scratch.stack = scratch.stack[:0]
+	scratch.trailerAddresses = scratch.trailerAddresses[:0]
+	scratch.releaseAddresses = scratch.releaseAddresses[:0]
+	return nil
+}
+
+func checkpointBitPrefix(set *FixedBitSet, blockCount uint64) FixedBitSet {
+	words := (blockCount + 63) / 64
+	return FixedBitSet{words: set.words[:int(words)], length: blockCount}
+}
+
 func (replica *Replica) resolveCheckpointReachability(manifest CheckpointManifest) (FixedBitSet, FixedBitSet, []uint64, error) {
 	if !validCheckpointManifestShape(manifest) {
 		return FixedBitSet{}, FixedBitSet{}, nil, ErrInvalidCheckpoint
 	}
 	blockCount := replica.blockAllocator.blockCount
-	reachable, err := NewFixedBitSet(blockCount)
-	if err != nil {
+	scratch := &replica.checkpointScratch
+	if err := scratch.reset(blockCount, replica.blockAllocator.acquired.Len()); err != nil {
 		return FixedBitSet{}, FixedBitSet{}, nil, err
 	}
+	reachable := checkpointBitPrefix(&scratch.reachable, blockCount)
 	protected, superseded, err := replica.currentCheckpointTrailerBlocks()
 	if err != nil {
 		return FixedBitSet{}, FixedBitSet{}, nil, err
@@ -57,9 +115,8 @@ func (replica *Replica) resolveCheckpointReachability(manifest CheckpointManifes
 	}
 	graph := checkpointGraph{
 		replica: replica, checkpoint: checkpoint, reachable: reachable, limit: limit,
-		nodes: make([]checkpointGraphNode, 0, limit), byAddress: make(map[uint64]int, limit),
-		stack: make([]int, 0, limit), outputs: make([]BlockRequirement, limit),
-		buffer: make([]byte, replica.config.Cluster.BlockSize),
+		nodes: scratch.nodes, byAddress: scratch.byAddress,
+		stack: scratch.stack, outputs: scratch.outputs, buffer: scratch.buffer,
 	}
 	if err := graph.visitManifestChain(manifest); err != nil {
 		return FixedBitSet{}, FixedBitSet{}, nil, err
@@ -76,6 +133,8 @@ func (replica *Replica) resolveCheckpointReachability(manifest CheckpointManifes
 	if err := graph.visitStack(); err != nil {
 		return FixedBitSet{}, FixedBitSet{}, nil, err
 	}
+	scratch.nodes = graph.nodes
+	scratch.stack = graph.stack
 	return graph.reachable, protected, superseded, nil
 }
 
@@ -123,12 +182,10 @@ func (replica *Replica) checkpointApplicationState(manifest CheckpointManifest) 
 
 func (graph *checkpointGraph) visitManifestChain(manifest CheckpointManifest) error {
 	current := manifest.Newest
-	chain := make(map[uint64]struct{}, manifest.BlockCount)
 	for ordinal := uint32(0); ordinal < manifest.BlockCount; ordinal++ {
-		if _, found := chain[current.Address]; found {
+		if _, found := graph.byAddress[current.Address]; found {
 			return ErrInvalidCheckpoint
 		}
-		chain[current.Address] = struct{}{}
 		index, err := graph.enqueue(BlockRequirement{Reference: current, Type: BlockManifest})
 		if err != nil {
 			return err
@@ -257,11 +314,9 @@ func (graph *checkpointGraph) process(index int) (BlockReadResult, error) {
 }
 
 func (replica *Replica) currentCheckpointTrailerBlocks() (FixedBitSet, []uint64, error) {
-	protected, err := NewFixedBitSet(replica.blockAllocator.blockCount)
-	if err != nil {
-		return FixedBitSet{}, nil, err
-	}
-	addresses := make([]uint64, 0, 8)
+	protected := checkpointBitPrefix(&replica.checkpointScratch.protected, replica.blockAllocator.blockCount)
+	clear(protected.words)
+	addresses := replica.checkpointScratch.trailerAddresses[:0]
 	chains := [...]struct {
 		reference   BlockReference
 		encodedSize uint64
@@ -271,12 +326,28 @@ func (replica *Replica) currentCheckpointTrailerBlocks() (FixedBitSet, []uint64,
 		{BlockReference{Checksum: replica.checkpoint.ReleasedTrailerLastChecksum, Address: replica.checkpoint.ReleasedTrailerLastAddress}, replica.checkpoint.ReleasedTrailerEncodedSize, BlockFreeSet},
 		{BlockReference{Checksum: replica.checkpoint.SessionTrailerLastChecksum, Address: replica.checkpoint.SessionTrailerLastAddress}, replica.checkpoint.SessionTrailerEncodedSize, BlockClientSessions},
 	}
-	buffer := make([]byte, replica.config.Cluster.BlockSize)
+	buffer := replica.checkpointScratch.trailerBuffer
 	payload := replica.config.Cluster.BlockSize - protocol.HeaderSize
+	total := uint64(0)
+	for _, chain := range chains {
+		if chain.encodedSize == 0 {
+			continue
+		}
+		count := (chain.encodedSize-1)/payload + 1
+		var ok bool
+		total, ok = checkedAdd(total, count)
+		if !ok {
+			return FixedBitSet{}, nil, ErrInvalidCheckpoint
+		}
+	}
+	if total > uint64(^uint(0)>>1) {
+		return FixedBitSet{}, nil, ErrInvalidCheckpoint
+	}
+	addresses = slices.Grow(addresses, int(total))
 	for _, chain := range chains {
 		count := uint64(0)
 		if chain.encodedSize != 0 {
-			count = (chain.encodedSize + payload - 1) / payload
+			count = (chain.encodedSize-1)/payload + 1
 		}
 		current := chain.reference
 		var bytesRead uint64
@@ -289,10 +360,14 @@ func (replica *Replica) currentCheckpointTrailerBlocks() (FixedBitSet, []uint64,
 			if err != nil || result.Snapshot != uint64(replica.checkpoint.PrepareOp()) {
 				return FixedBitSet{}, nil, ErrInvalidCheckpoint
 			}
-			bytesRead += uint64(result.BodySize)
-			if bytesRead > chain.encodedSize {
+			bytesRead, ok = checkedAdd(bytesRead, uint64(result.BodySize))
+			if !ok || bytesRead > chain.encodedSize {
 				return FixedBitSet{}, nil, ErrInvalidCheckpoint
 			}
+			replica.rememberBlock(BlockRequirement{
+				Reference: current, Type: chain.blockType, Snapshot: uint64(replica.checkpoint.PrepareOp()),
+				SnapshotExact: true, BodySize: result.BodySize,
+			})
 			protected.Set(index)
 			addresses = append(addresses, current.Address)
 			copy(current.Checksum[:], result.Metadata[:16])
@@ -302,11 +377,23 @@ func (replica *Replica) currentCheckpointTrailerBlocks() (FixedBitSet, []uint64,
 			return FixedBitSet{}, nil, ErrInvalidCheckpoint
 		}
 	}
+	replica.checkpointScratch.trailerAddresses = addresses
 	return protected, addresses, nil
 }
 
+func (replica *Replica) catalogCurrentCheckpointTrailers() error {
+	if replica.blockAllocator == nil {
+		return ErrInvalidCheckpoint
+	}
+	if err := replica.checkpointScratch.reset(replica.blockAllocator.blockCount, replica.blockAllocator.acquired.Len()); err != nil {
+		return err
+	}
+	_, _, err := replica.currentCheckpointTrailerBlocks()
+	return err
+}
+
 func (replica *Replica) stageCheckpointReleases(reachable, protected FixedBitSet) error {
-	replica.checkpointReleases = replica.checkpointReleases[:0]
+	replica.checkpointReleases = replica.checkpointScratch.releaseAddresses[:0]
 	acquired := replica.blockAllocator.Acquired()
 	released := replica.blockAllocator.Released()
 	for index := uint64(0); index < acquired.Len(); index++ {
@@ -320,6 +407,7 @@ func (replica *Replica) stageCheckpointReleases(reachable, protected FixedBitSet
 		}
 		replica.checkpointReleases = append(replica.checkpointReleases, address)
 	}
+	replica.checkpointScratch.releaseAddresses = replica.checkpointReleases
 	return nil
 }
 
@@ -328,6 +416,7 @@ func (replica *Replica) rollbackCheckpointReleases() {
 		_ = replica.blockAllocator.cancelRelease(address)
 	}
 	replica.checkpointReleases = replica.checkpointReleases[:0]
+	replica.checkpointScratch.releaseAddresses = replica.checkpointReleases
 }
 
 func installCheckpointReachability(candidate *BlockCheckpointCandidate, reachable FixedBitSet, allocator *BlockAllocator) error {

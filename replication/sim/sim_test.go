@@ -467,6 +467,141 @@ func TestClusterSupportsEveryActiveAndStandbyTopology(t *testing.T) {
 	}
 }
 
+func TestClusterSustainedTrafficReachesConfiguredPipeline(t *testing.T) {
+	cluster, clients, events := newPipelineTrafficFixture(t)
+	for sequence := range 64 {
+		submitPipelineBatch(t, cluster, clients, events, byte(sequence))
+	}
+}
+
+func BenchmarkClusterConfiguredPipeline(b *testing.B) {
+	cluster, clients, events := newPipelineTrafficFixture(b)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(clients)))
+	b.ResetTimer()
+	for sequence := range b.N {
+		submitPipelineBatch(b, cluster, clients, events, byte(sequence))
+	}
+}
+
+func newPipelineTrafficFixture(t testing.TB) (*Cluster, []*replication.Client, []*clientEvents) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer closeCancel()
+		if err := cluster.Close(closeCtx); err != nil {
+			t.Error(err)
+		}
+	})
+	clients := make([]*replication.Client, 0, cluster.config.Cluster.PipelineMax)
+	events := make([]*clientEvents, 0, cluster.config.Cluster.PipelineMax)
+	for index := range cluster.config.Cluster.PipelineMax {
+		observer := &clientEvents{}
+		client, err := cluster.AddClient(protocol.ClientID{byte(index + 1)}, observer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Register(); err != nil {
+			t.Fatal(err)
+		}
+		if err := runUntil(cluster, 2_000, func(*Cluster) bool { return observer.replyCount() == 1 }); err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+		events = append(events, observer)
+	}
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	return cluster, clients, events
+}
+
+func submitPipelineBatch(t testing.TB, cluster *Cluster, clients []*replication.Client, events []*clientEvents, body byte) {
+	t.Helper()
+	for _, client := range clients {
+		if err := client.Submit(protocol.OperationApplicationMin, []byte{body}); err != nil {
+			t.Fatalf("batch %d submit: %v", body, err)
+		}
+	}
+	if _, err := cluster.network.DeliverReady(); err != nil {
+		t.Fatalf("batch %d delivery: %v", body, err)
+	}
+	primary := currentPrimary(t, cluster)
+	if _, err := cluster.nodes[primary].replica.Process(64); err != nil {
+		t.Fatalf("batch %d primary: %v", body, err)
+	}
+	snapshot, ok := cluster.Snapshot(primary)
+	if !ok || uint64(snapshot.PipelineLen) != cluster.config.Cluster.PipelineMax {
+		t.Fatalf("pipeline length=%d, want %d", snapshot.PipelineLen, cluster.config.Cluster.PipelineMax)
+	}
+	expected := events[0].replyCount() + 1
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool {
+		for _, observer := range events {
+			if observer.replyCount() != expected {
+				return false
+			}
+		}
+		return true
+	}); err != nil {
+		t.Fatalf("batch %d completion: %v", body, err)
+	}
+}
+
+func TestClusterAcceptsRepliesFromConfiguredReplicationQuorum(t *testing.T) {
+	for _, active := range []uint8{4, 6} {
+		t.Run(fmt.Sprintf("active_%d", active), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cluster, err := NewCluster(ctx, DefaultConfig(active), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := cluster.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}()
+			if err := runUntil(cluster, 2_000, func(cluster *Cluster) bool {
+				return configuredMembersAgree(cluster, active)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for index := cluster.quorums.Replication; index < active; index++ {
+				if err := cluster.Network().Disconnect(protocol.ReplicaIndex(index)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			events := &clientEvents{}
+			client, err := cluster.AddClient(protocol.ClientID{active}, events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Register(); err != nil {
+				t.Fatal(err)
+			}
+			if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Submit(protocol.OperationApplicationMin, []byte{active}); err != nil {
+				t.Fatal(err)
+			}
+			if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 2 }); err != nil {
+				t.Fatal(err)
+			}
+			if err := cluster.CheckInvariants(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestClusterChecksGlobalInvariantsAfterEveryStep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -644,6 +779,196 @@ func TestClusterCommitsAcrossPrimaryCrashAndRepairsRestart(t *testing.T) {
 	if events.replyCount() != 3 {
 		t.Fatalf("reply count=%d, want 3", events.replyCount())
 	}
+}
+
+func TestClusterLosesPrimaryAtEveryProcessStageWithoutDuplicateExecution(t *testing.T) {
+	for _, stage := range []string{"write", "prepare", "commit", "view"} {
+		t.Run(stage, func(t *testing.T) {
+			exercisePrimaryProcessStageCrash(t, stage)
+		})
+	}
+}
+
+func exercisePrimaryProcessStageCrash(t testing.TB, stage string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	events := &clientEvents{}
+	client, err := cluster.AddClient(protocol.ClientID{0xa5}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	primary := currentPrimary(t, cluster)
+	before, _ := cluster.Snapshot(primary)
+	targetOp := before.CommitMin + 1
+	body := []byte("process-stage-" + stage)
+
+	if stage == "view" {
+		for index := range cluster.config.ActiveCount {
+			peer := protocol.ReplicaIndex(index)
+			if peer != primary {
+				if err := cluster.Network().PartitionDirected(primary, peer); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		var candidate protocol.ReplicaIndex
+		if err := driveUntilClusterStage(cluster, true, func() bool {
+			for index := range cluster.config.ActiveCount {
+				snapshot, ok := cluster.Snapshot(protocol.ReplicaIndex(index))
+				if ok && snapshot.Status == replication.StatusViewChange && snapshot.Primary == protocol.ReplicaIndex(index) {
+					candidate = protocol.ReplicaIndex(index)
+					return true
+				}
+			}
+			return false
+		}); err != nil {
+			t.Fatal(err)
+		}
+		primary = candidate
+	} else {
+		if err := client.Submit(protocol.OperationApplicationMin, body); err != nil {
+			t.Fatal(err)
+		}
+		if err := driveUntilClusterStage(cluster, false, func() bool {
+			snapshot, ok := cluster.Snapshot(primary)
+			if !ok || snapshot.HeadOp != targetOp {
+				return false
+			}
+			switch stage {
+			case "write":
+				return snapshot.PrepareWritePending
+			case "prepare":
+				return !snapshot.PrepareWritePending && snapshot.CommitStage == replication.CommitStageIdle
+			case "commit":
+				return snapshot.CommitStage == replication.CommitStageExecute
+			default:
+				return false
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cluster.Crash(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	for from := range cluster.config.ActiveCount {
+		for to := range cluster.config.ActiveCount {
+			if from == to {
+				continue
+			}
+			if err := cluster.Network().HealDirected(protocol.ReplicaIndex(from), protocol.ReplicaIndex(to)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if stage == "view" {
+		if err := client.Submit(protocol.OperationApplicationMin, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runUntil(cluster, 6_000, func(*Cluster) bool { return events.replyCount() == 2 }); err != nil {
+		t.Fatalf("%v snapshots=%v replies=%d", err, clusterSnapshots(cluster), events.replyCount())
+	}
+	if err := cluster.Restart(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 6_000, replicasAgree); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	if events.replyCount() != 2 {
+		t.Fatalf("reply count=%d, want 2", events.replyCount())
+	}
+	for index := range cluster.config.ActiveCount {
+		machine, ok := cluster.nodes[index].machine.(*Machine)
+		if !ok {
+			t.Fatalf("replica %d machine missing", index)
+		}
+		count := 0
+		for _, commit := range machine.Commits() {
+			if string(commit.Body) == string(body) {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("replica %d executed request %d times", index, count)
+		}
+	}
+}
+
+func driveUntilClusterStage(cluster *Cluster, advanceTime bool, reached func() bool) error {
+	for range 10_000 {
+		if reached() {
+			return nil
+		}
+		if advanceTime {
+			cluster.clock.Advance(cluster.config.Process.Tick)
+			for _, clock := range cluster.memberClocks {
+				clock.Advance(cluster.config.Process.Tick)
+			}
+			cluster.network.Advance()
+			for _, client := range cluster.clients {
+				if err := client.Tick(); err != nil {
+					return err
+				}
+				if reached() {
+					return cluster.CheckInvariants()
+				}
+			}
+			for nodeIndex := range cluster.nodes {
+				replica := cluster.nodes[nodeIndex].replica
+				if replica == nil {
+					continue
+				}
+				if err := replica.Tick(); err != nil {
+					return &NodeError{Index: protocol.ReplicaIndex(nodeIndex), Err: err}
+				}
+				if reached() {
+					return cluster.CheckInvariants()
+				}
+			}
+		}
+		if _, err := cluster.network.DeliverOne(); err != nil {
+			return err
+		}
+		if reached() {
+			return cluster.CheckInvariants()
+		}
+		for nodeIndex := range cluster.nodes {
+			replica := cluster.nodes[nodeIndex].replica
+			if replica == nil {
+				continue
+			}
+			if _, err := replica.Process(1); err != nil {
+				return &NodeError{Index: protocol.ReplicaIndex(nodeIndex), Err: err}
+			}
+			if reached() {
+				return cluster.CheckInvariants()
+			}
+		}
+		if err := cluster.CheckInvariants(); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("stage not reached: snapshots=%v", clusterSnapshots(cluster))
 }
 
 func TestClusterRecoversAfterAllReplicasRestart(t *testing.T) {

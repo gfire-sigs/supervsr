@@ -136,6 +136,7 @@ func (replica *Replica) continueBlockRepair(now uint64) bool {
 		if replica.startBlockRepairRead(uint32(index)) {
 			return true
 		}
+		replica.metrics.repairStalls.Add(1)
 		break
 	}
 	var references [64]BlockReference
@@ -159,10 +160,12 @@ func (replica *Replica) continueBlockRepair(now uint64) bool {
 	}
 	peer, ok := replica.blockRepairDestination(neededAtCheckpoint)
 	if !ok {
+		replica.metrics.repairStalls.Add(1)
 		return false
 	}
 	batch := references[:count]
 	if !replica.blockRepairBudget.Reserve(peer, batch, now) {
+		replica.metrics.repairStalls.Add(1)
 		return false
 	}
 	replica.sendGetBlocks(peer, batch)

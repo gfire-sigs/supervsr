@@ -3,6 +3,7 @@ package replication
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
@@ -74,7 +75,9 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if reference.Address == 0 || reference.Checksum.IsZero() || !store.validAddress(reference.Address) {
-		return BlockReadResult{}, ErrBlockMissing
+		return BlockReadResult{}, fmt.Errorf(
+			"%w: invalid address %d checksum %s", ErrBlockMissing, reference.Address, reference.Checksum,
+		)
 	}
 	offset, _ := store.cluster.BlockOffset(reference.Address)
 	if err := store.storage.ReadAt(store.scratch, offset); err != nil {
@@ -82,7 +85,10 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	}
 	header, reason := protocol.DecodeHeader(store.scratch[:protocol.HeaderSize], store.group, uint32(store.cluster.BlockSize), 1)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandBlock || header.HeaderChecksum != reference.Checksum {
-		return BlockReadResult{}, ErrBlockMissing
+		return BlockReadResult{}, fmt.Errorf(
+			"%w: address %d checksum %s found %s command %d rejection %d",
+			ErrBlockMissing, reference.Address, reference.Checksum, header.HeaderChecksum, header.Command, reason,
+		)
 	}
 	if header.Size > uint32(store.cluster.BlockSize) || !allZeroBytes(store.scratch[header.Size:]) {
 		return BlockReadResult{}, ErrInvalidBlock
@@ -94,7 +100,10 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	address := binary.LittleEndian.Uint64(header.Fields[96:104])
 	actualType := protocol.BlockType(header.Fields[112])
 	if address != reference.Address || actualType != blockType || !allZeroBytes(header.Fields[113:]) {
-		return BlockReadResult{}, ErrBlockMissing
+		return BlockReadResult{}, fmt.Errorf(
+			"%w: requested address %d type %d found address %d type %d",
+			ErrBlockMissing, reference.Address, blockType, address, actualType,
+		)
 	}
 	var metadata [96]byte
 	copy(metadata[:], header.Fields[:96])

@@ -20,6 +20,7 @@ var (
 	ErrSuperblockFork                     = errors.New("replication: superblock fork")
 	ErrSuperblockQuorum                   = errors.New("replication: no superblock open quorum")
 	ErrSuperblockInitializationIncomplete = errors.New("replication: incomplete initial superblock quorum")
+	ErrIncompatibleConfiguration          = errors.New("replication: durable configuration is incompatible")
 )
 
 type DurableReplicaState struct {
@@ -105,6 +106,23 @@ func DecodeSuperblock(source []byte, physicalIndex uint16, validation Superblock
 	if protocol.ChecksumBytes(source[34:]) != checksum {
 		return SuperblockCandidate{}, ErrInvalidSuperblock
 	}
+	storedFormat := binary.LittleEndian.Uint16(source[34:36])
+	storedRelease := protocol.Release(binary.LittleEndian.Uint32(source[36:40]))
+	storedSequence := binary.LittleEndian.Uint64(source[40:48])
+	var storedGroup protocol.GroupID
+	copy(storedGroup[:], source[48:64])
+	var storedConfiguration protocol.Checksum
+	copy(storedConfiguration[:], source[2156:2172])
+	storedProtocol := binary.LittleEndian.Uint16(source[2172:2174])
+	if storedRelease == 0 || storedSequence == 0 {
+		return SuperblockCandidate{}, ErrInvalidSuperblock
+	}
+	if storedFormat != protocol.FormatVersion ||
+		storedGroup != validation.Group ||
+		storedConfiguration != validation.ConfigurationChecksum ||
+		storedProtocol != protocol.ProtocolVersion {
+		return SuperblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
+	}
 	storedIndex := binary.LittleEndian.Uint16(source[32:34])
 	var superblock Superblock
 	superblock.Checksum = checksum
@@ -150,7 +168,7 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 		return ErrInvalidSuperblock
 	}
 	if superblock.State.LocalMember != validation.Membership.LocalMember || superblock.State.Members != validation.Membership.Members || superblock.State.ActiveCount != validation.Membership.ActiveCount || superblock.State.StandbyCount != validation.Membership.StandbyCount {
-		return ErrInvalidSuperblock
+		return errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
 	}
 	checkpointValidation := CheckpointValidation{
 		Group:          validation.Group,

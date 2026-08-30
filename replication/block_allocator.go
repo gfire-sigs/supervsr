@@ -3,6 +3,7 @@ package replication
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 )
 
 var (
@@ -63,6 +64,14 @@ type BlockAllocator struct {
 	checkpointReleased   FixedBitSet
 	checkpointGeneration uint64
 	checkpointActive     bool
+
+	candidateAcquired        FixedBitSet
+	candidateReleased        FixedBitSet
+	candidateReachable       FixedBitSet
+	candidateAddresses       []uint64
+	candidateEWAHWords       []uint64
+	candidateAcquiredEncoded []byte
+	candidateReleasedEncoded []byte
 }
 
 func OpenBlockAllocator(storage Storage, cluster ClusterConfig, process ProcessConfig, state CheckpointState, acquired, released FixedBitSet) (*BlockAllocator, error) {
@@ -111,6 +120,18 @@ func OpenBlockAllocator(storage Storage, cluster ClusterConfig, process ProcessC
 	if err != nil {
 		return nil, err
 	}
+	candidateAcquired, err := NewFixedBitSet(capacity)
+	if err != nil {
+		return nil, err
+	}
+	candidateReleased, err := NewFixedBitSet(capacity)
+	if err != nil {
+		return nil, err
+	}
+	candidateReachable, err := NewFixedBitSet(capacity)
+	if err != nil {
+		return nil, err
+	}
 	copy(acquiredMax.words, acquired.words)
 	copy(releasedMax.words, released.words)
 	for index := uint64(0); index < blockCount; index++ {
@@ -124,6 +145,7 @@ func OpenBlockAllocator(storage Storage, cluster ClusterConfig, process ProcessC
 		acquired: acquiredMax, released: releasedMax, reserved: reserved, pending: pending,
 		reservedReleased: reservedReleased, checkpoint: checkpoint,
 		checkpointAcquired: checkpointAcquired, checkpointReleased: checkpointReleased,
+		candidateAcquired: candidateAcquired, candidateReleased: candidateReleased, candidateReachable: candidateReachable,
 	}, nil
 }
 
@@ -145,6 +167,7 @@ func (allocator *BlockAllocator) ensureCapacity(required uint64) error {
 	sets := [...]*FixedBitSet{
 		&allocator.acquired, &allocator.released, &allocator.reserved, &allocator.pending,
 		&allocator.reservedReleased, &allocator.checkpoint, &allocator.checkpointAcquired, &allocator.checkpointReleased,
+		&allocator.candidateAcquired, &allocator.candidateReleased, &allocator.candidateReachable,
 	}
 	for _, set := range sets {
 		if err := set.grow(capacity); err != nil {
@@ -222,7 +245,8 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 		return BlockCheckpointCandidate{}, ErrBlockReservation
 	}
 	sessionBlocks := int((sessionEncodedSize + payloadSize - 1) / payloadSize)
-	addresses := make([]uint64, 0, sessionBlocks+2)
+	allocator.candidateAddresses = slices.Grow(allocator.candidateAddresses[:0], sessionBlocks+2)
+	addresses := allocator.candidateAddresses
 	for range sessionBlocks + 2 {
 		address, err := allocator.Reserve()
 		if err != nil {
@@ -237,12 +261,12 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 			allocator.forfeitAddresses(addresses)
 			return BlockCheckpointCandidate{}, err
 		}
-		acquiredEncoded, err := encodeEWAHBytes(acquired)
+		acquiredEncoded, err := allocator.encodeEWAHBytes(acquired, &allocator.candidateAcquiredEncoded)
 		if err != nil {
 			allocator.forfeitAddresses(addresses)
 			return BlockCheckpointCandidate{}, err
 		}
-		releasedEncoded, err := encodeEWAHBytes(released)
+		releasedEncoded, err := allocator.encodeEWAHBytes(released, &allocator.candidateReleasedEncoded)
 		if err != nil {
 			allocator.forfeitAddresses(addresses)
 			return BlockCheckpointCandidate{}, err
@@ -251,6 +275,8 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 		releasedBlocks := int((uint64(len(releasedEncoded)) + payloadSize - 1) / payloadSize)
 		required := acquiredBlocks + releasedBlocks + sessionBlocks
 		if required > len(addresses) {
+			addresses = slices.Grow(addresses, required-len(addresses))
+			allocator.candidateAddresses = addresses
 			for range required - len(addresses) {
 				address, reserveErr := allocator.Reserve()
 				if reserveErr != nil {
@@ -266,11 +292,8 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 			addresses = addresses[:required]
 			continue
 		}
-		reachable, err := NewFixedBitSet(acquired.Len())
-		if err != nil {
-			allocator.forfeitAddresses(addresses)
-			return BlockCheckpointCandidate{}, err
-		}
+		reachable := allocator.prefix(&allocator.candidateReachable)
+		clear(reachable.words)
 		copy(reachable.words, acquired.words)
 		for index := range reachable.words {
 			reachable.words[index] &^= released.words[index]
@@ -278,6 +301,7 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 		allocator.installCheckpointSets(acquired, released)
 		allocator.checkpointGeneration++
 		allocator.checkpointActive = true
+		allocator.candidateAddresses = addresses
 		return BlockCheckpointCandidate{
 			generation: allocator.checkpointGeneration, blockCount: allocator.blockCount,
 			acquired: acquired, released: released, reachable: reachable, addresses: addresses,
@@ -290,14 +314,10 @@ func (allocator *BlockAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSi
 }
 
 func (allocator *BlockAllocator) checkpointSets(addresses []uint64) (FixedBitSet, FixedBitSet, error) {
-	acquired, err := NewFixedBitSet(allocator.blockCount)
-	if err != nil {
-		return FixedBitSet{}, FixedBitSet{}, err
-	}
-	released, err := NewFixedBitSet(allocator.blockCount)
-	if err != nil {
-		return FixedBitSet{}, FixedBitSet{}, err
-	}
+	acquired := allocator.prefix(&allocator.candidateAcquired)
+	released := allocator.prefix(&allocator.candidateReleased)
+	clear(acquired.words)
+	clear(released.words)
 	copy(acquired.words, allocator.prefix(&allocator.acquired).words)
 	copy(released.words, allocator.prefix(&allocator.released).words)
 	for index := range released.words {
@@ -329,16 +349,25 @@ func (allocator *BlockAllocator) forfeitAddresses(addresses []uint64) {
 	}
 }
 
-func encodeEWAHBytes(set FixedBitSet) ([]byte, error) {
-	words := make([]uint64, len(set.words)*2+1)
+func (allocator *BlockAllocator) encodeEWAHBytes(set FixedBitSet, destination *[]byte) ([]byte, error) {
+	wordCount := len(set.words)*2 + 1
+	if cap(allocator.candidateEWAHWords) < wordCount {
+		allocator.candidateEWAHWords = make([]uint64, wordCount)
+	}
+	words := allocator.candidateEWAHWords[:wordCount]
 	count, err := set.EncodeEWAH(words)
 	if err != nil {
 		return nil, err
 	}
-	encoded := make([]byte, count*8)
+	byteCount := count * 8
+	if cap(*destination) < byteCount {
+		*destination = make([]byte, byteCount)
+	}
+	encoded := (*destination)[:byteCount]
 	for index := range count {
 		binary.LittleEndian.PutUint64(encoded[index*8:], words[index])
 	}
+	*destination = encoded
 	return encoded, nil
 }
 

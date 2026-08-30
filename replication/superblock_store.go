@@ -53,6 +53,7 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 	allZero := true
 	successfulReads := 0
 	var firstReadError error
+	incompatibleCopies := 0
 	for index := range copies {
 		clear(buffer)
 		if err := storage.ReadAt(buffer, uint64(index)*SuperblockBytes); err != nil {
@@ -65,6 +66,9 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		allZero = allZero && allZeroBytes(buffer)
 		candidate, err := DecodeSuperblock(buffer, uint16(index), validation)
 		if err != nil {
+			if errors.Is(err, ErrIncompatibleConfiguration) {
+				incompatibleCopies++
+			}
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -77,6 +81,10 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		}
 		if allZero {
 			return nil, ErrUnformatted
+		}
+		openQuorum, _ := superblockOpenQuorum(validation.Cluster.SuperblockCopies)
+		if incompatibleCopies >= int(openQuorum) {
+			return nil, ErrIncompatibleConfiguration
 		}
 		return nil, ErrCorrupt
 	}

@@ -21,7 +21,10 @@ func (sink *startupCompletionSink) enqueueSMCompletion(completion *SMCompletion)
 	}
 }
 
-func Open(ctx context.Context, config Config, dependencies Dependencies) (*Replica, error) {
+func Open(ctx context.Context, config Config, dependencies Dependencies) (replica *Replica, err error) {
+	defer func() {
+		recordOpenMetric(dependencies.Metrics, err)
+	}()
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -63,6 +66,9 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	recovery, err := wal.Recover(durable.State.Checkpoint, durable.State.CommitMax, config.Process)
 	if err != nil {
 		return nil, err
+	}
+	if dependencies.Metrics != nil && recovery.FaultySlots != 0 {
+		dependencies.Metrics.storageCorruptions.Add(uint64(recovery.FaultySlots))
 	}
 	if config.Membership.ActiveCount == 1 && recovery.FaultySlots == 0 {
 		durable.State.CommitMax = recovery.HeadOp
@@ -115,7 +121,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	if err != nil {
 		return nil, err
 	}
-	replica, err := newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, blocks)
+	replica, err = newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +135,33 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 		return nil, err
 	}
 	return replica, nil
+}
+
+func recordOpenMetric(metrics *ReplicaMetrics, err error) {
+	if metrics == nil || err == nil {
+		return
+	}
+	if errors.Is(err, ErrInvalidConfiguration) || errors.Is(err, ErrIncompatibleConfiguration) {
+		metrics.incompatibleConfigurations.Add(1)
+		return
+	}
+	if openStorageCorruption(err) {
+		metrics.storageCorruptions.Add(1)
+		return
+	}
+	if errors.Is(err, ErrStorage) {
+		metrics.storageFailures.Add(1)
+	}
+}
+
+func openStorageCorruption(err error) bool {
+	targets := [...]error{ErrCorrupt, ErrInvalidSuperblock, ErrInvalidCheckpoint, ErrWALRecovery, ErrInvalidBlock, ErrBlockMissing}
+	for _, target := range targets {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func newOpenSessionTable(config Config) (*SessionTable, error) {

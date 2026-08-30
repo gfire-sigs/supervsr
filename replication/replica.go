@@ -177,6 +177,7 @@ type Replica struct {
 	checkpointBlockLimit    uint32
 	checkpointReleases      []uint64
 	checkpointSuperseded    []uint64
+	checkpointScratch       checkpointGraphScratch
 
 	wal                    *WAL
 	replies                *ReplyStore
@@ -408,6 +409,17 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		start := uint64(index) * config.Cluster.BlockSize
 		blockRepairIO[index].buffer = blockRepairStorage[start : start+config.Cluster.BlockSize]
 	}
+	checkpointBitCapacity := uint64(0)
+	if blocks.allocator != nil {
+		checkpointBitCapacity = blocks.allocator.acquired.Len()
+	}
+	checkpointScratch, err := newCheckpointGraphScratch(
+		int(capacities.CheckpointMax), checkpointBitCapacity, config.Cluster.BlockSize,
+	)
+	if err != nil {
+		_ = ioEngine.Close(context.Background())
+		return nil, err
+	}
 	targetCapacity := int(memberCount)*int(config.Process.RepairRequestsMax+1) + int(config.Process.ScrubReadConcurrency) + 5
 	joins := make([]joinRecord, int(config.Membership.ActiveCount))
 	joinHeaders := make([]protocol.Header, int(config.Membership.ActiveCount)*int(config.Cluster.PipelineMax+1))
@@ -455,6 +467,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		checkpointBlocks:     newCheckpointBlockTransaction(blocks.allocator, blocks.store, capacities.CheckpointMax),
 		checkpointReader:     newCheckpointBlockReader(blocks.allocator, blocks.store),
 		checkpointBlockLimit: capacities.CheckpointMax,
+		checkpointScratch:    checkpointScratch,
 		events:               events,
 		notify:               make(chan struct{}, 1),
 		pipeline:             make([]pipelineEntry, int(config.Cluster.PipelineMax)),
@@ -482,6 +495,12 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		done:                 make(chan struct{}),
 	}
 	replica.seedScrubCatalog(initial.Checkpoint)
+	if replica.blockAllocator != nil {
+		if err := replica.catalogCurrentCheckpointTrailers(); err != nil {
+			_ = ioEngine.Close(context.Background())
+			return nil, err
+		}
+	}
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 	if err := replica.checkInvariants(); err != nil {
@@ -493,23 +512,20 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 }
 
 func (replica *Replica) Snapshot() ReplicaSnapshot {
+	commitStage := CommitStageIdle
+	prepareWritePending := false
 	committing := false
 	if replica.pipelineLen > 0 {
 		entry := replica.pipelineEntry(0)
+		commitStage = entry.stage
+		prepareWritePending = entry.ioKind == IOWALAppend
 		committing = entry.stage >= CommitStageCheckpointDurable && prepareOp(&entry.header) == replica.commitMin
 	}
 	return ReplicaSnapshot{
-		Status:      replica.status,
-		View:        replica.view,
-		DurableView: replica.durableView,
-		LogView:     replica.logView,
-		HeadOp:      replica.headOp,
-		CommitMin:   replica.commitMin,
-		CommitMax:   replica.commitMax,
-		Checkpoint:  replica.checkpoint,
-		PipelineLen: replica.pipelineLen,
-		Committing:  committing,
-		Primary:     replica.membership.Primary(replica.view),
+		Status: replica.status, View: replica.view, DurableView: replica.durableView, LogView: replica.logView,
+		HeadOp: replica.headOp, CommitMin: replica.commitMin, CommitMax: replica.commitMax, Checkpoint: replica.checkpoint,
+		PipelineLen: replica.pipelineLen, CommitStage: commitStage, PrepareWritePending: prepareWritePending,
+		Committing: committing, Primary: replica.membership.Primary(replica.view),
 	}
 }
 

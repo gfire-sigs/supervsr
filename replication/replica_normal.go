@@ -100,6 +100,7 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 	}
 	if replica.membership.ActiveCount > 1 && !sample.Synchronized {
 		replica.metrics.requestsDropped.Add(1)
+		replica.metrics.clockDisagreements.Add(1)
 		return false
 	}
 	if header.Release < replica.config.ClientReleaseMin {

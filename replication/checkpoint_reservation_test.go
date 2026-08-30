@@ -59,3 +59,72 @@ func TestCheckpointPreparationIncludesOwnTrailerReservations(t *testing.T) {
 		t.Fatalf("published acquired=%d addresses=%d", allocator.AcquiredCount(), len(candidate.addresses))
 	}
 }
+
+func TestCheckpointPreparationSteadyStateHasNoAllocations(t *testing.T) {
+	cluster := compactTestClusterConfig()
+	base, _ := cluster.BlockBase()
+	process := DefaultProcessConfig()
+	process.StorageSizeLimit = base + 8*cluster.BlockSize
+	storage := &growingStorage{}
+	if err := storage.Resize(base); err != nil {
+		t.Fatal(err)
+	}
+	state := CheckpointState{LogicalStorageSize: base}
+	acquired, released, err := EmptyBlockSets(state, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := cluster.BlockSize - protocol.HeaderSize
+	run := func() {
+		candidate, prepareErr := allocator.PrepareCheckpoint(64, payload)
+		if prepareErr != nil {
+			panic(prepareErr)
+		}
+		if abortErr := allocator.AbortCheckpoint(candidate); abortErr != nil {
+			panic(abortErr)
+		}
+	}
+	run()
+	if allocations := testing.AllocsPerRun(1_000, run); allocations != 0 {
+		t.Fatalf("steady-state checkpoint allocations = %f", allocations)
+	}
+}
+
+func TestEmptyCheckpointReachabilitySteadyStateHasNoAllocations(t *testing.T) {
+	cluster := compactTestClusterConfig()
+	base, _ := cluster.BlockBase()
+	process := DefaultProcessConfig()
+	process.StorageSizeLimit = base + cluster.BlockSize
+	storage := &growingStorage{}
+	if err := storage.Resize(base); err != nil {
+		t.Fatal(err)
+	}
+	state := CheckpointState{LogicalStorageSize: base}
+	acquired, released, err := EmptyBlockSets(state, cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch, err := newCheckpointGraphScratch(1, allocator.acquired.Len(), cluster.BlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replica := Replica{config: Config{Cluster: cluster}, blockAllocator: allocator, checkpointScratch: scratch}
+	run := func() {
+		reachable, protected, superseded, resolveErr := replica.resolveCheckpointReachability(CheckpointManifest{})
+		if resolveErr != nil || reachable.Count() != 0 || protected.Count() != 0 || len(superseded) != 0 {
+			panic(ErrInvalidCheckpoint)
+		}
+	}
+	run()
+	if allocations := testing.AllocsPerRun(1_000, run); allocations != 0 {
+		t.Fatalf("steady-state reachability allocations = %f", allocations)
+	}
+}

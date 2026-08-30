@@ -114,6 +114,12 @@ func (network *Network) RegisterClient(id protocol.ClientID, handle func(protoco
 	if id.IsZero() || handle == nil {
 		return replication.ErrInvalidConfiguration
 	}
+	if _, exists := network.clients[id]; exists {
+		return replication.ErrInvalidConfiguration
+	}
+	if len(network.clients) >= network.maximum {
+		return ErrNetworkBackpressure
+	}
 	network.clients[id] = handle
 	return nil
 }

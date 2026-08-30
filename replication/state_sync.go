@@ -536,6 +536,12 @@ func (replica *Replica) finishStateSyncBlocks() {
 	replica.blocks = blocks.store
 	replica.trailers = blocks.trailers
 	replica.blockAllocator = blocks.allocator
+	replica.clearBlockCatalog()
+	replica.seedScrubCatalog(replica.checkpoint)
+	if err := replica.catalogCurrentCheckpointTrailers(); err != nil {
+		replica.fail(err)
+		return
+	}
 	if err := replica.checkpointBlocks.setRuntime(blocks.allocator, blocks.store); err != nil {
 		replica.fail(err)
 		return

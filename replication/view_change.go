@@ -74,6 +74,7 @@ func (replica *Replica) beginViewChangeNow(target protocol.View) {
 	replica.invalidateReleaseReports()
 	replica.joinViewBits = 0
 	clear(replica.joins)
+	replica.timers.join.Reset()
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
 		entry.acks = 0

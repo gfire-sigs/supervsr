@@ -17,8 +17,12 @@ func (replica *Replica) rememberBlock(requirement BlockRequirement) {
 	}
 	for index := range replica.blockCatalogCount {
 		known := &replica.blockCatalog[index]
-		if known.Reference != requirement.Reference {
+		if known.Reference.Address != requirement.Reference.Address {
 			continue
+		}
+		if known.Reference != requirement.Reference {
+			*known = requirement
+			return
 		}
 		if known.Type != requirement.Type {
 			replica.fail(ErrReplicaInvariant)
@@ -60,6 +64,21 @@ func (replica *Replica) clearBlockCatalog() {
 	replica.blockCatalogCount = 0
 }
 
+func (replica *Replica) pruneBlockCatalog() {
+	count := 0
+	for index := range replica.blockCatalogCount {
+		requirement := replica.blockCatalog[index]
+		blockIndex, ok := replica.blockAllocator.index(requirement.Reference.Address)
+		if !ok || !replica.blockAllocator.acquired.Test(blockIndex) || replica.blockAllocator.released.Test(blockIndex) {
+			continue
+		}
+		replica.blockCatalog[count] = requirement
+		count++
+	}
+	clear(replica.blockCatalog[count:replica.blockCatalogCount])
+	replica.blockCatalogCount = count
+}
+
 func (replica *Replica) seedScrubCatalog(checkpoint CheckpointState) {
 	op := checkpoint.PrepareOp()
 	replica.rememberBlock(BlockRequirement{
@@ -87,7 +106,8 @@ func (replica *Replica) seedScrubCatalog(checkpoint CheckpointState) {
 }
 
 func (replica *Replica) continueScrub(now uint64) bool {
-	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.repairing || replica.blockAllocator == nil || now < replica.scrub.next {
+	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.repairing || replica.blockAllocator == nil ||
+		replica.checkpointTransitionActive() || now < replica.scrub.next {
 		return false
 	}
 	delay := replica.scrubDelay()
@@ -181,6 +201,7 @@ func (replica *Replica) queueKnownCorruptBlock(address uint64, requirement Block
 		replica.fail(ErrBlockMissing)
 		return
 	}
+	replica.metrics.storageCorruptions.Add(1)
 	snapshot := blockSnapshotExpectation{value: requirement.Snapshot, exact: requirement.SnapshotExact}
 	if !replica.queueBlockRepair(requirement.Reference, requirement.Type, replica.checkpoint.PrepareOp(), snapshot, requirement.BodySize, blockRepairScrub) {
 		replica.fail(ErrReplicaBackpressure)

@@ -61,10 +61,12 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 		Type:      protocol.BlockFreeSet, Snapshot: 7, SnapshotExact: true, BodySize: uint32(len(body)),
 	}
 	validator := &resolvingBlockValidator{requirement: expected}
+	metrics := &ReplicaMetrics{}
 	replica := Replica{
 		config: config, membership: config.Membership,
 		deps:         Dependencies{BlockValidator: validator},
 		blockCatalog: make([]BlockRequirement, 1), blockRepairTargets: make([]blockRepairTarget, 1),
+		metrics: metrics,
 	}
 	operation := blockRepairIO{buffer: wrongFrame, address: 1, busy: true, stage: blockRepairIOScrub}
 	replica.finishScrubRead(&operation, IOCompletion{})
@@ -80,6 +82,9 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 	}
 	if replica.blockCatalogCount != 0 {
 		t.Fatalf("untrusted block cached: count=%d", replica.blockCatalogCount)
+	}
+	if snapshot := metrics.Snapshot(); snapshot.StorageCorruptions != 1 {
+		t.Fatalf("storage corruption metric = %d", snapshot.StorageCorruptions)
 	}
 }
 

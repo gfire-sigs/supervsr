@@ -45,9 +45,10 @@ func (cluster *Cluster) CheckInvariants() error {
 		return err
 	}
 	active := cluster.config.ActiveCount
-	quorum := active/2 + 1
-	if active == 0 || 2*quorum <= active {
-		return fmt.Errorf("%w: active quorum does not intersect", ErrInvariant)
+	if active == 0 ||
+		uint16(cluster.quorums.Replication)+uint16(cluster.quorums.ViewChange) <= uint16(active) ||
+		uint16(cluster.quorums.Replication)+uint16(cluster.quorums.Negative) <= uint16(active) {
+		return fmt.Errorf("%w: configured quorums do not intersect", ErrInvariant)
 	}
 	if uint64(len(cluster.clients)) > cluster.config.Cluster.ClientsMax {
 		return fmt.Errorf("%w: client count %d exceeds %d", ErrInvariant, len(cluster.clients), cluster.config.Cluster.ClientsMax)
@@ -250,7 +251,7 @@ func (cluster *Cluster) checkDurableReply(reply replication.ClientReply) error {
 		}
 		durable++
 	}
-	if durable < cluster.config.ActiveCount/2+1 {
+	if durable < cluster.quorums.Replication {
 		return fmt.Errorf("%w: reply at op %d has %d durable replicas", ErrInvariant, candidateOp, durable)
 	}
 	return nil

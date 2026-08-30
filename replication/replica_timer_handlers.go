@@ -34,10 +34,7 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 		replica.timers.exit.Reset()
 	}
 	if replica.tickTimer(&replica.timers.join) {
-		if replica.status == StatusViewChange && replica.durableView == replica.view {
-			replica.sendJoinView()
-		}
-		replica.timers.join.Reset()
+		replica.handleJoinTimeout()
 	}
 	if replica.tickTimer(&replica.timers.pulse) {
 		replica.handlePulseTimeout(sample)
@@ -82,8 +79,29 @@ func (replica *Replica) handlePrepareTimeout() {
 
 func (replica *Replica) handleAbdicationTimeout() {
 	if replica.status == StatusNormal && replica.isPrimary() && replica.pipelineLen > 0 && !replica.pipelineEntry(0).quorum {
+		replica.metrics.quorumUnavailable.Add(1)
 		replica.sendExitView()
 	}
+}
+
+func (replica *Replica) handleJoinTimeout() {
+	if replica.status != StatusViewChange || replica.durableView != replica.view {
+		replica.timers.join.Reset()
+		return
+	}
+	if replica.timers.join.Attempts() == 0 {
+		replica.sendJoinView()
+		if err := replica.timers.join.Backoff(replica.config.Process, replica.config.Process.InitialRTT, &replica.random); err != nil {
+			replica.fail(err)
+		}
+		return
+	}
+	if replica.view == protocol.MaxView {
+		replica.fail(ErrReplicaInvariant)
+		return
+	}
+	replica.timers.join.Reset()
+	replica.beginViewChange(replica.view + 1)
 }
 
 func (replica *Replica) handleExitTimeout(sample TimeSample) {
@@ -100,6 +118,7 @@ func (replica *Replica) handlePulseTimeout(sample TimeSample) {
 		return
 	}
 	if replica.membership.ActiveCount > 1 && !sample.Synchronized {
+		replica.metrics.clockDisagreements.Add(1)
 		return
 	}
 	if replica.upgradeTarget != 0 {

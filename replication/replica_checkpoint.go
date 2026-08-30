@@ -135,7 +135,7 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 		replica.fail(err)
 		return
 	}
-	replica.checkpointSuperseded = append(replica.checkpointSuperseded[:0], superseded...)
+	replica.checkpointSuperseded = superseded
 	if err := replica.stageCheckpointReleases(reachable, protected); err != nil {
 		replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
 		replica.fail(err)
@@ -287,8 +287,12 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		return
 	}
 	replica.checkpointID = checkpointID
-	replica.clearBlockCatalog()
+	replica.pruneBlockCatalog()
 	replica.seedScrubCatalog(replica.checkpoint)
+	if err := replica.catalogCurrentCheckpointTrailers(); err != nil {
+		replica.fail(err)
+		return
+	}
 	replica.checkpointSessionOp = 0
 	replica.checkpointTarget = 0
 	replica.checkpointTargetRelease = 0

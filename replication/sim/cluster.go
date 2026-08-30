@@ -62,6 +62,7 @@ type node struct {
 
 type Cluster struct {
 	config       Config
+	quorums      replication.Quorums
 	clock        *Clock
 	memberClocks []*Clock
 	network      *Network
@@ -79,12 +80,17 @@ func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cl
 	if memberCount == 0 || config.MaximumPackets == 0 || config.WorkLimit <= 0 {
 		return nil, replication.ErrInvalidConfiguration
 	}
+	quorumLimit := uint8(min(config.Cluster.ReplicationQuorumMax, uint64(^uint8(0))))
+	quorums, ok := replication.QuorumsFor(config.ActiveCount, quorumLimit)
+	if !ok {
+		return nil, replication.ErrInvalidConfiguration
+	}
 	network, err := NewNetwork(memberCount, uint32(config.Cluster.MessageSizeMax), config.MaximumPackets)
 	if err != nil {
 		return nil, err
 	}
 	cluster := &Cluster{
-		config: config, clock: NewClock(), network: network, factory: factory,
+		config: config, clock: NewClock(), network: network, factory: factory, quorums: quorums,
 		memberClocks: make([]*Clock, memberCount), stores: make([]*Storage, memberCount), nodes: make([]node, memberCount),
 	}
 	for index := range memberCount {
