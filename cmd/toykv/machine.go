@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,10 +24,12 @@ const (
 	operationGet
 	operationDelete
 
-	maxKeyBytes     = 256
-	maxRequestBytes = 64 << 10
-	maxReplyBytes   = 64 << 10
-	maxKeys         = 1024
+	maxKeyBytes      = 256
+	maxRequestBytes  = 64 << 10
+	maxReplyBytes    = 64 << 10
+	maxKeys          = 1024
+	snapshotFormat   = "toykv-snapshot-v1"
+	maxSnapshotBytes = 1<<20 + maxKeys*(((maxKeyBytes+2)/3)*4+((maxRequestBytes+2)/3)*4+64)
 
 	resultOK byte = iota
 	resultNotFound
@@ -36,7 +41,26 @@ var (
 	errInvalidSnapshot  = errors.New("toykv: invalid snapshot")
 )
 
-var snapshotMagic = [8]byte{'T', 'O', 'Y', 'K', 'V', '0', '0', '1'}
+type snapshotEntry struct {
+	Key   []byte `json:"key"`
+	Value []byte `json:"value"`
+}
+
+type snapshotPayload struct {
+	Format    string          `json:"format"`
+	Operation uint64          `json:"operation"`
+	Entries   []snapshotEntry `json:"entries"`
+}
+
+type snapshotDocument struct {
+	Payload  snapshotPayload `json:"payload"`
+	Checksum string          `json:"checksum"`
+}
+
+type frozenSnapshot struct {
+	op      protocol.Op
+	encoded []byte
+}
 
 type kvMachine struct {
 	values          map[string][]byte
@@ -44,14 +68,18 @@ type kvMachine struct {
 	group           protocol.GroupID
 	memberCount     uint8
 	messageSizeMax  uint32
+	compactionOps   uint64
+	lastObservedOp  protocol.Op
 	pendingSnapshot protocol.Op
+	frozenSnapshots [2]frozenSnapshot
 	logger          zerolog.Logger
 }
 
-func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, logger zerolog.Logger) *kvMachine {
+func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, compactionOps uint64, logger zerolog.Logger) *kvMachine {
 	return &kvMachine{
 		values: make(map[string][]byte, maxKeys), directory: directory, group: group,
-		memberCount: memberCount, messageSizeMax: messageSizeMax, logger: logger,
+		memberCount: memberCount, messageSizeMax: messageSizeMax,
+		compactionOps: compactionOps, logger: logger,
 	}
 }
 
@@ -90,9 +118,16 @@ func (*kvMachine) StartPrefetch(replication.PrefetchInput, *replication.SMComple
 }
 
 func (machine *kvMachine) Commit(input replication.CommitInput, _ replication.PrefetchToken, reply []byte) (int, error) {
+	if input.Op <= machine.lastObservedOp {
+		return 0, errInvalidSnapshot
+	}
+	if err := machine.captureUnobservedThrough(input.Op - 1); err != nil {
+		return 0, err
+	}
+	replyLen := 0
+	var err error
 	switch input.Operation {
 	case protocol.OperationPulse:
-		return 0, nil
 	case operationPut:
 		keyBytes, value, ok := decodePut(input.Body)
 		if !ok {
@@ -100,10 +135,11 @@ func (machine *kvMachine) Commit(input replication.CommitInput, _ replication.Pr
 		}
 		key := string(keyBytes)
 		if _, found := machine.values[key]; !found && len(machine.values) == maxKeys {
-			return encodeStatus(reply, resultCapacity)
+			replyLen, err = encodeStatus(reply, resultCapacity)
+			break
 		}
 		machine.values[key] = append(machine.values[key][:0], value...)
-		return encodeStatus(reply, resultOK)
+		replyLen, err = encodeStatus(reply, resultOK)
 	case operationGet:
 		key, ok := decodeKey(input.Body)
 		if !ok {
@@ -111,14 +147,15 @@ func (machine *kvMachine) Commit(input replication.CommitInput, _ replication.Pr
 		}
 		value, found := machine.values[string(key)]
 		if !found {
-			return encodeStatus(reply, resultNotFound)
+			replyLen, err = encodeStatus(reply, resultNotFound)
+			break
 		}
 		if len(reply) < 1+len(value) {
 			return 0, replication.ErrStateMachine
 		}
 		reply[0] = resultOK
 		copy(reply[1:], value)
-		return 1 + len(value), nil
+		replyLen = 1 + len(value)
 	case operationDelete:
 		key, ok := decodeKey(input.Body)
 		if !ok {
@@ -126,13 +163,24 @@ func (machine *kvMachine) Commit(input replication.CommitInput, _ replication.Pr
 		}
 		name := string(key)
 		if _, found := machine.values[name]; !found {
-			return encodeStatus(reply, resultNotFound)
+			replyLen, err = encodeStatus(reply, resultNotFound)
+			break
 		}
 		delete(machine.values, name)
-		return encodeStatus(reply, resultOK)
+		replyLen, err = encodeStatus(reply, resultOK)
 	default:
 		return 0, errInvalidKVRequest
 	}
+	if err != nil {
+		return 0, err
+	}
+	machine.lastObservedOp = input.Op
+	if machine.isCompactionBoundary(input.Op) {
+		if err := machine.captureSnapshot(input.Op); err != nil {
+			return 0, err
+		}
+	}
+	return replyLen, nil
 }
 
 func (machine *kvMachine) StartCompact(input replication.CompactInput, _ *replication.SMCompletion) (replication.StartResult[replication.CompactResult], error) {
@@ -142,11 +190,27 @@ func (machine *kvMachine) StartCompact(input replication.CompactInput, _ *replic
 		}
 		machine.pendingSnapshot = 0
 	}
+	if input.Op < machine.lastObservedOp {
+		return replication.StartResult[replication.CompactResult]{}, errInvalidSnapshot
+	}
+	if input.Op > machine.lastObservedOp {
+		if err := machine.captureUnobservedThrough(input.Op); err != nil {
+			return replication.StartResult[replication.CompactResult]{}, err
+		}
+	} else if machine.isCompactionBoundary(input.Op) {
+		if err := machine.captureSnapshot(input.Op); err != nil {
+			return replication.StartResult[replication.CompactResult]{}, err
+		}
+	}
 	return replication.Ready(replication.CompactResult{}), nil
 }
 
 func (machine *kvMachine) StartCheckpoint(input replication.CheckpointInput, _ *replication.SMCompletion) (replication.StartResult[replication.CheckpointManifest], error) {
-	if err := machine.writeSnapshot(input.Op); err != nil {
+	encoded, found := machine.frozenSnapshot(input.Op)
+	if !found {
+		return replication.StartResult[replication.CheckpointManifest]{}, errInvalidSnapshot
+	}
+	if err := machine.writeSnapshot(input.Op, encoded); err != nil {
 		return replication.StartResult[replication.CheckpointManifest]{}, err
 	}
 	machine.pendingSnapshot = input.Op
@@ -170,11 +234,17 @@ func (machine *kvMachine) StartOpen(input replication.OpenCheckpointInput, _ *re
 	if err := machine.removeOtherSnapshots(op); err != nil {
 		return replication.StartResult[replication.OpenResult]{}, err
 	}
+	machine.pendingSnapshot = 0
+	machine.lastObservedOp = op
+	clear(machine.frozenSnapshots[:])
 	return replication.Ready(replication.OpenResult{}), nil
 }
 
 func (machine *kvMachine) StartReset(*replication.SMCompletion) (replication.StartResult[replication.ResetResult], error) {
 	clear(machine.values)
+	machine.pendingSnapshot = 0
+	machine.lastObservedOp = 0
+	clear(machine.frozenSnapshots[:])
 	return replication.Ready(replication.ResetResult{}), nil
 }
 
@@ -236,73 +306,172 @@ func encodeStatus(reply []byte, status byte) (int, error) {
 }
 
 func (machine *kvMachine) snapshotPath(op protocol.Op) string {
-	return filepath.Join(machine.directory, fmt.Sprintf("snapshot-%020d.bin", uint64(op)))
+	return filepath.Join(machine.directory, fmt.Sprintf("snapshot-%020d.json", uint64(op)))
 }
 
-func (machine *kvMachine) writeSnapshot(op protocol.Op) error {
+func (machine *kvMachine) isCompactionBoundary(op protocol.Op) bool {
+	return machine.compactionOps != 0 && uint64(op) != ^uint64(0) && (uint64(op)+1)%machine.compactionOps == 0
+}
+
+func (machine *kvMachine) captureUnobservedThrough(through protocol.Op) error {
+	if through < machine.lastObservedOp || machine.compactionOps == 0 || uint64(through) == ^uint64(0) {
+		return errInvalidSnapshot
+	}
+	if through == machine.lastObservedOp {
+		return nil
+	}
+	completed := uint64(through) + 1
+	lastCompleted := completed - completed%machine.compactionOps
+	if lastCompleted > machine.compactionOps {
+		previous := protocol.Op(lastCompleted - machine.compactionOps - 1)
+		if previous > machine.lastObservedOp {
+			if err := machine.captureSnapshot(previous); err != nil {
+				return err
+			}
+		}
+	}
+	if lastCompleted != 0 {
+		last := protocol.Op(lastCompleted - 1)
+		if last > machine.lastObservedOp {
+			if err := machine.captureSnapshot(last); err != nil {
+				return err
+			}
+		}
+	}
+	machine.lastObservedOp = through
+	return nil
+}
+
+func (machine *kvMachine) captureSnapshot(op protocol.Op) error {
+	if !machine.isCompactionBoundary(op) {
+		return errInvalidSnapshot
+	}
+	for _, snapshot := range machine.frozenSnapshots {
+		if snapshot.op == op && len(snapshot.encoded) != 0 {
+			return nil
+		}
+	}
+	encoded, err := machine.encodeSnapshot(op)
+	if err != nil {
+		return err
+	}
+	machine.frozenSnapshots[0] = machine.frozenSnapshots[1]
+	machine.frozenSnapshots[1] = frozenSnapshot{op: op, encoded: encoded}
+	return nil
+}
+
+func (machine *kvMachine) frozenSnapshot(op protocol.Op) ([]byte, bool) {
+	for _, snapshot := range machine.frozenSnapshots {
+		if snapshot.op == op && len(snapshot.encoded) != 0 {
+			return snapshot.encoded, true
+		}
+	}
+	return nil, false
+}
+
+func (machine *kvMachine) encodeSnapshot(op protocol.Op) ([]byte, error) {
 	keys := make([]string, 0, len(machine.values))
 	for key := range machine.values {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
-	var encoded bytes.Buffer
-	encoded.Grow(8 + 8 + 4 + len(keys)*16)
-	_, _ = encoded.Write(snapshotMagic[:])
-	_ = binary.Write(&encoded, binary.LittleEndian, uint64(op))
-	_ = binary.Write(&encoded, binary.LittleEndian, uint32(len(keys)))
-	for _, key := range keys {
-		value := machine.values[key]
-		_ = binary.Write(&encoded, binary.LittleEndian, uint16(len(key)))
-		_ = binary.Write(&encoded, binary.LittleEndian, uint32(len(value)))
-		_, _ = encoded.WriteString(key)
-		_, _ = encoded.Write(value)
+	payload := snapshotPayload{
+		Format: snapshotFormat, Operation: uint64(op),
+		Entries: make([]snapshotEntry, 0, len(keys)),
 	}
-	checksum := protocol.ChecksumBytes(encoded.Bytes())
-	_, _ = encoded.Write(checksum[:])
-	return writeAtomic(machine.snapshotPath(op), encoded.Bytes(), 0o600)
+	for _, key := range keys {
+		payload.Entries = append(payload.Entries, snapshotEntry{Key: []byte(key), Value: machine.values[key]})
+	}
+	checksumInput, err := json.Marshal(payload)
+	if err != nil {
+		return nil, errors.Join(errInvalidSnapshot, err)
+	}
+	checksum := protocol.ChecksumBytes(checksumInput)
+	document := snapshotDocument{Payload: payload, Checksum: hex.EncodeToString(checksum[:])}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return nil, errors.Join(errInvalidSnapshot, err)
+	}
+	if len(encoded) > maxSnapshotBytes {
+		return nil, errInvalidSnapshot
+	}
+	return encoded, nil
+}
+
+func (machine *kvMachine) writeSnapshot(op protocol.Op, encoded []byte) error {
+	if len(encoded) == 0 || len(encoded) > maxSnapshotBytes {
+		return errInvalidSnapshot
+	}
+	return writeAtomic(machine.snapshotPath(op), encoded, 0o600)
 }
 
 func (machine *kvMachine) readSnapshot(op protocol.Op) error {
-	encoded, err := os.ReadFile(machine.snapshotPath(op))
+	path := machine.snapshotPath(op)
+	file, err := os.Open(path)
 	if err != nil {
 		return errors.Join(errInvalidSnapshot, err)
 	}
-	if len(encoded) < 8+8+4+16 || !bytes.Equal(encoded[:8], snapshotMagic[:]) {
+	info, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return errors.Join(errInvalidSnapshot, statErr)
+	}
+	if info.Size() <= 0 || info.Size() > maxSnapshotBytes {
+		_ = file.Close()
 		return errInvalidSnapshot
 	}
-	payload := encoded[:len(encoded)-16]
+	encoded, readErr := io.ReadAll(io.LimitReader(file, maxSnapshotBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return errors.Join(errInvalidSnapshot, readErr)
+	}
+	if closeErr != nil {
+		return errors.Join(errInvalidSnapshot, closeErr)
+	}
+	if len(encoded) == 0 || len(encoded) > maxSnapshotBytes {
+		return errInvalidSnapshot
+	}
+
+	var document snapshotDocument
+	if err := json.Unmarshal(encoded, &document); err != nil {
+		return errors.Join(errInvalidSnapshot, err)
+	}
+	canonical, err := json.Marshal(document)
+	if err != nil || !bytes.Equal(encoded, canonical) {
+		return errInvalidSnapshot
+	}
+	payload := document.Payload
+	if payload.Format != snapshotFormat || protocol.Op(payload.Operation) != op || len(payload.Entries) > maxKeys {
+		return errInvalidSnapshot
+	}
+	checksumInput, err := json.Marshal(payload)
+	if err != nil {
+		return errors.Join(errInvalidSnapshot, err)
+	}
 	var stored protocol.Checksum
-	copy(stored[:], encoded[len(encoded)-16:])
-	if protocol.ChecksumBytes(payload) != stored || protocol.Op(binary.LittleEndian.Uint64(payload[8:16])) != op {
+	if len(document.Checksum) != hex.EncodedLen(len(stored)) {
 		return errInvalidSnapshot
 	}
-	count := int(binary.LittleEndian.Uint32(payload[16:20]))
-	if count > maxKeys {
+	if _, err := hex.Decode(stored[:], []byte(document.Checksum)); err != nil || hex.EncodeToString(stored[:]) != document.Checksum {
 		return errInvalidSnapshot
 	}
-	values := make(map[string][]byte, count)
-	offset := 20
-	for range count {
-		if len(payload)-offset < 6 {
-			return errInvalidSnapshot
-		}
-		keySize := int(binary.LittleEndian.Uint16(payload[offset : offset+2]))
-		valueSize := int(binary.LittleEndian.Uint32(payload[offset+2 : offset+6]))
-		offset += 6
-		if keySize == 0 || keySize > maxKeyBytes || valueSize > maxRequestBytes || keySize+valueSize > len(payload)-offset {
-			return errInvalidSnapshot
-		}
-		key := string(payload[offset : offset+keySize])
-		offset += keySize
-		if _, duplicate := values[key]; duplicate {
-			return errInvalidSnapshot
-		}
-		values[key] = append([]byte(nil), payload[offset:offset+valueSize]...)
-		offset += valueSize
-	}
-	if offset != len(payload) {
+	if protocol.ChecksumBytes(checksumInput) != stored {
 		return errInvalidSnapshot
+	}
+
+	values := make(map[string][]byte, len(payload.Entries))
+	previous := ""
+	for index, entry := range payload.Entries {
+		if len(entry.Key) == 0 || len(entry.Key) > maxKeyBytes || len(entry.Value) > maxRequestBytes {
+			return errInvalidSnapshot
+		}
+		key := string(entry.Key)
+		if index > 0 && key <= previous {
+			return errInvalidSnapshot
+		}
+		values[key] = append([]byte(nil), entry.Value...)
+		previous = key
 	}
 	machine.values = values
 	return nil
@@ -315,10 +484,10 @@ func (machine *kvMachine) removeOtherSnapshots(keep protocol.Op) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "snapshot-") || !strings.HasSuffix(name, ".bin") {
+		if entry.IsDir() || !strings.HasPrefix(name, "snapshot-") || !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		number := strings.TrimSuffix(strings.TrimPrefix(name, "snapshot-"), ".bin")
+		number := strings.TrimSuffix(strings.TrimPrefix(name, "snapshot-"), ".json")
 		value, parseErr := strconv.ParseUint(number, 10, 64)
 		if parseErr != nil || protocol.Op(value) == keep {
 			continue

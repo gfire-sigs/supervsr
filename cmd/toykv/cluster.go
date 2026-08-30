@@ -241,7 +241,14 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 		loggerContext := cluster.logger.With()
 		loggerContext = loggerContext.Uint8("replica", uint8(index))
 		replicaLogger := loggerContext.Logger()
-		machine := newKVMachine(machineDir, identity.group, uint8(len(identity.members)), uint32(cluster.config.MessageSizeMax), replicaLogger)
+		machine := newKVMachine(
+			machineDir,
+			identity.group,
+			uint8(len(identity.members)),
+			uint32(cluster.config.MessageSizeMax),
+			cluster.config.CompactionOps,
+			replicaLogger,
+		)
 		replica, err := replication.Open(ctx, config, replication.Dependencies{
 			Storage: storage, MessageBus: localBus{transport: cluster.transport, from: protocol.ReplicaIndex(index), fromMember: true},
 			Clock: clock, Entropy: rand.Reader, StateMachine: machine, Logger: &replicaLogger,
