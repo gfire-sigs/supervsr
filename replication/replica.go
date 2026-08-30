@@ -513,6 +513,17 @@ func (replica *Replica) Snapshot() ReplicaSnapshot {
 	}
 }
 
+func (replica *Replica) DurableChecksum(op protocol.Op) (protocol.Checksum, bool) {
+	if op < replica.checkpoint.PrepareOp() || op > replica.headOp {
+		return protocol.Checksum{}, false
+	}
+	header, present, dirty, found := replica.localHeaderEvidence(op)
+	if !found || !present || dirty {
+		return protocol.Checksum{}, false
+	}
+	return header.HeaderChecksum, true
+}
+
 func (replica *Replica) Submit(frame *protocol.Frame) error {
 	replica.submitters.Add(1)
 	defer replica.submitters.Add(-1)

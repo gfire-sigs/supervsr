@@ -12,11 +12,12 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 		return false
 	}
 	switch header.Command {
-	case protocol.CommandExitView, protocol.CommandJoinView:
+	case protocol.CommandExitView, protocol.CommandJoinView, protocol.CommandPing, protocol.CommandPong:
+		if uint8(replica.local) >= replica.membership.ActiveCount {
+			return false
+		}
 		replica.beginViewChange(header.View)
 		return true
-	case protocol.CommandPing, protocol.CommandPong:
-		return false
 	case protocol.CommandRequest, protocol.CommandClientPing:
 		return false
 	case protocol.CommandPrepare:

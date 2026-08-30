@@ -959,7 +959,7 @@ func (bus *captureBus) replicaMessage(t testing.TB, index int) []byte {
 	return append([]byte(nil), bus.replicas[index]...)
 }
 
-func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {
+func TestHigherViewPingEntersViewChangeBeforeClockTraffic(t *testing.T) {
 	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
 	bus := &captureBus{}
 	clock := &observingClock{sample: TimeSample{Wall: 100, Monotonic: 100, Synchronized: true}}
@@ -970,17 +970,13 @@ func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {
 		CheckpointMax: 1,
 	}}
 	replica, err := newReplica(config, Dependencies{
-		Storage:      storage,
-		MessageBus:   bus,
-		Clock:        clock,
-		Entropy:      bytes.NewReader([]byte{1}),
-		StateMachine: machine,
+		Storage: storage, MessageBus: bus, Clock: clock, Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeReplica(t, replica)
-	pool, err := protocol.NewFramePool(2, uint32(config.Cluster.MessageSizeMax))
+	pool, err := protocol.NewFramePool(1, uint32(config.Cluster.MessageSizeMax))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -999,41 +995,17 @@ func TestHigherViewPingAndPongDoNotAdvanceConsensusState(t *testing.T) {
 	if err := ping.BindReplica(protocol.MemberID{1}, 0); err != nil {
 		t.Fatal(err)
 	}
-	pong, err := pool.Acquire(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pongHeader := protocol.Header{Group: config.Group, View: 7, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPong, Author: 0}
-	binary.LittleEndian.PutUint64(pongHeader.Fields[:8], 11)
-	binary.LittleEndian.PutUint64(pongHeader.Fields[8:16], 22)
-	if err := pong.Seal(&pongHeader); err != nil {
-		t.Fatal(err)
-	}
-	if err := pong.BindReplica(protocol.MemberID{1}, 0); err != nil {
-		t.Fatal(err)
-	}
 	if err := replica.Submit(ping); err != nil {
 		t.Fatal(err)
 	}
-	if err := replica.Submit(pong); err != nil {
+	if _, err := replica.Process(1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := replica.Process(2); err != nil {
-		t.Fatal(err)
+	if snapshot := replica.Snapshot(); snapshot.View != 7 || snapshot.Status != StatusViewChange || snapshot.HeadOp != 0 {
+		t.Fatalf("higher-view ping state: %+v", snapshot)
 	}
-	if snapshot := replica.Snapshot(); snapshot.View != 0 || snapshot.Status != StatusNormal || snapshot.HeadOp != 0 {
-		t.Fatalf("ping changed consensus state: %+v", snapshot)
-	}
-	if clock.observations != 1 {
-		t.Fatalf("pong observations = %d", clock.observations)
-	}
-	messages := bus.replicaMessages()
-	if len(messages) != 1 {
-		t.Fatalf("ping replies = %d", len(messages))
-	}
-	reply, _, reason := protocol.DecodeFrame(messages[0], config.Group, uint32(config.Cluster.MessageSizeMax), 1)
-	if reason != protocol.RejectNone || reply.Command != protocol.CommandPong {
-		t.Fatalf("ping response command=%d reason=%v", reply.Command, reason)
+	if clock.observations != 0 || len(bus.replicaMessages()) != 0 {
+		t.Fatalf("clock observations=%d messages=%d", clock.observations, len(bus.replicaMessages()))
 	}
 }
 

@@ -61,15 +61,17 @@ type node struct {
 }
 
 type Cluster struct {
-	config  Config
-	clock   *Clock
-	network *Network
-	factory MachineFactory
-	members [replication.MembersMax]protocol.MemberID
-	stores  []*Storage
-	nodes   []node
-	clients []*replication.Client
-	closed  bool
+	config       Config
+	clock        *Clock
+	memberClocks []*Clock
+	network      *Network
+	factory      MachineFactory
+	members      [replication.MembersMax]protocol.MemberID
+	stores       []*Storage
+	nodes        []node
+	clients      []*replication.Client
+	closed       bool
+	invariants   invariantState
 }
 
 func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cluster, error) {
@@ -83,9 +85,10 @@ func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cl
 	}
 	cluster := &Cluster{
 		config: config, clock: NewClock(), network: network, factory: factory,
-		stores: make([]*Storage, memberCount), nodes: make([]node, memberCount),
+		memberClocks: make([]*Clock, memberCount), stores: make([]*Storage, memberCount), nodes: make([]node, memberCount),
 	}
 	for index := range memberCount {
+		cluster.memberClocks[index] = NewClock()
 		cluster.members[index][15] = index + 1
 	}
 	if cluster.factory == nil {
@@ -119,11 +122,29 @@ func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cl
 			return nil, err
 		}
 	}
+	if err := cluster.CheckInvariants(); err != nil {
+		_ = cluster.Close(context.Background())
+		return nil, err
+	}
 	return cluster, nil
 }
 
 func (cluster *Cluster) Clock() *Clock {
 	return cluster.clock
+}
+
+func (cluster *Cluster) MemberClock(index protocol.ReplicaIndex) *Clock {
+	if int(index) >= len(cluster.memberClocks) {
+		return nil
+	}
+	return cluster.memberClocks[index]
+}
+
+func (cluster *Cluster) SetAllClocksSynchronized(synchronized bool) {
+	cluster.clock.SetSynchronized(synchronized)
+	for _, clock := range cluster.memberClocks {
+		clock.SetSynchronized(synchronized)
+	}
 }
 
 func (cluster *Cluster) Network() *Network {
@@ -159,13 +180,17 @@ func (cluster *Cluster) Metrics(index protocol.ReplicaIndex) (replication.Replic
 }
 
 func (cluster *Cluster) AddClient(id protocol.ClientID, events replication.ClientEvents) (*replication.Client, error) {
+	if uint64(len(cluster.clients)) >= cluster.config.Cluster.ClientsMax {
+		return nil, replication.ErrInvalidConfiguration
+	}
 	if cluster.closed {
 		return nil, replication.ErrReplicaClosed
 	}
+	observer := &observedClientEvents{cluster: cluster, client: id, target: events}
 	client, err := replication.NewClient(replication.ClientConfig{
 		Group: cluster.config.Group, ID: id, Release: cluster.config.CurrentRelease, ActiveCount: cluster.config.ActiveCount,
 		MessageSizeMax: uint32(cluster.config.Cluster.MessageSizeMax), Process: cluster.config.Process,
-	}, cluster.network.ClientBus(), cluster.clock, bytes.NewReader(id[:8]), events)
+	}, cluster.network.ClientBus(), cluster.clock, bytes.NewReader(id[:8]), observer)
 	if err != nil {
 		return nil, err
 	}
@@ -182,9 +207,18 @@ func (cluster *Cluster) Step() error {
 		return replication.ErrReplicaClosed
 	}
 	cluster.clock.Advance(cluster.config.Process.Tick)
+	for _, clock := range cluster.memberClocks {
+		clock.Advance(cluster.config.Process.Tick)
+	}
 	cluster.network.Advance()
+	if err := cluster.CheckInvariants(); err != nil {
+		return err
+	}
 	for _, client := range cluster.clients {
 		if err := client.Tick(); err != nil {
+			return err
+		}
+		if err := cluster.CheckInvariants(); err != nil {
 			return err
 		}
 		if err := cluster.settle(); err != nil {
@@ -199,11 +233,17 @@ func (cluster *Cluster) Step() error {
 		if err := replica.Tick(); err != nil {
 			return &NodeError{Index: protocol.ReplicaIndex(index), Err: err}
 		}
+		if err := cluster.CheckInvariants(); err != nil {
+			return err
+		}
 		if err := cluster.settle(); err != nil {
 			return err
 		}
 	}
-	return cluster.settle()
+	if err := cluster.settle(); err != nil {
+		return err
+	}
+	return cluster.CheckInvariants()
 }
 
 func (cluster *Cluster) Run(steps int) error {
@@ -221,20 +261,21 @@ func (cluster *Cluster) Crash(ctx context.Context, index protocol.ReplicaIndex) 
 	}
 	node := &cluster.nodes[index]
 	cluster.network.UnregisterReplica(index)
-	if err := node.replica.Close(ctx); err != nil {
-		return err
-	}
+	_ = node.replica.Close(ctx)
 	node.replica = nil
 	node.machine = nil
 	cluster.stores[index].Crash()
-	return nil
+	return cluster.CheckInvariants()
 }
 
 func (cluster *Cluster) Restart(ctx context.Context, index protocol.ReplicaIndex) error {
 	if int(index) >= len(cluster.nodes) || cluster.nodes[index].replica != nil {
 		return replication.ErrInvalidConfiguration
 	}
-	return cluster.openNode(ctx, index)
+	if err := cluster.openNode(ctx, index); err != nil {
+		return err
+	}
+	return cluster.CheckInvariants()
 }
 
 func (cluster *Cluster) Close(ctx context.Context) error {
@@ -275,7 +316,7 @@ func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaInde
 	seed[7] = byte(node.generation)
 	metrics := &replication.ReplicaMetrics{}
 	replica, err := replication.Open(ctx, node.config, replication.Dependencies{
-		Storage: cluster.stores[index], MessageBus: cluster.network.ReplicaBus(index), Clock: cluster.clock,
+		Storage: cluster.stores[index], MessageBus: cluster.network.ReplicaBus(index), Clock: cluster.memberClocks[index],
 		Entropy: bytes.NewReader(seed[:]), StateMachine: machine, Metrics: metrics, SynchronousIO: true,
 	})
 	if err != nil {
@@ -301,6 +342,11 @@ func (cluster *Cluster) settle() error {
 		if err != nil {
 			return err
 		}
+		if delivered != 0 {
+			if err := cluster.CheckInvariants(); err != nil {
+				return err
+			}
+		}
 		processed := 0
 		for index := range cluster.nodes {
 			replica := cluster.nodes[index].replica
@@ -312,12 +358,17 @@ func (cluster *Cluster) settle() error {
 				return &NodeError{Index: protocol.ReplicaIndex(index), Err: err}
 			}
 			processed += count
+			if count != 0 {
+				if err := cluster.CheckInvariants(); err != nil {
+					return err
+				}
+			}
 		}
 		work += delivered + processed + 1
 		if delivered == 0 && processed == 0 {
 			idleRounds++
 			if idleRounds == 2 {
-				return nil
+				return cluster.CheckInvariants()
 			}
 		} else {
 			idleRounds = 0

@@ -7,6 +7,8 @@ import (
 	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
 
+const CommitHistoryMax = 256
+
 type Commit struct {
 	Operation protocol.Operation
 	Body      []byte
@@ -45,9 +47,14 @@ func (machine *Machine) Commit(input replication.CommitInput, _ replication.Pref
 	machine.mu.Lock()
 	defer machine.mu.Unlock()
 	body := append([]byte(nil), input.Body...)
-	machine.commits = append(machine.commits, Commit{
-		Operation: input.Operation, Body: body, Timestamp: input.Timestamp, Op: input.Op, Release: input.Release,
-	})
+	commit := Commit{Operation: input.Operation, Body: body, Timestamp: input.Timestamp, Op: input.Op, Release: input.Release}
+	if len(machine.commits) == CommitHistoryMax {
+		machine.commits[0].Body = nil
+		copy(machine.commits, machine.commits[1:])
+		machine.commits[len(machine.commits)-1] = commit
+	} else {
+		machine.commits = append(machine.commits, commit)
+	}
 	return copy(reply, input.Body), nil
 }
 

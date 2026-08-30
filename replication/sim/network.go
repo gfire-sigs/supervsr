@@ -33,6 +33,11 @@ type corruption struct {
 	mask   byte
 	armed  bool
 }
+
+type misdirection struct {
+	to    protocol.ReplicaIndex
+	armed bool
+}
 type Network struct {
 	mu          sync.Mutex
 	pool        *protocol.FramePool
@@ -41,13 +46,17 @@ type Network struct {
 	now         uint64
 	sequence    uint64
 	delay       uint64
+	nextDelay   uint64
+	delayNext   bool
 	drop        uint64
 	duplicate   uint64
 	corrupt     corruption
+	misdirect   misdirection
 	fault       error
 	queue       []packet
 	members     [replication.MembersMax]protocol.MemberID
 	links       [replication.MembersMax][replication.MembersMax]bool
+	linkDelay   [replication.MembersMax][replication.MembersMax]uint64
 	replicas    [replication.MembersMax]func(*protocol.Frame) error
 	clients     map[protocol.ClientID]func(protocol.ReplicaIndex, []byte)
 }
@@ -117,6 +126,73 @@ func (network *Network) Heal(left, right protocol.ReplicaIndex) error {
 	return network.setLink(left, right, true)
 }
 
+func (network *Network) PartitionDirected(from, to protocol.ReplicaIndex) error {
+	return network.setDirectedLink(from, to, false)
+}
+
+func (network *Network) HealDirected(from, to protocol.ReplicaIndex) error {
+	return network.setDirectedLink(from, to, true)
+}
+
+func (network *Network) Disconnect(index protocol.ReplicaIndex) error {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if uint8(index) >= network.memberCount {
+		return replication.ErrInvalidConfiguration
+	}
+	for peer := range network.memberCount {
+		if protocol.ReplicaIndex(peer) == index {
+			continue
+		}
+		network.links[index][peer] = false
+		network.links[peer][index] = false
+	}
+	return nil
+}
+
+func (network *Network) Reconnect(index protocol.ReplicaIndex) error {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if uint8(index) >= network.memberCount {
+		return replication.ErrInvalidConfiguration
+	}
+	for peer := range network.memberCount {
+		if protocol.ReplicaIndex(peer) == index {
+			continue
+		}
+		network.links[index][peer] = true
+		network.links[peer][index] = true
+	}
+	return nil
+}
+
+func (network *Network) SetLinkDelay(from, to protocol.ReplicaIndex, ticks uint64) error {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if uint8(from) >= network.memberCount || uint8(to) >= network.memberCount {
+		return replication.ErrInvalidConfiguration
+	}
+	network.linkDelay[from][to] = ticks
+	return nil
+}
+
+func (network *Network) DelayNext(ticks uint64) {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	network.nextDelay = ticks
+	network.delayNext = true
+}
+
+func (network *Network) MisdirectNext(to protocol.ReplicaIndex) error {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if uint8(to) >= network.memberCount {
+		return replication.ErrInvalidConfiguration
+	}
+	network.misdirect = misdirection{to: to, armed: true}
+	return nil
+}
+
 func (network *Network) SetDelay(ticks uint64) {
 	network.mu.Lock()
 	defer network.mu.Unlock()
@@ -141,52 +217,68 @@ func (network *Network) CorruptNext(offset int, mask byte) {
 	network.corrupt = corruption{offset: offset, mask: mask, armed: true}
 }
 
+func (network *Network) ClearFault() {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	network.fault = nil
+}
+
 func (network *Network) Advance() {
 	network.mu.Lock()
 	defer network.mu.Unlock()
-	network.now++
+	network.now = saturatingAdd(network.now, 1)
 }
 
 func (network *Network) DeliverReady() (int, error) {
 	delivered := 0
+	for {
+		ready, err := network.DeliverOne()
+		if err != nil {
+			return delivered, err
+		}
+		if !ready {
+			return delivered, nil
+		}
+		delivered++
+	}
+}
+
+func (network *Network) DeliverOne() (bool, error) {
 	network.mu.Lock()
 	fault := network.fault
 	network.mu.Unlock()
 	if fault != nil {
-		return delivered, fault
+		return false, fault
 	}
-	for {
-		packet, replicaSubmit, clientHandle, ok := network.takeReady()
-		if !ok {
-			return delivered, nil
+	packet, replicaSubmit, clientHandle, ok := network.takeReady()
+	if !ok {
+		return false, nil
+	}
+	if replicaSubmit != nil {
+		frame, err := network.pool.AcquireEncoded(packet.frame)
+		if err == nil {
+			if packet.fromMember {
+				err = frame.BindReplica(network.members[packet.from], packet.from)
+			} else {
+				err = frame.BindClient()
+			}
 		}
-		if replicaSubmit != nil {
-			frame, err := network.pool.AcquireEncoded(packet.frame)
-			if err == nil {
-				if packet.fromMember {
-					err = frame.BindReplica(network.members[packet.from], packet.from)
-				} else {
-					err = frame.BindClient()
-				}
-			}
-			if err != nil {
-				if frame != nil {
-					frame.Release()
-				}
-				return delivered, err
-			}
-			if err := replicaSubmit(frame); err != nil {
+		if err != nil {
+			if frame != nil {
 				frame.Release()
-				return delivered, err
 			}
-			delivered++
-			continue
+			return false, err
 		}
-		if clientHandle != nil {
-			clientHandle(packet.from, packet.frame)
-			delivered++
+		if err := replicaSubmit(frame); err != nil {
+			frame.Release()
+			return false, err
 		}
+		return true, nil
 	}
+	if clientHandle != nil {
+		clientHandle(packet.from, packet.frame)
+	}
+	return true, nil
 }
 
 func (network *Network) Pending() int {
@@ -206,6 +298,16 @@ func (network *Network) setLink(left, right protocol.ReplicaIndex, connected boo
 	return nil
 }
 
+func (network *Network) setDirectedLink(from, to protocol.ReplicaIndex, connected bool) error {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	if uint8(from) >= network.memberCount || uint8(to) >= network.memberCount || from == to {
+		return replication.ErrInvalidConfiguration
+	}
+	network.links[from][to] = connected
+	return nil
+}
+
 func (network *Network) enqueue(from protocol.ReplicaIndex, fromMember bool, kind packetKind, to protocol.ReplicaIndex, client protocol.ClientID, message *protocol.Frame) {
 	encoded, err := message.Bytes()
 	if err != nil {
@@ -215,6 +317,10 @@ func (network *Network) enqueue(from protocol.ReplicaIndex, fromMember bool, kin
 	defer network.mu.Unlock()
 	if kind == packetReplica && uint8(to) >= network.memberCount {
 		return
+	}
+	if kind == packetReplica && network.misdirect.armed {
+		to = network.misdirect.to
+		network.misdirect = misdirection{}
 	}
 	if fromMember && kind == packetReplica && !network.links[from][to] {
 		return
@@ -228,6 +334,16 @@ func (network *Network) enqueue(from protocol.ReplicaIndex, fromMember bool, kin
 		network.duplicate--
 		copies++
 	}
+	delay := network.delay
+	if fromMember {
+		delay = saturatingAdd(delay, network.linkDelay[from][to])
+	}
+	if network.delayNext {
+		delay = saturatingAdd(delay, network.nextDelay)
+		network.nextDelay = 0
+		network.delayNext = false
+	}
+	deliverAt := saturatingAdd(network.now, delay)
 	for range copies {
 		if len(network.queue) == network.maximum {
 			network.fault = ErrNetworkBackpressure
@@ -242,7 +358,7 @@ func (network *Network) enqueue(from protocol.ReplicaIndex, fromMember bool, kin
 		}
 		network.sequence++
 		network.queue = append(network.queue, packet{
-			frame: frame, client: client, sequence: network.sequence, deliverAt: network.now + network.delay,
+			frame: frame, client: client, sequence: network.sequence, deliverAt: deliverAt,
 			from: from, to: to, kind: kind, fromMember: fromMember,
 		})
 	}
@@ -255,6 +371,9 @@ func (network *Network) takeReady() (packet, func(*protocol.Frame) error, func(p
 	for index := range network.queue {
 		candidate := network.queue[index]
 		if candidate.deliverAt > network.now {
+			continue
+		}
+		if candidate.kind == packetReplica && candidate.fromMember && !network.links[candidate.from][candidate.to] {
 			continue
 		}
 		if selected == -1 || candidate.sequence < network.queue[selected].sequence {
@@ -271,6 +390,13 @@ func (network *Network) takeReady() (packet, func(*protocol.Frame) error, func(p
 		return selectedPacket, network.replicas[selectedPacket.to], nil, true
 	}
 	return selectedPacket, nil, network.clients[selectedPacket.client], true
+}
+
+func saturatingAdd(left, right uint64) uint64 {
+	if ^uint64(0)-left < right {
+		return ^uint64(0)
+	}
+	return left + right
 }
 
 type networkBus struct {
