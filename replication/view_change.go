@@ -345,7 +345,16 @@ func (replica *Replica) joinHeaderSlice(sender uint8) []protocol.Header {
 
 func (replica *Replica) tryInstallCanonicalView() {
 	commit, head, count, resolved := replica.selectCanonicalSuffix()
-	if !resolved || commit != replica.commitMin || !replica.canonicalAvailable(commit, head, count) {
+	if !resolved || commit < replica.commitMin || commit-replica.commitMin > protocol.Op(replica.pipelineLen) || !replica.canonicalAvailable(head, count) {
+		return
+	}
+	if commit > replica.commitMin {
+		if !replica.validRecoveringView(replica.view, commit, head, count) {
+			return
+		}
+		replica.status = StatusRecoveringHead
+		replica.recordRecoveringView(replica.view, commit, head, count)
+		replica.finishRecoveringView()
 		return
 	}
 	if err := replica.persistView(true, commit, head, replica.canonicalHeaders[:count]); err != nil {
@@ -468,18 +477,18 @@ func (replica *Replica) joinHeaderAt(sender uint8, op protocol.Op) (protocol.Hea
 	return header, header.Command != 0
 }
 
-func (replica *Replica) canonicalAvailable(commit, head protocol.Op, count int) bool {
+func (replica *Replica) canonicalAvailable(head protocol.Op, count int) bool {
 	if count == 0 || prepareOp(&replica.canonicalHeaders[0]) != head {
 		return false
 	}
 	for index := range count {
 		header := replica.canonicalHeaders[index]
 		op := prepareOp(&header)
-		if op <= commit {
+		if op <= replica.commitMin {
 			continue
 		}
-		local, present, _, found := replica.localHeaderEvidence(op)
-		if !found || !present || local.HeaderChecksum != header.HeaderChecksum {
+		local, present, dirty, found := replica.localHeaderEvidence(op)
+		if !found || !present || dirty || local.HeaderChecksum != header.HeaderChecksum {
 			return false
 		}
 	}
@@ -565,7 +574,7 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		replica.getViewLast = 0
 		return
 	}
-	if commit != replica.commitMin || !replica.canonicalAvailable(commit, head, count) {
+	if commit < replica.commitMin || commit-replica.commitMin > protocol.Op(replica.pipelineLen) || !replica.canonicalAvailable(head, count) {
 		replica.status = StatusRecoveringHead
 		if !replica.validRecoveringView(header.View, commit, head, count) {
 			return
@@ -655,8 +664,8 @@ func (replica *Replica) recoveringCommonAncestor(count int) (protocol.Op, bool) 
 		if op > replica.headOp {
 			continue
 		}
-		local, present, _, found := replica.localHeaderEvidence(op)
-		if found && present && local.HeaderChecksum == canonical.HeaderChecksum {
+		local, present, dirty, found := replica.localHeaderEvidence(op)
+		if found && present && !dirty && local.HeaderChecksum == canonical.HeaderChecksum {
 			return op, true
 		}
 	}

@@ -33,6 +33,31 @@ func TestCanonicalSuffixSelectionAndNegativeTruncation(t *testing.T) {
 	}
 }
 
+func TestCanonicalRecoveryRequiresDurableLocalEntry(t *testing.T) {
+	replica, root, first, _ := canonicalFixture(t)
+	replica.pipeline = make([]pipelineEntry, int(replica.config.Cluster.PipelineMax))
+	replica.pipeline[0] = pipelineEntry{header: first}
+	replica.pipelineLen = 1
+	replica.headOp = 1
+	replica.canonicalHeaders[0] = first
+	replica.canonicalHeaders[1] = root
+
+	if replica.canonicalAvailable(1, 2) {
+		t.Fatal("non-durable canonical entry reported available")
+	}
+	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 0 {
+		t.Fatalf("non-durable recovery ancestor = %d, found %t", ancestor, found)
+	}
+
+	replica.pipeline[0].durable = true
+	if !replica.canonicalAvailable(1, 2) {
+		t.Fatal("durable canonical entry reported unavailable")
+	}
+	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 1 {
+		t.Fatalf("durable recovery ancestor = %d, found %t", ancestor, found)
+	}
+}
+
 func TestExitViewQuorumPersistsBeforeJoin(t *testing.T) {
 	config, storage := threeReplicaFormat(t)
 	machine := &testStateMachine{capacities: StateMachineCapacities{

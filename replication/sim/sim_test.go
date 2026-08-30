@@ -230,6 +230,59 @@ func TestClusterCommitsAcrossPrimaryCrashAndRepairsRestart(t *testing.T) {
 	}
 }
 
+func TestClusterRecoversAfterAllReplicasRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	events := &clientEvents{}
+	client, err := cluster.AddClient(protocol.ClientID{1}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Submit(protocol.OperationApplicationMin, []byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 2 }); err != nil {
+		t.Fatal(err)
+	}
+	for index := range uint8(3) {
+		if err := cluster.Crash(ctx, protocol.ReplicaIndex(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := range uint8(3) {
+		if err := cluster.Restart(ctx, protocol.ReplicaIndex(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := runUntil(cluster, 4_000, replicasAgree); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	if err := client.Submit(protocol.OperationApplicationMin, []byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 3 }); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+}
+
 func TestClusterStateSyncsReplicaBeyondRetainedCheckpoint(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
