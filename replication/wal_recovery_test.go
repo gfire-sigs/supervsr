@@ -91,6 +91,41 @@ func TestWALRecoverSoloRejectsUncertainBody(t *testing.T) {
 	}
 }
 
+func TestRecoveredCommitTargetRetainsBoundedSuffix(t *testing.T) {
+	config := compactTestClusterConfig()
+	head := protocol.Header{}
+	putUint64(head.Fields[96:104], 10)
+	putUint64(head.Fields[104:112], 3)
+	recovery := WALRecoveryReport{HeadOp: 10, HeadHeader: head}
+	durable := Superblock{}
+
+	target, err := recoveredCommitTarget(config, durable, recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := protocol.Op(10 - config.PipelineMax)
+	if target != want {
+		t.Fatalf("recovered target = %d, want retained floor %d", target, want)
+	}
+
+	putUint64(recovery.HeadHeader.Fields[104:112], 7)
+	target, err = recoveredCommitTarget(config, durable, recovery)
+	if err != nil || target != 7 {
+		t.Fatalf("recovered target = %d, error %v, want head commit 7", target, err)
+	}
+
+	durable.State.CommitMax = 8
+	target, err = recoveredCommitTarget(config, durable, recovery)
+	if err != nil || target != 8 {
+		t.Fatalf("recovered target = %d, error %v, want durable commit 8", target, err)
+	}
+
+	durable.State.CommitMax = 11
+	if _, err := recoveredCommitTarget(config, durable, recovery); !errors.Is(err, ErrWALRecovery) {
+		t.Fatalf("invalid durable commit error = %v", err)
+	}
+}
+
 func formattedWALFixture(t testing.TB) (ClusterConfig, *crashStorage, CheckpointState) {
 	t.Helper()
 	config := compactTestClusterConfig()

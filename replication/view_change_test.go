@@ -3,6 +3,7 @@ package replication
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -55,6 +56,45 @@ func TestCanonicalRecoveryRequiresDurableLocalEntry(t *testing.T) {
 	}
 	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 1 {
 		t.Fatalf("durable recovery ancestor = %d, found %t", ancestor, found)
+	}
+}
+
+func TestSelectedPrimaryRepairsMissingCommittedPrepare(t *testing.T) {
+	replica, root, first, _ := canonicalFixture(t)
+	replica.pipeline = make([]pipelineEntry, int(replica.config.Cluster.PipelineMax))
+	replica.repairFrames = make([]*Message, int(replica.config.Cluster.PipelineMax+1))
+	replica.status = StatusViewChange
+	replica.view = 3
+	replica.headOp = 0
+	replica.headChecksum = root.HeaderChecksum
+	installJoinRecord(replica, 0, 1, 1, []protocol.Header{first}, 0b1, 0)
+	installJoinRecord(replica, 1, 1, 1, []protocol.Header{first}, 0b1, 0)
+
+	replica.tryInstallCanonicalView()
+
+	if replica.status != StatusRecoveringHead || !replica.repairViewValid {
+		t.Fatalf("recovery status = %d, proof valid %t", replica.status, replica.repairViewValid)
+	}
+	if replica.repairViewAncestor != 0 || replica.repairViewCommit != 1 || replica.repairViewHead != 1 {
+		t.Fatalf("recovery proof = ancestor %d commit %d head %d", replica.repairViewAncestor, replica.repairViewCommit, replica.repairViewHead)
+	}
+	bus := &captureBus{}
+	frames, err := protocol.NewFramePool(1, uint32(replica.config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget, err := newJournalRepairBudget(3, replica.local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replica.frames = frames
+	replica.repairBudget = budget
+	replica.random = NewDeterministicRandom(1)
+	replica.deps.MessageBus = bus
+	replica.continueRecoveringView(1)
+	request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+	if reason != protocol.RejectNone || request.Command != protocol.CommandGetPrepare || binary.LittleEndian.Uint64(request.Fields[32:40]) != 1 {
+		t.Fatalf("repair request command=%d op=%d reason=%d", request.Command, binary.LittleEndian.Uint64(request.Fields[32:40]), reason)
 	}
 }
 

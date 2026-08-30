@@ -96,7 +96,11 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 			return nil, err
 		}
 		if recovery.FaultySlots == 0 {
-			commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, durable.State.CommitMax)
+			replayTarget, targetErr := recoveredCommitTarget(config.Cluster, durable, recovery)
+			if targetErr != nil {
+				return nil, targetErr
+			}
+			commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, replayTarget)
 			if err != nil {
 				return nil, err
 			}
@@ -180,6 +184,27 @@ func (replica *Replica) resumeInterruptedStateSync(durable Superblock, recovery 
 	return nil
 }
 
+func recoveredCommitTarget(config ClusterConfig, durable Superblock, recovery WALRecoveryReport) (protocol.Op, error) {
+	checkpoint := durable.State.Checkpoint.PrepareOp()
+	if recovery.HeadOp < checkpoint || durable.State.CommitMax < checkpoint || durable.State.CommitMax > recovery.HeadOp {
+		return 0, ErrWALRecovery
+	}
+	target := durable.State.CommitMax
+	if recovery.HeadOp > checkpoint {
+		if prepareOp(&recovery.HeadHeader) != recovery.HeadOp {
+			return 0, ErrWALRecovery
+		}
+		target = max(target, prepareCommit(&recovery.HeadHeader))
+	}
+	if recovery.HeadOp > protocol.Op(config.PipelineMax) {
+		target = max(target, recovery.HeadOp-protocol.Op(config.PipelineMax))
+	}
+	if target > recovery.HeadOp {
+		return 0, ErrWALRecovery
+	}
+	return target, nil
+}
+
 func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryReport, commitMin protocol.Op, upgrades recoveredUpgradeState, wal *WAL, superblocks *SuperblockStore, memberCount uint8) (ReplicaInitialState, error) {
 	status, view, durableView, logView, headOp, err := deriveRecoveredStatus(config, durable, recovery, wal, superblocks)
 	if err != nil {
@@ -196,7 +221,7 @@ func deriveInitialState(config Config, durable Superblock, recovery WALRecoveryR
 		LogView:           logView,
 		HeadOp:            commitMin,
 		CommitMin:         commitMin,
-		CommitMax:         durable.State.CommitMax,
+		CommitMax:         max(durable.State.CommitMax, commitMin),
 		Checkpoint:        durable.State.Checkpoint,
 		HeadHeader:        committedHeader,
 		upgradeTarget:     upgrades.target,
