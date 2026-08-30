@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -186,4 +187,25 @@ func makeValidEmptyFrame(t testing.TB, context ValidationContext, command Comman
 func resealHeaderChecksum(frame []byte) {
 	checksum := ChecksumBytes(frame[HeaderChecksumFrom:HeaderSize])
 	copy(frame[:16], checksum[:])
+}
+
+func TestFramePoolAcquiresExactEncodedBytes(t *testing.T) {
+	pool, err := NewFramePool(1, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := make([]byte, HeaderSize+3)
+	copy(encoded[HeaderSize:], []byte{1, 2, 3})
+	frame, err := pool.AcquireEncoded(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := frame.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actual, encoded) {
+		t.Fatalf("encoded frame changed")
+	}
+	frame.Release()
 }

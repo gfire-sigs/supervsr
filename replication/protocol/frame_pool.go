@@ -75,6 +75,24 @@ func (pool *FramePool) Acquire(bodySize uint32) (*Frame, error) {
 	return frame, nil
 }
 
+func (pool *FramePool) AcquireEncoded(encoded []byte) (*Frame, error) {
+	if len(encoded) < HeaderSize {
+		return nil, ErrFrameEncoding
+	}
+	if len(encoded) > int(pool.messageSizeMax) {
+		return nil, ErrFrameTooLarge
+	}
+	frame := pool.pop()
+	if frame == nil {
+		return nil, ErrFramePoolEmpty
+	}
+	frame.size = uint32(len(encoded))
+	copy(frame.buffer[:frame.size], encoded)
+	frame.sealed.Store(true)
+	frame.refs.Store(1)
+	return frame, nil
+}
+
 func (pool *FramePool) Available() uint32 {
 	return pool.available.Load()
 }

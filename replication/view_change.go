@@ -181,8 +181,13 @@ func (replica *Replica) handleViewPersistence(completion IOCompletion) bool {
 	replica.viewInstall = false
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
-		if entry.durable {
+		if !entry.durable {
+			continue
+		}
+		if replica.isPrimary() {
 			replica.countPrepareAck(entry, replica.local)
+		} else {
+			replica.sendPrepareOK(entry)
 		}
 	}
 	if replica.resumePendingViewChange() {
@@ -281,6 +286,10 @@ func (replica *Replica) localHeaderEvidence(op protocol.Op) (protocol.Header, bo
 func (replica *Replica) handleJoinView(header protocol.Header, body []byte) {
 	if header.View > replica.view {
 		replica.beginViewChange(header.View)
+		return
+	}
+	if replica.status == StatusNormal && header.View == replica.view && replica.isPrimary() && replica.durableView == replica.view && replica.logView == replica.view {
+		replica.broadcastView()
 		return
 	}
 	if replica.status != StatusViewChange || header.View != replica.view || !replica.isPrimary() || replica.durableView != replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
@@ -519,6 +528,17 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	if checkpoint.PrepareOp() != replica.checkpoint.PrepareOp() {
 		return
 	}
+	if !replica.validViewProof(checkpoint, head, count) {
+		return
+	}
+	if commit > replica.commitMin && head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
+		if !replica.beginRepairWindow(header.View, commit) {
+			return
+		}
+		replica.getViewNonce = protocol.Nonce{}
+		replica.getViewLast = 0
+		return
+	}
 	recoveringHead := replica.status == StatusRecoveringHead
 	if recoveringHead {
 		var nonce protocol.Nonce
@@ -546,6 +566,13 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		return
 	}
 	if commit != replica.commitMin || !replica.canonicalAvailable(commit, head, count) {
+		replica.status = StatusRecoveringHead
+		if !replica.validRecoveringView(header.View, commit, head, count) {
+			return
+		}
+		replica.recordRecoveringView(header.View, commit, head, count)
+		replica.getViewNonce = protocol.Nonce{}
+		replica.getViewLast = 0
 		return
 	}
 	if err := replica.persistView(true, commit, head, replica.canonicalHeaders[:count]); err != nil {
@@ -558,21 +585,33 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 
 func (replica *Replica) validStateSyncView(checkpoint CheckpointState, head, commit protocol.Op, count int) bool {
 	checkpointOp := checkpoint.PrepareOp()
-	if count <= 0 || protocol.Op(count-1) > head || commit < checkpointOp || head < commit || prepareOp(&replica.canonicalHeaders[0]) != head {
+	return commit >= checkpointOp && head >= commit && replica.validViewProof(checkpoint, head, count)
+}
+
+func (replica *Replica) validViewProof(checkpoint CheckpointState, head protocol.Op, count int) bool {
+	if count <= 0 || protocol.Op(count-1) > head || prepareOp(&replica.canonicalHeaders[0]) != head {
+		return false
+	}
+	checkpointHeader, reason := protocol.DecodeHeader(checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	if reason != protocol.RejectNone {
 		return false
 	}
 	for index := range count {
-		op := head - protocol.Op(index)
 		candidate := replica.canonicalHeaders[index]
-		if prepareOp(&candidate) != op {
+		if candidate.HeaderChecksum == checkpointHeader.HeaderChecksum && prepareOp(&candidate) == checkpoint.PrepareOp() {
+			return index == count-1
+		}
+		if prepareOp(&candidate) != head-protocol.Op(index) {
 			return false
 		}
-		if index+1 < count && prepareParent(&candidate) != replica.canonicalHeaders[index+1].HeaderChecksum {
-			return false
-		}
-		if op == checkpointOp {
-			checkpointHeader, reason := protocol.DecodeHeader(checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
-			return reason == protocol.RejectNone && checkpointHeader.HeaderChecksum == candidate.HeaderChecksum
+		if index+1 < count {
+			next := replica.canonicalHeaders[index+1]
+			if prepareOp(&next) == checkpoint.PrepareOp() && next.HeaderChecksum == checkpointHeader.HeaderChecksum {
+				continue
+			}
+			if prepareParent(&candidate) != next.HeaderChecksum {
+				return false
+			}
 		}
 	}
 	return false
@@ -588,10 +627,11 @@ func (replica *Replica) validRecoveringView(view protocol.View, commit, head pro
 	if head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
 		return false
 	}
-	for index := range count {
-		if protocol.Op(index) > head {
-			return false
-		}
+	proofCount := count
+	if count > 1 && prepareOp(&replica.canonicalHeaders[count-1]) == replica.checkpoint.PrepareOp() {
+		proofCount--
+	}
+	for index := range proofCount {
 		header := replica.canonicalHeaders[index]
 		expectedOp := head - protocol.Op(index)
 		if prepareOp(&header) != expectedOp || header.View > view {
@@ -601,11 +641,11 @@ func (replica *Replica) validRecoveringView(view protocol.View, commit, head pro
 			return false
 		}
 	}
-	ancestor, found := replica.recoveringCommonAncestor(count)
+	ancestor, found := replica.recoveringCommonAncestor(proofCount)
 	if !found || ancestor < replica.commitMin {
 		return false
 	}
-	return prepareOp(&replica.canonicalHeaders[count-1]) <= ancestor+1
+	return prepareOp(&replica.canonicalHeaders[proofCount-1]) <= ancestor+1
 }
 
 func (replica *Replica) recoveringCommonAncestor(count int) (protocol.Op, bool) {
@@ -645,6 +685,7 @@ func (replica *Replica) recordRecoveringView(view protocol.View, commit, head pr
 	replica.repairBudget.Reset()
 	replica.repairHeader = protocol.Header{}
 	replica.repairHeaderValid = false
+	replica.repairViewWindow = false
 	replica.repairViewValid = true
 	replica.repairView = view
 	ancestor, _ := replica.recoveringCommonAncestor(count)
@@ -680,8 +721,30 @@ func (replica *Replica) handleGetView(request protocol.Header) {
 	message.Release()
 }
 
-func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
+func (replica *Replica) collectViewSuffix() (int, error) {
 	count := replica.collectLocalSuffix(replica.canonicalHeaders)
+	checkpointOp := replica.checkpoint.PrepareOp()
+	for index := range count {
+		if prepareOp(&replica.canonicalHeaders[index]) == checkpointOp {
+			return count, nil
+		}
+	}
+	checkpoint, reason := protocol.DecodeHeader(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	if reason != protocol.RejectNone {
+		return 0, ErrInvalidCheckpoint
+	}
+	if count == len(replica.canonicalHeaders) {
+		count--
+	}
+	replica.canonicalHeaders[count] = checkpoint
+	return count + 1, nil
+}
+
+func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
+	count, err := replica.collectViewSuffix()
+	if err != nil {
+		return nil, err
+	}
 	message, err := replica.frames.Acquire(uint32(CheckpointStateSize + count*protocol.HeaderSize))
 	if err != nil {
 		return nil, err

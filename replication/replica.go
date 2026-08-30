@@ -32,6 +32,7 @@ type Dependencies struct {
 	BlockValidator  BlockValidator
 	Metrics         *ReplicaMetrics
 	Logger          *zerolog.Logger
+	SynchronousIO   bool
 }
 
 type ReplicaInitialState struct {
@@ -219,6 +220,7 @@ type Replica struct {
 	repairViewHead         protocol.Op
 	repairViewAncestor     protocol.Op
 	repairViewRebuilt      bool
+	repairViewWindow       bool
 	repairViewCount        int
 	repairFrames           []*Message
 	releaseHistory         []protocol.Release
@@ -228,6 +230,7 @@ type Replica struct {
 	releaseActivation      protocol.Release
 	stateSync              stateSyncRuntime
 	syncRangeRepaired      bool
+	recoveryReady          chan recoveryReplayResult
 	releaseReset           SMCompletion
 	releaseResetGeneration uint64
 	releaseResetDone       bool
@@ -243,6 +246,9 @@ type Replica struct {
 	shutdownCompletion SMCompletion
 	shutdownGeneration uint64
 	shutdownErr        error
+	recoveryLifecycle  sync.Mutex
+	recoveryCancel     context.CancelFunc
+	recoveryWorkers    sync.WaitGroup
 	fatalErr           error
 }
 
@@ -325,7 +331,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	}
 	blockIOCount := max(config.Process.RepairReadsMax, config.Process.ScrubWriteConcurrency)
 	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + blockIOCount + 4
-	ioEngine, err := NewIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)))
+	ioEngine, err := newIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)), dependencies.SynchronousIO)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +459,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		upgradeTarget:        initial.upgradeTarget,
 		blockCatalog:         make([]BlockRequirement, targetCapacity),
 		upgradeWindow:        initial.upgradeWindow,
+		recoveryReady:        make(chan recoveryReplayResult, 1),
 		stateSync:            stateSyncRuntime{headers: make([]protocol.Header, int(config.Cluster.PipelineMax+1))},
 		stop:                 make(chan struct{}),
 		done:                 make(chan struct{}),
@@ -543,9 +550,21 @@ func (replica *Replica) Run(ctx context.Context) (runErr error) {
 		case <-replica.notify:
 		case <-replica.io.Ready():
 		case <-ticker.C:
-			replica.handleTick(replica.deps.Clock.Now())
+			if !replica.stateSync.replayRunning {
+				replica.handleTick(replica.deps.Clock.Now())
+			}
 		}
 	}
+}
+
+func (replica *Replica) Tick() error {
+	if !replica.accepting.Load() {
+		return ErrReplicaClosed
+	}
+	if !replica.stateSync.replayRunning {
+		replica.handleTick(replica.deps.Clock.Now())
+	}
+	return replica.fatalErr
 }
 
 func (replica *Replica) Process(limit int) (int, error) {
@@ -557,6 +576,13 @@ func (replica *Replica) Process(limit int) (int, error) {
 	}
 	processed := 0
 	for processed < limit {
+		select {
+		case result := <-replica.recoveryReady:
+			replica.finishInterruptedReplay(result)
+			processed++
+			continue
+		default:
+		}
 		var completion IOCompletion
 		if replica.io.Poll(&completion) {
 			if replica.stateSync.stage == SyncStageCancelingGrid {
@@ -577,13 +603,13 @@ func (replica *Replica) Process(limit int) (int, error) {
 		}
 		switch event.kind {
 		case replicaEventMessage:
-			if replica.stateSync.stage != SyncStageIdle {
+			if replica.stateSync.stage != SyncStageIdle || replica.stateSync.replayRunning {
 				event.message.Release()
 			} else if !replica.handleMessage(event.message) {
 				event.message.Release()
 			}
 		case replicaEventSMCompletion:
-			if replica.stateSync.stage == SyncStageCancelingGrid || replica.stateSync.stage == SyncStageUpdatingCheckpoint {
+			if replica.stateSync.stage == SyncStageCancelingGrid || replica.stateSync.stage == SyncStageUpdatingCheckpoint || replica.stateSync.replayRunning {
 				replica.handleStateSyncDrainSM(event)
 			} else {
 				replica.handleSMCompletion(event)
@@ -601,7 +627,7 @@ func (replica *Replica) Process(limit int) (int, error) {
 		drained, err := replica.processReleaseActivation(limit - processed)
 		return processed + drained, err
 	}
-	if replica.stateSync.stage == SyncStageIdle || replica.stateSync.stage == SyncStageCancelingCommit {
+	if !replica.stateSync.replayRunning && (replica.stateSync.stage == SyncStageIdle || replica.stateSync.stage == SyncStageCancelingCommit) {
 		replica.advanceCommit()
 	}
 	replica.dispatchStateSync()
@@ -634,6 +660,7 @@ func (replica *Replica) startShutdown() {
 	if replica.shutdownStarted.Swap(true) {
 		return
 	}
+	replica.stopOnce.Do(func() { close(replica.stop) })
 	go replica.finishShutdown()
 }
 
@@ -643,6 +670,12 @@ func (replica *Replica) finishShutdown() {
 	for replica.submitters.Load() != 0 {
 		time.Sleep(time.Millisecond)
 	}
+	replica.recoveryLifecycle.Lock()
+	if replica.recoveryCancel != nil {
+		replica.recoveryCancel()
+	}
+	replica.recoveryLifecycle.Unlock()
+	replica.recoveryWorkers.Wait()
 	replica.shutdownGeneration++
 	generation := replica.shutdownGeneration
 	replica.shutdownCompletion.prepare(generation, replica)

@@ -139,29 +139,101 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	if !target.syncRangeRepaired || targetMachine.commits != 0 || targetMachine.resetSyncMin != 1 {
 		t.Fatalf("sync repaired=%t replay commits=%d reset sync min=%d", target.syncRangeRepaired, targetMachine.commits, targetMachine.resetSyncMin)
 	}
+	targetMachine.pulseNeeded = true
+	target.handlePulseTimeout(TimeSample{Wall: 150, Monotonic: monotonic, Synchronized: true})
+	targetMachine.pulseNeeded = false
+	for target.commitMin != checkpointOp+1 {
+		if _, err := target.Process(64); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeReplica(t, target)
+	target = nil
+	pending, err := Open(context.Background(), targetConfig, Dependencies{
+		Storage: targetStorage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 175, Monotonic: 175, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{3}), StateMachine: &pendingReplayMachine{testStateMachine: testStateMachine{capacities: capacities}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for !pending.stateSync.replayRunning {
+		pending.handleRepairTimeout(TimeSample{Monotonic: monotonic})
+		monotonic += uint64(100 * time.Millisecond)
+		if _, err := pending.Process(64); err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeContext, cancelClose := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClose()
+	if err := pending.Close(closeContext); err != nil {
+		t.Fatalf("close during pending replay: %v", err)
+	}
+
+	replayMachine := &testStateMachine{capacities: capacities}
+	reopened, err := Open(context.Background(), targetConfig, Dependencies{
+		Storage: targetStorage, MessageBus: &captureBus{},
+		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{3}), StateMachine: replayMachine,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline.Reset(3 * time.Second)
+	for reopened.stateSync.repairing {
+		reopened.handleRepairTimeout(TimeSample{Monotonic: monotonic})
+		monotonic += uint64(100 * time.Millisecond)
+		if _, err := reopened.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("reopened state sync did not finish")
+		default:
+		}
+	}
+	if reopened.status != StatusNormal || reopened.commitMin != checkpointOp+1 || replayMachine.commits != 1 {
+		t.Fatalf("reopened status=%d commit=%d replay commits=%d", reopened.status, reopened.commitMin, replayMachine.commits)
+	}
+	closeReplica(t, reopened)
+
 	corruptAddress := checkpoint.AcquiredTrailerLastAddress
 	if corruptAddress == 0 {
 		t.Fatal("checkpoint has no acquired trailer")
 	}
-	closeReplica(t, target)
-	target = nil
 	if err := targetStorage.WriteAt(make([]byte, targetConfig.Cluster.BlockSize), corruptAddress); err != nil {
 		t.Fatal(err)
 	}
 	if err := targetStorage.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(context.Background(), targetConfig, Dependencies{
+	damaged, err := Open(context.Background(), targetConfig, Dependencies{
 		Storage: targetStorage, MessageBus: &captureBus{},
-		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{3}), StateMachine: &testStateMachine{capacities: capacities},
+		Clock:   fixedClock{sample: TimeSample{Wall: 300, Monotonic: 300, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{4}), StateMachine: &testStateMachine{capacities: capacities},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closeReplica(t, reopened)
-	if reopened.status != StatusRecovering || !reopened.stateSync.repairing || !reopened.blockRepairActive() {
-		t.Fatalf("reopened status=%d repairing=%t active=%t", reopened.status, reopened.stateSync.repairing, reopened.blockRepairActive())
+	defer closeReplica(t, damaged)
+	repairDeadline := time.NewTimer(3 * time.Second)
+	defer repairDeadline.Stop()
+	for !damaged.blockRepairActive() {
+		if _, err := damaged.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		if damaged.blockRepairActive() || !damaged.stateSync.repairing {
+			break
+		}
+		select {
+		case <-damaged.io.Ready():
+		case <-damaged.notify:
+		case <-repairDeadline.C:
+			t.Fatalf("damaged checkpoint repair did not start: stage=%d io=%v phase=%d done=%t", damaged.stateSync.stage, damaged.stateSync.io, damaged.stateSync.persistPhase, damaged.stateSync.persistDone)
+		}
+	}
+	if damaged.status != StatusRecovering || !damaged.stateSync.repairing || !damaged.blockRepairActive() {
+		t.Fatalf("damaged status=%d repairing=%t active=%t", damaged.status, damaged.stateSync.repairing, damaged.blockRepairActive())
 	}
 }
 
@@ -196,6 +268,14 @@ type syncOrderMachine struct {
 func (machine *syncOrderMachine) StartReset(completion *SMCompletion) (StartResult[ResetResult], error) {
 	machine.resetSyncMin = machine.store.Current().State.SyncMin
 	return machine.testStateMachine.StartReset(completion)
+}
+
+type pendingReplayMachine struct {
+	testStateMachine
+}
+
+func (*pendingReplayMachine) StartPrefetch(PrefetchInput, *SMCompletion) (StartResult[PrefetchToken], error) {
+	return Pending[PrefetchToken](), nil
 }
 
 func makeStateSyncViewBody(t testing.TB, config Config, checkpoint CheckpointState) []byte {

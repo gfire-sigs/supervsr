@@ -298,22 +298,26 @@ func (replica *Replica) newestMissingHeader() (protocol.Op, bool) {
 }
 
 func (replica *Replica) sendGetHeaders(missing protocol.Op) {
-	peer, ok := replica.randomRepairPeer()
-	if !ok {
-		return
-	}
 	start := protocol.Op(0)
 	if missing > 63 {
 		start = missing - 63
 	}
 	start = max(start, replica.checkpoint.PrepareOp()+1)
+	peer, ok := replica.randomRepairPeer()
+	if !ok {
+		return
+	}
+	replica.sendGetHeadersRange(peer, start, missing)
+}
+
+func (replica *Replica) sendGetHeadersRange(peer protocol.ReplicaIndex, start, end protocol.Op) {
 	message, err := replica.frames.Acquire(0)
 	if err != nil {
 		return
 	}
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetHeaders, Author: replica.local}
 	binary.LittleEndian.PutUint64(header.Fields[:8], uint64(start))
-	binary.LittleEndian.PutUint64(header.Fields[8:16], uint64(missing))
+	binary.LittleEndian.PutUint64(header.Fields[8:16], uint64(end))
 	if message.Seal(&header) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	}
@@ -338,8 +342,12 @@ func (replica *Replica) randomRepairPeer() (protocol.ReplicaIndex, bool) {
 	return protocol.ReplicaIndex(replica.random.Uniform(uint64(count))), true
 }
 
-func (replica *Replica) handleHeaders(body []byte) {
+func (replica *Replica) handleHeaders(header protocol.Header, body []byte) {
 	if replica.repairWrite.busy {
+		return
+	}
+	if replica.repairViewWindow {
+		replica.handleRepairWindowHeaders(header, body)
 		return
 	}
 	for offset := len(body) - protocol.HeaderSize; offset >= 0; offset -= protocol.HeaderSize {
@@ -352,6 +360,30 @@ func (replica *Replica) handleHeaders(body []byte) {
 		replica.sendGetPrepare(replica.deps.Clock.Now().Monotonic)
 		return
 	}
+}
+
+func (replica *Replica) handleRepairWindowHeaders(header protocol.Header, body []byte) {
+	count := len(body) / protocol.HeaderSize
+	if header.Author != replica.membership.Primary(replica.repairView) || count == 0 || count > len(replica.canonicalHeaders) || len(body) != count*protocol.HeaderSize {
+		return
+	}
+	expected := replica.commitMin + 1
+	parent := replica.headChecksum
+	for index := range count {
+		candidate, reason := protocol.DecodeHeader(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		if reason != protocol.RejectNone || prepareOp(&candidate) != expected || candidate.View > replica.repairView || prepareParent(&candidate) != parent {
+			return
+		}
+		replica.canonicalHeaders[count-index-1] = candidate
+		parent = candidate.HeaderChecksum
+		expected++
+	}
+	if expected-1 != replica.repairViewHead {
+		return
+	}
+	replica.repairViewCount = count
+	replica.repairViewWindow = false
+	replica.repairHeadersLast = 0
 }
 
 func (replica *Replica) safeRepairHeader(candidate protocol.Header) bool {
@@ -412,8 +444,57 @@ func (replica *Replica) canonicalRepairHeader(candidate protocol.Header) bool {
 	return false
 }
 
+func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op) bool {
+	limit, ok := checkedAdd(uint64(replica.commitMin), uint64(len(replica.pipeline)))
+	if !ok {
+		replica.fail(ErrReplicaInvariant)
+		return false
+	}
+	windowHead := min(commit, protocol.Op(limit))
+	if windowHead <= replica.commitMin {
+		return false
+	}
+	for index := range replica.repairFrames {
+		if replica.repairFrames[index] != nil {
+			replica.repairFrames[index].Release()
+			replica.repairFrames[index] = nil
+		}
+	}
+	clear(replica.canonicalHeaders)
+	replica.repairBudget.Reset()
+	replica.repairHeader = protocol.Header{}
+	replica.repairHeaderValid = false
+	replica.status = StatusRecoveringHead
+	replica.repairViewValid = true
+	replica.repairView = view
+	replica.repairViewCommit = windowHead
+	replica.repairViewHead = windowHead
+	replica.repairViewAncestor = replica.commitMin
+	replica.repairViewRebuilt = false
+	replica.repairViewWindow = true
+	replica.repairViewCount = 0
+	replica.commitMax = max(replica.commitMax, commit)
+	replica.repairHeadersLast = 0
+	replica.requestRepairWindowHeaders(replica.deps.Clock.Now().Monotonic)
+	return true
+}
+
+func (replica *Replica) requestRepairWindowHeaders(now uint64) {
+	interval := uint64(replica.config.Process.InitialRTT)
+	if replica.repairHeadersLast != 0 && elapsedSince(replica.repairHeadersLast, now) < interval {
+		return
+	}
+	peer := replica.membership.Primary(replica.repairView)
+	replica.sendGetHeadersRange(peer, replica.commitMin+1, replica.repairViewHead)
+	replica.repairHeadersLast = now
+}
+
 func (replica *Replica) continueRecoveringView(now uint64) {
 	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
+		return
+	}
+	if replica.repairViewWindow {
+		replica.requestRepairWindowHeaders(now)
 		return
 	}
 	if replica.repairViewRebuilt {

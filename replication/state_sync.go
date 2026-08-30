@@ -2,6 +2,7 @@ package replication
 
 import (
 	"cmp"
+	"context"
 	"encoding/binary"
 	"errors"
 
@@ -15,6 +16,7 @@ const (
 	SyncStageCancelingCommit
 	SyncStageCancelingGrid
 	SyncStageUpdatingCheckpoint
+	SyncStageResizingStorage
 )
 
 type stateSyncRuntime struct {
@@ -22,6 +24,7 @@ type stateSyncRuntime struct {
 	headers        []protocol.Header
 	completion     SMCompletion
 	io             IOHandle
+	ioKind         IOKind
 	view           protocol.View
 	commit         protocol.Op
 	head           protocol.Op
@@ -35,6 +38,10 @@ type stateSyncRuntime struct {
 	resetDone      bool
 	persistDone    bool
 	repairing      bool
+	resumeRecovery bool
+	recovery       WALRecoveryReport
+	replayRunning  bool
+	recoveryState  Superblock
 	opening        bool
 }
 
@@ -79,6 +86,8 @@ func (replica *Replica) dispatchStateSync() {
 		replica.dispatchStateSyncCancelingGrid()
 	case SyncStageUpdatingCheckpoint:
 		replica.dispatchStateSyncCheckpoint()
+	case SyncStageResizingStorage:
+		replica.dispatchStateSyncResize()
 	default:
 		replica.fail(ErrReplicaInvariant)
 	}
@@ -230,6 +239,49 @@ func (replica *Replica) dispatchStateSyncCheckpoint() {
 		replica.fail(ErrReplicaInvariant)
 	}
 }
+func (replica *Replica) dispatchStateSyncResize() {
+	if replica.stateSync.io != (IOHandle{}) {
+		return
+	}
+	switch replica.stateSync.persistPhase {
+	case 0:
+		replica.startStateSyncIO(IOResize, replica.stateSync.checkpoint.LogicalStorageSize, 1)
+	case 1:
+		if !replica.stateSync.persistDone {
+			return
+		}
+		replica.stateSync.persistDone = false
+		replica.startStateSyncIO(IOSync, 0, 2)
+	case 2:
+		if !replica.stateSync.persistDone {
+			return
+		}
+		replica.stateSync.persistDone = false
+		replica.stateSync.stage = SyncStageIdle
+		if !replica.queueStateSyncRoots() {
+			replica.fail(ErrReplicaBackpressure)
+			return
+		}
+		if !replica.blockRepairActive() {
+			replica.finishStateSyncBlocks()
+		}
+	default:
+		replica.fail(ErrReplicaInvariant)
+	}
+}
+
+func (replica *Replica) startStateSyncIO(kind IOKind, size uint64, phase uint8) {
+	handle, err := replica.io.Submit(IOOperation{Kind: kind, Size: size})
+	if err != nil {
+		if !errors.Is(err, ErrIOBackpressure) {
+			replica.fail(err)
+		}
+		return
+	}
+	replica.stateSync.io = handle
+	replica.stateSync.ioKind = kind
+	replica.stateSync.persistPhase = phase
+}
 
 func (replica *Replica) startStateSyncReset() bool {
 	if replica.stateSync.resetStarted {
@@ -261,6 +313,7 @@ func (replica *Replica) startStateSyncPersistence(next Superblock, phase uint8) 
 		return
 	}
 	replica.stateSync.io = handle
+	replica.stateSync.ioKind = IOSuperblockPersist
 	replica.stateSync.persistPhase = phase
 }
 
@@ -284,10 +337,11 @@ func (replica *Replica) stateSyncSuperblock() (Superblock, error) {
 }
 
 func (replica *Replica) handleStateSyncPersistence(completion IOCompletion) bool {
-	if replica.stateSync.io == (IOHandle{}) || completion.Handle != replica.stateSync.io || completion.Kind != IOSuperblockPersist {
+	if replica.stateSync.io == (IOHandle{}) || completion.Handle != replica.stateSync.io || completion.Kind != replica.stateSync.ioKind {
 		return false
 	}
 	replica.stateSync.io = IOHandle{}
+	replica.stateSync.ioKind = 0
 	if completion.Err != nil {
 		replica.fail(completion.Err)
 		return true
@@ -319,16 +373,10 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.view = replica.stateSync.view
 	replica.durableView = replica.stateSync.view
 	replica.logView = replica.stateSync.view
-	replica.stateSync.stage = SyncStageIdle
+	replica.stateSync.stage = SyncStageResizingStorage
+	replica.stateSync.persistPhase = 0
 	replica.stateSync.persistDone = false
 	replica.stateSync.repairing = true
-	if !replica.queueStateSyncRoots() {
-		replica.fail(ErrReplicaBackpressure)
-		return
-	}
-	if !replica.blockRepairActive() {
-		replica.finishStateSyncBlocks()
-	}
 }
 
 func (replica *Replica) queueStateSyncRoots() bool {
@@ -523,11 +571,27 @@ func (replica *Replica) handleStateSyncCompletion(completion *SMCompletion, gene
 	return true
 }
 
+type recoveryReplayResult struct {
+	commitMin protocol.Op
+	upgrades  recoveredUpgradeState
+	err       error
+}
+
 func (replica *Replica) finishStateSyncOpen() {
 	replica.stateSync.opening = false
+	if replica.stateSync.resumeRecovery {
+		replica.finishInterruptedStateSyncOpen()
+		return
+	}
 	replica.stateSync.repairing = false
 	replica.syncRangeRepaired = true
 	if replica.stateSync.head > replica.checkpoint.PrepareOp() {
+		if replica.stateSync.commit > replica.commitMin && replica.stateSync.head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
+			if !replica.beginRepairWindow(replica.stateSync.view, replica.stateSync.commit) {
+				replica.fail(ErrReplicaInvariant)
+			}
+			return
+		}
 		clear(replica.canonicalHeaders)
 		copy(replica.canonicalHeaders, replica.stateSync.headers[:replica.stateSync.count])
 		replica.status = StatusRecoveringHead
@@ -541,6 +605,89 @@ func (replica *Replica) finishStateSyncOpen() {
 		return
 	}
 	replica.status = StatusNormal
+	replica.refreshLocalReleaseReport()
+	replica.maybeSelectUpgrade()
+}
+
+func (replica *Replica) finishInterruptedStateSyncOpen() {
+	ctx, cancel := context.WithCancel(context.Background())
+	replica.recoveryLifecycle.Lock()
+	if replica.shutdownStarted.Load() {
+		replica.recoveryLifecycle.Unlock()
+		cancel()
+		return
+	}
+	replica.recoveryCancel = cancel
+	replica.recoveryWorkers.Add(1)
+	replica.recoveryLifecycle.Unlock()
+	replica.stateSync.replayRunning = true
+	durable := replica.stateSync.recoveryState
+	recovery := replica.stateSync.recovery
+	checkpoint := replica.checkpoint
+	go func() {
+		defer replica.recoveryWorkers.Done()
+		result := recoveryReplayResult{commitMin: checkpoint.PrepareOp()}
+		if recovery.FaultySlots == 0 {
+			startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
+			result.commitMin, result.upgrades, result.err = replayCommitted(
+				ctx, replica.config, replica.deps.StateMachine, replica.wal, replica.replies, replica.sessions,
+				startup, result.commitMin, checkpoint.Release, durable.State.CommitMax,
+			)
+		}
+		replica.recoveryReady <- result
+		replica.signal()
+	}()
+}
+
+func (replica *Replica) finishInterruptedReplay(result recoveryReplayResult) {
+	replica.recoveryLifecycle.Lock()
+	if replica.recoveryCancel != nil {
+		replica.recoveryCancel()
+		replica.recoveryCancel = nil
+	}
+	replica.recoveryLifecycle.Unlock()
+	replica.stateSync.replayRunning = false
+	if result.err != nil {
+		replica.fail(result.err)
+		return
+	}
+	durable := replica.stateSync.recoveryState
+	recovery := replica.stateSync.recovery
+	status, view, durableView, logView, headOp, err := deriveRecoveredStatus(replica.config, durable, recovery, replica.wal, replica.superblocks)
+	if err != nil {
+		replica.fail(err)
+		return
+	}
+	committed, err := recoveredCommittedHeader(replica.config, durable, recovery, result.commitMin, replica.wal, replica.membership.ActiveCount+replica.membership.StandbyCount)
+	if err != nil {
+		replica.fail(err)
+		return
+	}
+	replica.status = status
+	replica.view = view
+	replica.durableView = durableView
+	replica.logView = logView
+	replica.headOp = result.commitMin
+	replica.commitMin = result.commitMin
+	replica.commitMax = durable.State.CommitMax
+	replica.headChecksum = committed.HeaderChecksum
+	replica.lastPrepareTimestamp = prepareTimestamp(&committed)
+	replica.lastCommitTimestamp = prepareTimestamp(&committed)
+	replica.upgradeTarget = result.upgrades.target
+	replica.upgradeWindow = result.upgrades.window
+	if status == StatusRecoveringHead {
+		replica.headOp = headOp
+		replica.headChecksum = recovery.HeadHeader.HeaderChecksum
+	}
+	if err := loadOpenSuffix(replica, recovery, result.commitMin); err != nil {
+		replica.fail(err)
+		return
+	}
+	replica.stateSync.resumeRecovery = false
+	replica.stateSync.repairing = false
+	replica.stateSync.recovery = WALRecoveryReport{}
+	replica.stateSync.recoveryState = Superblock{}
+	replica.syncRangeRepaired = true
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 }

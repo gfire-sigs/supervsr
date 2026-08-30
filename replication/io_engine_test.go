@@ -90,6 +90,29 @@ func TestIOEngineRejectsStaleHandleAfterReuse(t *testing.T) {
 	_ = collectIOCompletions(t, engine, 1)
 }
 
+func TestSynchronousIOEngineCompletesInline(t *testing.T) {
+	storage := &crashStorage{}
+	if err := storage.Resize(1); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := newIOEngine(storage, 1, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeIOEngine(t, engine)
+	handle, err := engine.Submit(IOOperation{Kind: IOWrite, Buffer: []byte{7}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion IOCompletion
+	if !engine.Poll(&completion) || completion.Handle != handle || completion.Err != nil {
+		t.Fatalf("completion=%+v", completion)
+	}
+	if storage.working[0] != 7 {
+		t.Fatalf("stored byte=%d, want 7", storage.working[0])
+	}
+}
+
 func collectIOCompletions(t testing.TB, engine *IOEngine, count int) []IOCompletion {
 	t.Helper()
 	completions := make([]IOCompletion, 0, count)

@@ -116,7 +116,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 		return nil, err
 	}
 	if resumeStateSync {
-		err = replica.resumeInterruptedStateSync(durable, memberCount)
+		err = replica.resumeInterruptedStateSync(durable, recovery, memberCount)
 	} else {
 		err = loadOpenSuffix(replica, recovery, commitMin)
 	}
@@ -149,7 +149,7 @@ func deriveInterruptedStateSync(config Config, durable Superblock, memberCount u
 	}, nil
 }
 
-func (replica *Replica) resumeInterruptedStateSync(durable Superblock, memberCount uint8) error {
+func (replica *Replica) resumeInterruptedStateSync(durable Superblock, recovery WALRecoveryReport, memberCount uint8) error {
 	count := int(durable.ViewHeaderCount)
 	if count == 0 || count > len(replica.stateSync.headers) {
 		return ErrInvalidSuperblock
@@ -164,8 +164,15 @@ func (replica *Replica) resumeInterruptedStateSync(durable Superblock, memberCou
 	replica.stateSync.checkpoint = durable.State.Checkpoint
 	replica.stateSync.view = durable.State.View
 	replica.stateSync.commit = durable.State.CommitMax
-	replica.stateSync.head = prepareOp(&replica.stateSync.headers[count-1])
+	replica.stateSync.head = prepareOp(&replica.stateSync.headers[0])
 	replica.stateSync.count = count
+	copy(replica.canonicalHeaders, replica.stateSync.headers[:count])
+	if !replica.validStateSyncView(durable.State.Checkpoint, replica.stateSync.head, min(replica.stateSync.commit, replica.stateSync.head), count) {
+		return ErrInvalidSuperblock
+	}
+	replica.stateSync.resumeRecovery = true
+	replica.stateSync.recovery = recovery
+	replica.stateSync.recoveryState = durable
 	replica.installStateSyncCheckpoint()
 	if replica.fatalErr != nil {
 		return replica.fatalErr
@@ -435,31 +442,36 @@ func replayExecute(config Config, machine StateMachine, replies *ReplyStore, ses
 
 func persistRecoveredView(store *SuperblockStore, wal *WAL, head protocol.Op, view, logView protocol.View, commitMax protocol.Op, config ClusterConfig) error {
 	next := store.Current()
+	checkpoint := next.State.Checkpoint.PrepareOp()
+	if head < checkpoint {
+		return ErrWALRecovery
+	}
 	next.ParentChecksum = next.Checksum
 	next.Sequence++
 	next.State.View = view
 	next.State.LogView = logView
 	next.State.CommitMax = commitMax
+	clear(next.ViewHeaders[:])
+
 	count := uint32(0)
-	for op := head; ; op-- {
+	var child protocol.Header
+	for op := head; op > checkpoint && count < uint32(config.PipelineMax); op-- {
 		header, found := wal.RecoveredHeader(op)
-		if found {
-			var encoded [protocol.HeaderSize]byte
-			copyOfHeader := header
-			if err := protocol.EncodeHeader(encoded[:], &copyOfHeader); err != nil {
-				return err
-			}
-			next.ViewHeaders[count] = encoded
-			count++
-		}
-		if op == 0 || count == uint32(config.PipelineMax+1) {
+		if !found || count > 0 && prepareParent(&child) != header.HeaderChecksum {
 			break
 		}
+		copyOfHeader := header
+		if err := protocol.EncodeHeader(next.ViewHeaders[count][:], &copyOfHeader); err != nil {
+			return err
+		}
+		child = header
+		count++
 	}
-	if count == 0 {
-		next.ViewHeaders[0] = next.State.Checkpoint.Header
-		count = 1
+	if head > checkpoint && count == 0 {
+		return ErrWALRecovery
 	}
+	next.ViewHeaders[count] = next.State.Checkpoint.Header
+	count++
 	next.ViewHeaderCount = count
 	return store.Persist(next)
 }

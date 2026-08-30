@@ -80,15 +80,24 @@ type IOEngine struct {
 	closed    atomic.Bool
 	lifecycle sync.Mutex
 
-	workers sync.WaitGroup
-	slots   []ioSlot
-	free    []uint32
-	freeLen int
-	ready   *MPSCRing[uint32]
+	workers     sync.WaitGroup
+	slots       []ioSlot
+	free        []uint32
+	freeLen     int
+	ready       *MPSCRing[uint32]
+	synchronous bool
 }
 
 func NewIOEngine(storage Storage, requestCount, workerCount uint32) (*IOEngine, error) {
-	if storage == nil || requestCount == 0 || workerCount == 0 || workerCount > requestCount {
+	return newIOEngine(storage, requestCount, workerCount, false)
+}
+
+func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool) (*IOEngine, error) {
+	if storage == nil || requestCount == 0 {
+		return nil, ErrInvalidConfiguration
+	}
+	workersInvalid := workerCount == 0 || workerCount > requestCount
+	if !synchronous && workersInvalid {
 		return nil, ErrInvalidConfiguration
 	}
 	ringCapacity := uint64(2)
@@ -100,17 +109,17 @@ func NewIOEngine(storage Storage, requestCount, workerCount uint32) (*IOEngine, 
 		return nil, err
 	}
 	engine := &IOEngine{
-		storage: storage,
-		work:    make(chan uint32, requestCount),
-		done:    make(chan struct{}),
-		notify:  make(chan struct{}, 1),
-		slots:   make([]ioSlot, int(requestCount)),
-		free:    make([]uint32, int(requestCount)),
-		freeLen: int(requestCount),
-		ready:   ready,
+		storage: storage, synchronous: synchronous,
+		work: make(chan uint32, requestCount), done: make(chan struct{}), notify: make(chan struct{}, 1),
+		slots: make([]ioSlot, int(requestCount)), free: make([]uint32, int(requestCount)),
+		freeLen: int(requestCount), ready: ready,
 	}
 	for index := range engine.free {
 		engine.free[index] = uint32(len(engine.free) - index - 1)
+	}
+	if synchronous {
+		close(engine.done)
+		return engine, nil
 	}
 	engine.workers.Add(int(workerCount))
 	for range workerCount {
@@ -159,7 +168,13 @@ func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
 	slot.err = nil
 	slot.state.Store(ioSlotQueued)
 	handle := IOHandle{Index: index, Generation: generation}
-	engine.work <- index
+	if engine.synchronous {
+		slot.state.Store(ioSlotRunning)
+		slot.err = engine.execute(&slot.operation)
+		engine.complete(index, slot)
+	} else {
+		engine.work <- index
+	}
 	return handle, nil
 }
 
@@ -241,14 +256,18 @@ func (engine *IOEngine) runWorker() {
 		} else {
 			panic("replication: storage request entered worker twice")
 		}
-		slot.state.Store(ioSlotComplete)
-		if !engine.ready.TryPush(index) {
-			panic("replication: storage completion ring exhausted")
-		}
-		select {
-		case engine.notify <- struct{}{}:
-		default:
-		}
+		engine.complete(index, slot)
+	}
+}
+
+func (engine *IOEngine) complete(index uint32, slot *ioSlot) {
+	slot.state.Store(ioSlotComplete)
+	if !engine.ready.TryPush(index) {
+		panic("replication: storage completion ring exhausted")
+	}
+	select {
+	case engine.notify <- struct{}{}:
+	default:
 	}
 }
 

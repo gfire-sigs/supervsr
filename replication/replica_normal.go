@@ -49,7 +49,7 @@ func (replica *Replica) handleMessage(message *Message) bool {
 	case protocol.CommandView:
 		replica.handleView(header, body)
 	case protocol.CommandHeaders:
-		replica.handleHeaders(body)
+		replica.handleHeaders(header, body)
 	case protocol.CommandGetView:
 		replica.handleGetView(header)
 	case protocol.CommandGetHeaders:
@@ -677,7 +677,7 @@ func (replica *Replica) executeEntry(entry *pipelineEntry) {
 		session, found = replica.sessions.Session(client)
 		if !found {
 			reply.Release()
-			replica.fail(ErrReplicaInvariant)
+			replica.fail(errors.Join(ErrReplicaInvariant, ErrSessionEncoding))
 			return
 		}
 	}
@@ -923,7 +923,7 @@ func (replica *Replica) pipelineConflict(client protocol.ClientID, request proto
 }
 
 func prepareOKMatches(ack, prepare *protocol.Header) bool {
-	if ack.View != prepare.View || binary.LittleEndian.Uint64(ack.Fields[96:104]) != uint64(prepareOp(prepare)) || binary.LittleEndian.Uint64(ack.Fields[112:120]) != prepareTimestamp(prepare) || binary.LittleEndian.Uint32(ack.Fields[120:124]) != uint32(prepareRequest(prepare)) || ack.Fields[124] != byte(prepareOperation(prepare)) {
+	if binary.LittleEndian.Uint64(ack.Fields[96:104]) != uint64(prepareOp(prepare)) || binary.LittleEndian.Uint64(ack.Fields[112:120]) != prepareTimestamp(prepare) || binary.LittleEndian.Uint32(ack.Fields[120:124]) != uint32(prepareRequest(prepare)) || ack.Fields[124] != byte(prepareOperation(prepare)) {
 		return false
 	}
 	return equal16(ack.Fields[0:16], prepare.Fields[0:16]) && equal16(ack.Fields[32:48], prepare.HeaderChecksum[:]) && equal16(ack.Fields[64:80], prepare.Fields[64:80]) && equal16(ack.Fields[80:96], prepare.Fields[80:96])

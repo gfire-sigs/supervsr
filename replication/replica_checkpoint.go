@@ -295,6 +295,12 @@ func (replica *Replica) yieldCheckpointToView(entry *pipelineEntry) {
 func (replica *Replica) completeCommitEntry() {
 	replica.popPipeline()
 	replica.stage = CommitStageIdle
+	if replica.stateSync.stage == SyncStageIdle && replica.pipelineLen == 0 && replica.status == StatusNormal && replica.commitMin < replica.commitMax {
+		if !replica.beginRepairWindow(replica.view, replica.commitMax) {
+			replica.fail(ErrReplicaInvariant)
+		}
+		return
+	}
 	if replica.stateSync.stage == SyncStageIdle {
 		replica.dequeueRequest()
 		replica.advanceCommit()
