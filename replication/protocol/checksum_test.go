@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"encoding/hex"
+	"errors"
+	"math"
 	"testing"
 )
 
@@ -77,6 +79,35 @@ func TestChecksumSumDoesNotConsumeHasher(t *testing.T) {
 	}
 	if second != ChecksumBytes([]byte("first second")) {
 		t.Fatalf("second checksum = %x", second)
+	}
+}
+
+func TestChecksumHasherRejectsBitLengthOverflow(t *testing.T) {
+	const maxBytes = math.MaxUint64 / 8
+	hasher := NewChecksumHasher()
+	hasher.length = maxBytes - 1
+	if written, err := hasher.Write([]byte{1}); err != nil || written != 1 {
+		t.Fatalf("boundary write = (%d, %v), want (1, nil)", written, err)
+	}
+	if hasher.length != maxBytes {
+		t.Fatalf("length = %d, want %d", hasher.length, uint64(maxBytes))
+	}
+	before := hasher
+	if written, err := hasher.Write([]byte{2}); !errors.Is(err, ErrChecksumLengthOverflow) || written != 0 {
+		t.Fatalf("overflow write = (%d, %v), want (0, %v)", written, err, ErrChecksumLengthOverflow)
+	}
+	if hasher != before {
+		t.Fatal("overflow write changed hasher state")
+	}
+
+	invalid := NewChecksumHasher()
+	invalid.length = maxBytes + 1
+	before = invalid
+	if written, err := invalid.Write(nil); !errors.Is(err, ErrChecksumLengthOverflow) || written != 0 {
+		t.Fatalf("invalid-state write = (%d, %v), want (0, %v)", written, err, ErrChecksumLengthOverflow)
+	}
+	if invalid != before {
+		t.Fatal("invalid-state write changed hasher state")
 	}
 }
 

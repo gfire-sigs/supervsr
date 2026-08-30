@@ -8,6 +8,8 @@ import (
 
 var ErrChecksumLengthOverflow = errors.New("protocol: checksum input length overflow")
 
+const checksumInputBytesMax = math.MaxUint64 / 8
+
 var aesSBox = [256]byte{
 	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
 	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -59,7 +61,7 @@ func (hasher *ChecksumHasher) Reset() {
 }
 
 func (hasher *ChecksumHasher) Write(input []byte) (int, error) {
-	if uint64(len(input)) > math.MaxUint64/8-hasher.length {
+	if hasher.length > checksumInputBytesMax || uint64(len(input)) > checksumInputBytesMax-hasher.length {
 		return 0, ErrChecksumLengthOverflow
 	}
 	inputLength := len(input)
