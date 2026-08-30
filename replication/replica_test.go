@@ -553,13 +553,14 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 		RequestBytes:  uint32(config.Cluster.ApplicationBatchSizeMax),
 		ReplyBytes:    uint32(config.Cluster.ApplicationReplySizeMax),
 		PrefetchMax:   uint32(config.Cluster.PipelineMax),
-		CheckpointMax: 1,
+		CheckpointMax: 2,
 	}
-	machine := &testStateMachine{capacities: capacities}
+	machine := &testStateMachine{capacities: capacities, writeCheckpoint: true}
+	validator := manifestTestValidator{}
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: bus,
-		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+		Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}}, Entropy: bytes.NewReader([]byte{1}),
+		StateMachine: machine, BlockValidator: validator,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -607,26 +608,81 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 		default:
 		}
 	}
-	if machine.compacts != 7 || machine.checkpoints != 1 {
-		t.Fatalf("maintenance compacts=%d checkpoints=%d", machine.compacts, machine.checkpoints)
+	if machine.compacts != 7 || machine.checkpoints != 1 || !machine.checkpointBlocks {
+		t.Fatalf("maintenance compacts=%d checkpoints=%d blocks=%t", machine.compacts, machine.checkpoints, machine.checkpointBlocks)
+	}
+	checkpoint := replica.Snapshot().Checkpoint
+	if checkpoint.ManifestBlockCount != 1 || checkpoint.NewestManifestAddress == 0 || checkpoint.SnapshotRootAddress == 0 {
+		t.Fatalf("application checkpoint references: %+v", checkpoint)
+	}
+	firstCheckpoint := checkpoint
+	for requestNo := protocol.RequestNo(111); requestNo <= 210; requestNo++ {
+		request := makeClientRequest(t, pool, config.Group, client, session, requestNo, parent, protocol.OperationNoop, nil)
+		if err := replica.Submit(request); err != nil {
+			t.Fatal(err)
+		}
+		processReplicaUntil(t, replica, protocol.Op(requestNo)+1)
+		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		if replyReason != protocol.RejectNone {
+			t.Fatalf("request %d reply: %v", requestNo, replyReason)
+		}
+		parent = replyContext(&reply)
+	}
+	secondDeadline := time.NewTimer(3 * time.Second)
+	defer secondDeadline.Stop()
+	for snapshot := replica.Snapshot(); snapshot.Checkpoint.PrepareOp() != 191 || snapshot.PipelineLen != 0; snapshot = replica.Snapshot() {
+		if _, err := replica.Process(64); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-replica.io.Ready():
+		case <-replica.notify:
+		case <-secondDeadline.C:
+			t.Fatalf("second checkpoint did not finish: %+v", replica.Snapshot())
+		default:
+		}
+	}
+	if machine.checkpoints != 2 {
+		t.Fatalf("checkpoint count = %d, want 2", machine.checkpoints)
+	}
+	secondCheckpoint := replica.Snapshot().Checkpoint
+	if secondCheckpoint.ManifestBlockCount != 0 || secondCheckpoint.SnapshotRootAddress != 0 {
+		t.Fatalf("second application checkpoint references: %+v", secondCheckpoint)
+	}
+	for _, address := range []uint64{firstCheckpoint.NewestManifestAddress, firstCheckpoint.SnapshotRootAddress} {
+		index, ok := replica.blockAllocator.index(address)
+		if !ok || !replica.blockAllocator.released.Test(index) {
+			t.Fatalf("superseded application block %d was not released", address)
+		}
+	}
+	for _, address := range []uint64{firstCheckpoint.AcquiredTrailerLastAddress, firstCheckpoint.ReleasedTrailerLastAddress, firstCheckpoint.SessionTrailerLastAddress} {
+		index, ok := replica.blockAllocator.index(address)
+		if !ok || !replica.blockAllocator.pending.Test(index) {
+			t.Fatalf("superseded trailer %d was not deferred", address)
+		}
 	}
 	closeReplica(t, replica)
 	storage.Crash()
+	reopenMachine := &testStateMachine{capacities: capacities, writeCheckpoint: true}
 	reopened, err := Open(context.Background(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
-		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 20, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities},
+		Clock: fixedClock{sample: TimeSample{Wall: 200, Monotonic: 20, Synchronized: true}}, Entropy: bytes.NewReader([]byte{2}),
+		StateMachine: reopenMachine, BlockValidator: validator,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeReplica(t, reopened)
 	reopenedSnapshot := reopened.Snapshot()
-	if reopenedSnapshot.Checkpoint.PrepareOp() != 95 || reopenedSnapshot.CommitMin != 111 {
+	if reopenedSnapshot.Checkpoint.PrepareOp() != 191 || reopenedSnapshot.CommitMin != 211 ||
+		reopenedSnapshot.Checkpoint.ManifestBlockCount != 0 || reopenedSnapshot.Checkpoint.SnapshotRootAddress != 0 {
 		t.Fatalf("reopened checkpoint: %+v", reopenedSnapshot)
 	}
+	if !reopenMachine.openBlocks {
+		t.Fatal("checkpoint block reader was not supplied during open")
+	}
 
-	if _, _, found := reopened.sessions.Reply(client, session, 110); !found {
+	if _, _, found := reopened.sessions.Reply(client, session, 210); !found {
 		t.Fatal("reopened session reply missing")
 	}
 }
@@ -1074,17 +1130,68 @@ func TestUnsynchronizedMultiReplicaClockSuppressesPulse(t *testing.T) {
 	}
 }
 
+type manifestTestValidator struct{}
+
+func (manifestTestValidator) CheckpointRoot(checkpoint CheckpointState) (BlockRequirement, error) {
+	return BlockRequirement{
+		Reference: BlockReference{Checksum: checkpoint.SnapshotRootChecksum, Address: checkpoint.SnapshotRootAddress},
+		Type:      BlockValue, Snapshot: uint64(checkpoint.PrepareOp()), SnapshotExact: true, BodySize: 4,
+	}, nil
+}
+
+func (manifestTestValidator) ResolveBlock(checkpoint CheckpointState, address uint64) (BlockRequirement, bool, error) {
+	switch address {
+	case checkpoint.SnapshotRootAddress:
+		requirement, err := (manifestTestValidator{}).CheckpointRoot(checkpoint)
+		return requirement, true, err
+	case checkpoint.NewestManifestAddress:
+		return BlockRequirement{
+			Reference: BlockReference{Checksum: checkpoint.NewestManifestChecksum, Address: checkpoint.NewestManifestAddress},
+			Type:      BlockManifest, Snapshot: uint64(checkpoint.PrepareOp()), SnapshotExact: true, BodySize: 32,
+		}, true, nil
+	default:
+		return BlockRequirement{}, false, nil
+	}
+}
+
+func (manifestTestValidator) ValidateBlock(input BlockValidationInput, references []BlockRequirement) (int, error) {
+	switch input.Type {
+	case BlockManifest:
+		count := int(binary.LittleEndian.Uint32(input.Metadata[40:44]))
+		if count != 1 || len(input.Body) != 32 || len(references) < count || !allZeroBytes(input.Body[24:]) {
+			return 0, ErrInvalidBlock
+		}
+		copy(references[0].Reference.Checksum[:], input.Body[:16])
+		references[0].Reference.Address = binary.LittleEndian.Uint64(input.Body[16:24])
+		references[0].Type = BlockValue
+		references[0].Snapshot = uint64(input.NeededAtCheckpoint)
+		references[0].SnapshotExact = true
+		references[0].BodySize = 4
+		return count, nil
+	case BlockValue:
+		if !bytes.Equal(input.Body, []byte{0x51, 0x52, 0x53, 0x54}) {
+			return 0, ErrInvalidBlock
+		}
+		return 0, nil
+	default:
+		return 0, ErrInvalidBlock
+	}
+}
+
 type testStateMachine struct {
-	capacities      StateMachineCapacities
-	commits         int
-	pulseNeeded     bool
-	closes          atomic.Uint32
-	resetPending    bool
-	resetStarted    chan struct{}
-	resetCompletion *SMCompletion
-	compacts        int
-	checkpoints     int
-	validation      ValidationResult
+	capacities       StateMachineCapacities
+	commits          int
+	pulseNeeded      bool
+	closes           atomic.Uint32
+	resetPending     bool
+	resetStarted     chan struct{}
+	resetCompletion  *SMCompletion
+	compacts         int
+	checkpoints      int
+	checkpointBlocks bool
+	writeCheckpoint  bool
+	openBlocks       bool
+	validation       ValidationResult
 }
 
 func (machine *testStateMachine) Capacities() StateMachineCapacities { return machine.capacities }
@@ -1105,11 +1212,42 @@ func (machine *testStateMachine) StartCompact(CompactInput, *SMCompletion) (Star
 	machine.compacts++
 	return Ready(CompactResult{}), nil
 }
-func (machine *testStateMachine) StartCheckpoint(CheckpointInput, *SMCompletion) (StartResult[CheckpointManifest], error) {
+func (machine *testStateMachine) StartCheckpoint(input CheckpointInput, _ *SMCompletion) (StartResult[CheckpointManifest], error) {
 	machine.checkpoints++
-	return Ready(CheckpointManifest{}), nil
+	machine.checkpointBlocks = input.Blocks != nil
+	if !machine.writeCheckpoint {
+		return Ready(CheckpointManifest{}), nil
+	}
+	machine.writeCheckpoint = false
+	rootBlock, err := input.Blocks.Reserve(BlockValue)
+	if err != nil {
+		return StartResult[CheckpointManifest]{}, err
+	}
+	manifestBlock, err := input.Blocks.Reserve(BlockManifest)
+	if err != nil {
+		return StartResult[CheckpointManifest]{}, err
+	}
+	var rootMetadata [96]byte
+	binary.LittleEndian.PutUint32(rootMetadata[0:4], 1)
+	binary.LittleEndian.PutUint32(rootMetadata[4:8], 1)
+	binary.LittleEndian.PutUint32(rootMetadata[8:12], 4)
+	root, err := rootBlock.Write(rootMetadata, []byte{0x51, 0x52, 0x53, 0x54})
+	if err != nil {
+		return StartResult[CheckpointManifest]{}, err
+	}
+	body := make([]byte, 32)
+	copy(body[:16], root.Checksum[:])
+	binary.LittleEndian.PutUint64(body[16:24], root.Address)
+	var manifestMetadata [96]byte
+	binary.LittleEndian.PutUint32(manifestMetadata[40:44], 1)
+	manifest, err := manifestBlock.Write(manifestMetadata, body)
+	if err != nil {
+		return StartResult[CheckpointManifest]{}, err
+	}
+	return Ready(CheckpointManifest{Oldest: manifest, Newest: manifest, Root: root, BlockCount: 1}), nil
 }
-func (machine *testStateMachine) StartOpen(OpenCheckpointInput, *SMCompletion) (StartResult[OpenResult], error) {
+func (machine *testStateMachine) StartOpen(input OpenCheckpointInput, _ *SMCompletion) (StartResult[OpenResult], error) {
+	machine.openBlocks = input.Blocks != nil
 	return Ready(OpenResult{}), nil
 }
 func (machine *testStateMachine) StartReset(completion *SMCompletion) (StartResult[ResetResult], error) {

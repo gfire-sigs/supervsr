@@ -172,6 +172,11 @@ type Replica struct {
 	checkpointManifest      CheckpointManifest
 	checkpointCandidate     BlockCheckpointCandidate
 	pendingCheckpoint       CheckpointState
+	checkpointBlocks        *CheckpointBlockTransaction
+	checkpointReader        *CheckpointBlockReader
+	checkpointBlockLimit    uint32
+	checkpointReleases      []uint64
+	checkpointSuperseded    []uint64
 
 	wal                    *WAL
 	replies                *ReplyStore
@@ -272,6 +277,11 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	}
 	capacities := dependencies.StateMachine.Capacities()
 	if uint64(capacities.RequestBytes) != config.Cluster.ApplicationBatchSizeMax || uint64(capacities.ReplyBytes) != config.Cluster.ApplicationReplySizeMax || uint64(capacities.PrefetchMax) < config.Cluster.PipelineMax || capacities.CheckpointMax == 0 {
+		return nil, ErrInvalidConfiguration
+	}
+	blockBase, _ := config.Cluster.BlockBase()
+	maximumCheckpointBlocks := (config.Process.StorageSizeLimit - blockBase) / config.Cluster.BlockSize
+	if uint64(capacities.CheckpointMax) > maximumCheckpointBlocks {
 		return nil, ErrInvalidConfiguration
 	}
 	local, ok := config.Membership.LocalIndex()
@@ -442,6 +452,9 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		blocks:               blocks.store,
 		trailers:             blocks.trailers,
 		blockAllocator:       blocks.allocator,
+		checkpointBlocks:     newCheckpointBlockTransaction(blocks.allocator, blocks.store, capacities.CheckpointMax),
+		checkpointReader:     newCheckpointBlockReader(blocks.allocator, blocks.store),
+		checkpointBlockLimit: capacities.CheckpointMax,
 		events:               events,
 		notify:               make(chan struct{}, 1),
 		pipeline:             make([]pipelineEntry, int(config.Cluster.PipelineMax)),
@@ -856,6 +869,12 @@ func (replica *Replica) handleSMCompletion(event replicaEvent) {
 			continue
 		}
 		if result.Err != nil {
+			if entry.stage == CommitStageCheckpointData {
+				if err := replica.checkpointBlocks.abort(); err != nil {
+					replica.fail(errors.Join(ErrStateMachine, result.Err, err))
+					return
+				}
+			}
 			replica.fail(errors.Join(ErrStateMachine, result.Err))
 			return
 		}

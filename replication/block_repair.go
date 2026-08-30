@@ -8,16 +8,16 @@ import (
 
 type BlockValidationInput struct {
 	Reference          BlockReference
-	NeededAtCheckpoint protocol.Op
+	NeededAtCheckpoint Op
 	Snapshot           uint64
-	Type               protocol.BlockType
+	Type               BlockType
 	Metadata           [96]byte
 	Body               []byte
 }
 
 type BlockRequirement struct {
 	Reference     BlockReference
-	Type          protocol.BlockType
+	Type          BlockType
 	Snapshot      uint64
 	SnapshotExact bool
 	BodySize      uint32

@@ -3,8 +3,6 @@ package replication
 import (
 	"errors"
 	"sync/atomic"
-
-	"github.com/gfire-sigs/supervsr/replication/protocol"
 )
 
 var (
@@ -22,7 +20,7 @@ const (
 )
 
 type ValidateInput struct {
-	Operation protocol.Operation
+	Operation Operation
 	Body      []byte
 }
 
@@ -34,34 +32,36 @@ type StateMachineCapacities struct {
 }
 
 type PrefetchInput struct {
-	Operation protocol.Operation
+	Operation Operation
 	Body      []byte
 	Timestamp uint64
-	Op        protocol.Op
-	Release   protocol.Release
+	Op        Op
+	Release   Release
 }
 
 type CommitInput struct {
-	Operation protocol.Operation
+	Operation Operation
 	Body      []byte
 	Timestamp uint64
-	Op        protocol.Op
-	Release   protocol.Release
+	Op        Op
+	Release   Release
 }
 
 type CompactInput struct {
-	Op        protocol.Op
+	Op        Op
 	Timestamp uint64
 }
 
 type CheckpointInput struct {
-	Op        protocol.Op
+	Op        Op
 	Timestamp uint64
-	Release   protocol.Release
+	Release   Release
+	Blocks    *CheckpointBlockTransaction
 }
 
 type OpenCheckpointInput struct {
-	State CheckpointState
+	State  CheckpointState
+	Blocks *CheckpointBlockReader
 }
 
 type PrefetchToken uint64
@@ -71,7 +71,7 @@ type CompactResult struct {
 }
 
 type BlockReference struct {
-	Checksum protocol.Checksum
+	Checksum Checksum
 	Address  uint64
 }
 

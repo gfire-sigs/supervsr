@@ -351,6 +351,15 @@ func (allocator *BlockAllocator) Release(address uint64) error {
 	return nil
 }
 
+func (allocator *BlockAllocator) cancelRelease(address uint64) error {
+	index, ok := allocator.index(address)
+	if !ok || !allocator.acquired.Test(index) || allocator.reserved.Test(index) || allocator.released.Test(index) || !allocator.pending.Test(index) {
+		return ErrBlockReservation
+	}
+	allocator.pending.Clear(index)
+	return nil
+}
+
 func (allocator *BlockAllocator) BeginCheckpoint() (BlockCheckpointCandidate, error) {
 	if allocator.checkpointActive || allocator.prefix(&allocator.reserved).Count() != 0 {
 		return BlockCheckpointCandidate{}, ErrBlockReservation
@@ -460,6 +469,11 @@ func (allocator *BlockAllocator) index(address uint64) (uint64, bool) {
 	}
 	index := address - 1
 	return index, index < allocator.blockCount
+}
+
+func (allocator *BlockAllocator) reservationValid(address uint64) bool {
+	index, ok := allocator.index(address)
+	return ok && allocator.reserved.Test(index)
 }
 
 func EmptyBlockSets(state CheckpointState, cluster ClusterConfig) (FixedBitSet, FixedBitSet, error) {

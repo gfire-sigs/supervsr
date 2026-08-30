@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/gfire-sigs/supervsr/replication/protocol"
@@ -159,6 +160,7 @@ func operationName(index int) string {
 }
 
 type crashStorage struct {
+	mu        sync.Mutex
 	working   []byte
 	durable   []byte
 	operation int
@@ -166,6 +168,8 @@ type crashStorage struct {
 }
 
 func (storage *crashStorage) ReadAt(buffer []byte, offset uint64) error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	if offset+uint64(len(buffer)) > uint64(len(storage.working)) {
 		return ErrShortIO
 	}
@@ -174,6 +178,8 @@ func (storage *crashStorage) ReadAt(buffer []byte, offset uint64) error {
 }
 
 func (storage *crashStorage) WriteAt(buffer []byte, offset uint64) error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	if storage.fail() {
 		return ErrStorage
 	}
@@ -185,6 +191,8 @@ func (storage *crashStorage) WriteAt(buffer []byte, offset uint64) error {
 }
 
 func (storage *crashStorage) Sync() error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	if storage.fail() {
 		return ErrStorage
 	}
@@ -193,6 +201,8 @@ func (storage *crashStorage) Sync() error {
 }
 
 func (storage *crashStorage) Resize(size uint64) error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	if storage.fail() {
 		return ErrStorage
 	}
@@ -205,10 +215,14 @@ func (storage *crashStorage) Resize(size uint64) error {
 }
 
 func (storage *crashStorage) Size() (uint64, error) {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	return uint64(len(storage.working)), nil
 }
 
 func (storage *crashStorage) SyncParent() error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	if storage.fail() {
 		return ErrStorage
 	}
@@ -218,6 +232,8 @@ func (storage *crashStorage) SyncParent() error {
 func (storage *crashStorage) Close() error { return nil }
 
 func (storage *crashStorage) Crash() {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
 	storage.working = append(storage.working[:0], storage.durable...)
 	storage.failAt = 0
 	storage.operation = 0

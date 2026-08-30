@@ -84,16 +84,36 @@ func (replica *Replica) afterCompact(entry *pipelineEntry) {
 	}
 	replica.checkpointTarget = target
 	replica.checkpointTargetRelease = replica.checkpointRelease(target)
+	if err := replica.checkpointBlocks.begin(uint64(target)); err != nil {
+		replica.fail(err)
+		return
+	}
 	entry.stage = CommitStageCheckpointData
 	entry.completion.prepare(entry.generation, replica)
-	result, err := replica.deps.StateMachine.StartCheckpoint(CheckpointInput{Op: target, Timestamp: prepareTimestamp(&entry.header), Release: replica.checkpointTargetRelease}, &entry.completion)
+	result, err := replica.deps.StateMachine.StartCheckpoint(CheckpointInput{
+		Op: target, Timestamp: prepareTimestamp(&entry.header), Release: replica.checkpointTargetRelease,
+		Blocks: replica.checkpointBlocks,
+	}, &entry.completion)
 	if err != nil {
+		entry.completion.release(entry.generation)
+		_ = replica.checkpointBlocks.abort()
 		replica.fail(errors.Join(ErrStateMachine, err))
+		return
+	}
+	if err := replica.checkpointBlocks.seal(); err != nil {
+		_ = replica.checkpointBlocks.abort()
+		replica.fail(err)
 		return
 	}
 	if manifest, ready := result.Value(); ready {
 		entry.completion.release(entry.generation)
 		replica.applyCheckpoint(entry, manifest)
+		return
+	}
+	if !result.IsPending() {
+		entry.completion.release(entry.generation)
+		_ = replica.checkpointBlocks.abort()
+		replica.fail(ErrReplicaInvariant)
 	}
 }
 
@@ -106,13 +126,35 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 		replica.fail(ErrReplicaInvariant)
 		return
 	}
-	payload := replica.config.Cluster.BlockSize - protocol.HeaderSize
-	candidate, err := replica.blockAllocator.PrepareCheckpoint(uint64(len(replica.checkpointSession)), payload)
+	if err := replica.checkpointBlocks.commit(); err != nil {
+		replica.fail(err)
+		return
+	}
+	reachable, protected, superseded, err := replica.resolveCheckpointReachability(manifest)
 	if err != nil {
 		replica.fail(err)
 		return
 	}
+	replica.checkpointSuperseded = append(replica.checkpointSuperseded[:0], superseded...)
+	if err := replica.stageCheckpointReleases(reachable, protected); err != nil {
+		replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
+		replica.fail(err)
+		return
+	}
+	payload := replica.config.Cluster.BlockSize - protocol.HeaderSize
+	candidate, err := replica.blockAllocator.PrepareCheckpoint(uint64(len(replica.checkpointSession)), payload)
+	if err != nil {
+		replica.abortCheckpointCandidate()
+		replica.fail(err)
+		return
+	}
 	replica.checkpointCandidate = candidate
+	if err := installCheckpointReachability(&replica.checkpointCandidate, reachable, replica.blockAllocator); err != nil {
+		replica.abortCheckpointCandidate()
+		replica.fail(err)
+		return
+	}
+	candidate = replica.checkpointCandidate
 	snapshot := uint64(replica.checkpointTarget)
 	acquired, err := replica.trailers.WriteReserved(replica.blockAllocator, candidate.AcquiredAddresses(), protocol.BlockFreeSet, snapshot, candidate.AcquiredEncoded())
 	if err != nil {
@@ -229,6 +271,14 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		replica.fail(err)
 		return
 	}
+	replica.checkpointReleases = replica.checkpointReleases[:0]
+	for _, address := range replica.checkpointSuperseded {
+		if err := replica.blockAllocator.Release(address); err != nil {
+			replica.fail(err)
+			return
+		}
+	}
+	replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
 	replica.checkpoint = replica.pendingCheckpoint
 	targetRelease := replica.checkpoint.Release
 	checkpointID, err := replica.checkpoint.ID()
@@ -262,11 +312,14 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 }
 
 func (replica *Replica) abortCheckpointCandidate() {
-	if replica.checkpointCandidate.generation == 0 {
-		return
+	if replica.checkpointCandidate.generation != 0 {
+		if err := replica.blockAllocator.AbortCheckpoint(replica.checkpointCandidate); err != nil {
+			replica.fail(err)
+		}
+		replica.checkpointCandidate = BlockCheckpointCandidate{}
 	}
-	_ = replica.blockAllocator.AbortCheckpoint(replica.checkpointCandidate)
-	replica.checkpointCandidate = BlockCheckpointCandidate{}
+	replica.rollbackCheckpointReleases()
+	replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
 }
 
 func (replica *Replica) checkpointTransitionActive() bool {
@@ -282,6 +335,10 @@ func (replica *Replica) checkpointTransitionActive() bool {
 func (replica *Replica) yieldCheckpointToView(entry *pipelineEntry) {
 	target := replica.pendingView
 	replica.pendingView = 0
+	if err := replica.checkpointBlocks.abort(); err != nil {
+		replica.fail(err)
+		return
+	}
 	replica.abortCheckpointCandidate()
 	replica.checkpointTarget = 0
 	replica.checkpointTargetRelease = 0

@@ -136,8 +136,8 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	if durable.SyncMin != 1 || durable.SyncMax != checkpointOp || durable.Checkpoint.PrepareOp() != checkpointOp {
 		t.Fatalf("durable sync range=%d..%d checkpoint=%d", durable.SyncMin, durable.SyncMax, durable.Checkpoint.PrepareOp())
 	}
-	if !target.syncRangeRepaired || targetMachine.commits != 0 || targetMachine.resetSyncMin != 1 {
-		t.Fatalf("sync repaired=%t replay commits=%d reset sync min=%d", target.syncRangeRepaired, targetMachine.commits, targetMachine.resetSyncMin)
+	if !target.syncRangeRepaired || targetMachine.commits != 0 || targetMachine.resetSyncMin != 1 || !targetMachine.openBlocks {
+		t.Fatalf("sync repaired=%t replay commits=%d reset sync min=%d open blocks=%t", target.syncRangeRepaired, targetMachine.commits, targetMachine.resetSyncMin, targetMachine.openBlocks)
 	}
 	targetMachine.pulseNeeded = true
 	target.handlePulseTimeout(TimeSample{Wall: 150, Monotonic: monotonic, Synchronized: true})

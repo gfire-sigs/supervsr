@@ -95,6 +95,82 @@ func TestBlockRepairRejectsDuplicateResponsesAndRecyclesTargets(t *testing.T) {
 	}
 }
 
+func TestBlockRepairPublishesOnlyAfterDurableSync(t *testing.T) {
+	tests := []struct {
+		name   string
+		failAt int
+		saved  bool
+	}{
+		{name: "write failure", failAt: 1},
+		{name: "sync failure", failAt: 2},
+		{name: "durable", saved: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cluster := compactTestClusterConfig()
+			config := Config{
+				Cluster: cluster, Process: DefaultProcessConfig(), Group: GroupID{1}, CurrentRelease: 1,
+				Membership: Membership{Members: [MembersMax]MemberID{{1}, {2}}, ActiveCount: 2, LocalMember: MemberID{1}},
+			}
+			base, ok := cluster.BlockBase()
+			if !ok {
+				t.Fatal("block base overflow")
+			}
+			storage := &crashStorage{}
+			if err := storage.Resize(base + cluster.BlockSize); err != nil {
+				t.Fatal(err)
+			}
+			if err := storage.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			storage.operation = 0
+			storage.failAt = test.failAt
+			engine, err := NewIOEngine(storage, 2, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeIOEngine(t, engine)
+			budget, err := newBlockRepairBudget(2, 0, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			buffer, err := NewAlignedBuffer(cluster.BlockSize, SectorSize)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replica := Replica{
+				config: config, membership: config.Membership, local: 0, io: engine,
+				blockRepairBudget: budget, blockRepairTargets: make([]blockRepairTarget, 1),
+				blockRepairIO: []blockRepairIO{{buffer: buffer}},
+			}
+			header, body := makeRepairBlock(t, config, 1, 7)
+			reference := BlockReference{Address: 1, Checksum: header.HeaderChecksum}
+			if !replica.queueBlockRepair(reference, BlockFreeSet, 9, blockSnapshotExpectation{value: 7, exact: true}, uint32(len(body)), blockRepairScrub) {
+				t.Fatal("repair target rejected")
+			}
+			replica.blockRepairTargets[0].state = blockRepairMissing
+			if !replica.blockRepairBudget.Reserve(1, []BlockReference{reference}, blockRepairExpires) {
+				t.Fatal("repair budget rejected")
+			}
+			replica.handleBlock(header, body)
+			drainBlockRepairIO(t, &replica)
+			if test.saved {
+				if replica.blockRepairTargets[0].state != 0 {
+					t.Fatalf("durable target state = %d", replica.blockRepairTargets[0].state)
+				}
+			} else if replica.blockRepairTargets[0].state != blockRepairMissing {
+				t.Fatalf("failed target state = %d", replica.blockRepairTargets[0].state)
+			}
+			storage.Crash()
+			var durable Checksum
+			copy(durable[:], storage.working[base:base+16])
+			if (durable == reference.Checksum) != test.saved {
+				t.Fatalf("durable checksum = %x, saved=%t", durable, test.saved)
+			}
+		})
+	}
+}
+
 func TestStalledBlockRepairDoesNotStarveJournalRepair(t *testing.T) {
 	membership := Membership{Members: [MembersMax]protocol.MemberID{{1}, {2}}, ActiveCount: 2, LocalMember: protocol.MemberID{1}}
 	blockBudget, err := newBlockRepairBudget(2, 0, 1)

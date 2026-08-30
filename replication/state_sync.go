@@ -536,9 +536,14 @@ func (replica *Replica) finishStateSyncBlocks() {
 	replica.blocks = blocks.store
 	replica.trailers = blocks.trailers
 	replica.blockAllocator = blocks.allocator
+	if err := replica.checkpointBlocks.setRuntime(blocks.allocator, blocks.store); err != nil {
+		replica.fail(err)
+		return
+	}
+	replica.checkpointReader = newCheckpointBlockReader(blocks.allocator, blocks.store)
 	replica.stateSync.generation++
 	replica.stateSync.completion.prepare(replica.stateSync.generation, replica)
-	result, err := replica.deps.StateMachine.StartOpen(OpenCheckpointInput{State: replica.stateSync.checkpoint}, &replica.stateSync.completion)
+	result, err := replica.deps.StateMachine.StartOpen(OpenCheckpointInput{State: replica.stateSync.checkpoint, Blocks: replica.checkpointReader}, &replica.stateSync.completion)
 	if err != nil {
 		replica.stateSync.completion.release(replica.stateSync.generation)
 		replica.fail(errors.Join(ErrStateMachine, err))

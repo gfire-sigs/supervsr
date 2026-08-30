@@ -92,7 +92,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (*Repli
 	var upgrades recoveredUpgradeState
 	if !resumeStateSync {
 		startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
-		if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, startup); err != nil {
+		if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, newCheckpointBlockReader(blocks.allocator, blocks.store), startup); err != nil {
 			return nil, err
 		}
 		if recovery.FaultySlots == 0 {
@@ -289,11 +289,11 @@ func loadOpenSuffix(replica *Replica, recovery WALRecoveryReport, commitMin prot
 	return replica.loadRecoveredSuffix(commitMin+1, recovery.HeadOp)
 }
 
-func startOpenStateMachine(ctx context.Context, machine StateMachine, checkpoint CheckpointState, sink *startupCompletionSink) error {
+func startOpenStateMachine(ctx context.Context, machine StateMachine, checkpoint CheckpointState, blocks *CheckpointBlockReader, sink *startupCompletionSink) error {
 	var completion SMCompletion
 	const generation = 1
 	completion.prepare(generation, sink)
-	result, err := machine.StartOpen(OpenCheckpointInput{State: checkpoint}, &completion)
+	result, err := machine.StartOpen(OpenCheckpointInput{State: checkpoint, Blocks: blocks}, &completion)
 	if err != nil {
 		return errors.Join(ErrStateMachine, err)
 	}
