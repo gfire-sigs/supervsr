@@ -201,7 +201,11 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	if corruptAddress == 0 {
 		t.Fatal("checkpoint has no acquired trailer")
 	}
-	if err := targetStorage.WriteAt(make([]byte, targetConfig.Cluster.BlockSize), corruptAddress); err != nil {
+	corruptOffset, ok := targetConfig.Cluster.BlockOffset(corruptAddress)
+	if !ok {
+		t.Fatal("corrupt block offset overflow")
+	}
+	if err := targetStorage.WriteAt(make([]byte, targetConfig.Cluster.BlockSize), corruptOffset); err != nil {
 		t.Fatal(err)
 	}
 	if err := targetStorage.Sync(); err != nil {

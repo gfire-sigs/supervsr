@@ -137,6 +137,14 @@ func (replica *Replica) startRepairRead(kind repairReadKind, peer protocol.Repli
 	if replica.stateSync.stage != SyncStageIdle {
 		return false
 	}
+	address := offset
+	if kind == repairReadBlock {
+		var ok bool
+		offset, ok = replica.config.Cluster.BlockOffset(address)
+		if !ok {
+			return false
+		}
+	}
 	if replica.activeRepairReads() >= int(replica.config.Process.RepairReadsMax) {
 		return false
 	}
@@ -150,7 +158,7 @@ func (replica *Replica) startRepairRead(kind repairReadKind, peer protocol.Repli
 		if err != nil {
 			return false
 		}
-		*read = repairRead{busy: true, kind: kind, handle: handle, peer: peer, op: op, client: client, checksum: checksum, address: offset, buffer: read.buffer}
+		*read = repairRead{busy: true, kind: kind, handle: handle, peer: peer, op: op, client: client, checksum: checksum, address: address, buffer: read.buffer}
 		return true
 	}
 	return false

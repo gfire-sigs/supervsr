@@ -141,14 +141,14 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	binary.LittleEndian.PutUint32(metadata[:4], 1)
 	binary.LittleEndian.PutUint32(metadata[4:8], 1)
 	binary.LittleEndian.PutUint32(metadata[8:12], 1)
-	address, ok := config.Cluster.BlockBase()
+	blockBase, ok := config.Cluster.BlockBase()
 	if !ok {
 		t.Fatal("block base overflow")
 	}
-	if err := storage.Resize(address + config.Cluster.BlockSize); err != nil {
+	if err := storage.Resize(blockBase + config.Cluster.BlockSize); err != nil {
 		t.Fatal(err)
 	}
-	blockReference, err := replica.blocks.Write(address, 1, protocol.BlockValue, metadata, []byte{7})
+	blockReference, err := replica.blocks.Write(1, 1, protocol.BlockValue, metadata, []byte{7})
 	if err != nil {
 		t.Fatal(err)
 	}

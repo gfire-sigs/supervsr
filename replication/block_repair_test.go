@@ -9,7 +9,7 @@ import (
 )
 
 func TestBlockRepairCoalescesWaitersInBothOrders(t *testing.T) {
-	reference := BlockReference{Address: 4096, Checksum: protocol.Checksum{1}}
+	reference := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
 	exact := blockSnapshotExpectation{value: 7, exact: true}
 	orders := [][2]blockRepairSource{{blockRepairScrub, blockRepairStateSync}, {blockRepairStateSync, blockRepairScrub}}
 	for _, order := range orders {
@@ -64,9 +64,8 @@ func TestBlockRepairRejectsDuplicateResponsesAndRecyclesTargets(t *testing.T) {
 		blockRepairBudget: budget, blockRepairTargets: make([]blockRepairTarget, 1),
 		blockRepairIO: []blockRepairIO{{buffer: buffer}},
 	}
-	base, _ := cluster.BlockBase()
 	for index := 0; index < 4; index++ {
-		address := base + uint64(index)*cluster.BlockSize
+		address := uint64(index + 1)
 		header, body := makeRepairBlock(t, config, address, 7)
 		reference := BlockReference{Address: address, Checksum: header.HeaderChecksum}
 		if !replica.queueBlockRepair(reference, protocol.BlockFreeSet, 9, blockSnapshotExpectation{value: 7, exact: true}, uint32(len(body)), blockRepairScrub) {
@@ -102,7 +101,7 @@ func TestStalledBlockRepairDoesNotStarveJournalRepair(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reference := BlockReference{Address: 4096, Checksum: protocol.Checksum{1}}
+	reference := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
 	if !blockBudget.Reserve(1, []BlockReference{reference}, 1) {
 		t.Fatal("block reservation rejected")
 	}
@@ -140,23 +139,19 @@ func TestBlockRepairRevalidatesConcurrentChildrenAtDurability(t *testing.T) {
 		Group: protocol.GroupID{1}, CurrentRelease: 1,
 		Membership: Membership{Members: [MembersMax]protocol.MemberID{{1}}, ActiveCount: 1, LocalMember: protocol.MemberID{1}},
 	}
-	base, ok := config.Cluster.BlockBase()
-	if !ok {
-		t.Fatal("block base overflow")
-	}
-	parentA, bodyA, physicalA := makeValueRepairBlock(t, config, base, 1)
-	parentB, bodyB, physicalB := makeValueRepairBlock(t, config, base+config.Cluster.BlockSize, 2)
-	childA := BlockRequirement{Reference: BlockReference{Address: base + 2*config.Cluster.BlockSize, Checksum: protocol.Checksum{3}}, Type: protocol.BlockValue}
-	childB := BlockRequirement{Reference: BlockReference{Address: base + 3*config.Cluster.BlockSize, Checksum: protocol.Checksum{4}}, Type: protocol.BlockValue}
+	parentA, bodyA, physicalA := makeValueRepairBlock(t, config, 1, 1)
+	parentB, bodyB, physicalB := makeValueRepairBlock(t, config, 2, 2)
+	childA := BlockRequirement{Reference: BlockReference{Address: 3, Checksum: protocol.Checksum{3}}, Type: protocol.BlockValue}
+	childB := BlockRequirement{Reference: BlockReference{Address: 4, Checksum: protocol.Checksum{4}}, Type: protocol.BlockValue}
 	validator := &branchingBlockValidator{children: map[uint64]BlockRequirement{
-		base: childA, base + config.Cluster.BlockSize: childB,
+		1: childA, 2: childB,
 	}}
 	replica := Replica{
 		config: config, membership: config.Membership, deps: Dependencies{BlockValidator: validator},
 		blockCatalog: make([]BlockRequirement, 4), blockRequirements: make([]BlockRequirement, 1),
 	}
-	targetA := blockRepairTarget{reference: BlockReference{Address: base, Checksum: parentA.HeaderChecksum}, blockType: protocol.BlockValue, state: blockRepairWriting}
-	targetB := blockRepairTarget{reference: BlockReference{Address: base + config.Cluster.BlockSize, Checksum: parentB.HeaderChecksum}, blockType: protocol.BlockValue, state: blockRepairWriting}
+	targetA := blockRepairTarget{reference: BlockReference{Address: 1, Checksum: parentA.HeaderChecksum}, blockType: protocol.BlockValue, state: blockRepairWriting}
+	targetB := blockRepairTarget{reference: BlockReference{Address: 2, Checksum: parentB.HeaderChecksum}, blockType: protocol.BlockValue, state: blockRepairWriting}
 	if !replica.validRequestedBlock(&targetA, parentA, bodyA) || !replica.validRequestedBlock(&targetB, parentB, bodyB) {
 		t.Fatal("valid concurrent parent rejected")
 	}

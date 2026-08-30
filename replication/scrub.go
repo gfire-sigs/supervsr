@@ -38,11 +38,10 @@ func (replica *Replica) rememberBlock(requirement BlockRequirement) {
 		replica.blockCatalogCount++
 		return
 	}
-	blockSize := replica.config.Cluster.BlockSize
-	if blockSize == 0 {
+	if requirement.Reference.Address == 0 {
 		return
 	}
-	index := int((requirement.Reference.Address / blockSize) % uint64(len(replica.blockCatalog)))
+	index := int((requirement.Reference.Address - 1) % uint64(len(replica.blockCatalog)))
 	replica.blockCatalog[index] = requirement
 }
 
@@ -115,7 +114,11 @@ func (replica *Replica) startScrubRead(address uint64) bool {
 		if operation.busy {
 			continue
 		}
-		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: address, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		offset, ok := replica.config.Cluster.BlockOffset(address)
+		if !ok {
+			return false
+		}
+		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}

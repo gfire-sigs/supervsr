@@ -46,6 +46,7 @@ func (store *BlockStore) Write(address, snapshot uint64, blockType protocol.Bloc
 	if !store.validAddress(address) || uint64(len(body))+protocol.HeaderSize > store.cluster.BlockSize || len(body) == 0 {
 		return BlockReference{}, ErrInvalidBlock
 	}
+	offset, _ := store.cluster.BlockOffset(address)
 	if err := ValidateBlockMetadata(blockType, metadata, body); err != nil {
 		return BlockReference{}, err
 	}
@@ -60,7 +61,7 @@ func (store *BlockStore) Write(address, snapshot uint64, blockType protocol.Bloc
 	if err := protocol.SealFrame(frame, &header); err != nil {
 		return BlockReference{}, errors.Join(ErrInvalidBlock, err)
 	}
-	if err := store.storage.WriteAt(store.scratch, address); err != nil {
+	if err := store.storage.WriteAt(store.scratch, offset); err != nil {
 		return BlockReference{}, err
 	}
 	if err := store.storage.Sync(); err != nil {
@@ -75,7 +76,8 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	if reference.Address == 0 || reference.Checksum.IsZero() || !store.validAddress(reference.Address) {
 		return BlockReadResult{}, ErrBlockMissing
 	}
-	if err := store.storage.ReadAt(store.scratch, reference.Address); err != nil {
+	offset, _ := store.cluster.BlockOffset(reference.Address)
+	if err := store.storage.ReadAt(store.scratch, offset); err != nil {
 		return BlockReadResult{}, err
 	}
 	header, reason := protocol.DecodeHeader(store.scratch[:protocol.HeaderSize], store.group, uint32(store.cluster.BlockSize), 1)
@@ -107,8 +109,8 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 }
 
 func (store *BlockStore) validAddress(address uint64) bool {
-	base, ok := store.cluster.BlockBase()
-	return ok && address >= base && (address-base)%store.cluster.BlockSize == 0
+	_, ok := store.cluster.BlockOffset(address)
+	return ok
 }
 
 func ValidateBlockMetadata(blockType protocol.BlockType, metadata [96]byte, body []byte) error {

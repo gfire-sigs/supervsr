@@ -262,6 +262,21 @@ func (cfg ClusterConfig) BlockBase() (uint64, bool) {
 	return checkedAlignUp(end, cfg.BlockSize)
 }
 
+func (cfg ClusterConfig) BlockOffset(address uint64) (uint64, bool) {
+	if address == 0 || cfg.BlockSize == 0 {
+		return 0, false
+	}
+	base, ok := cfg.BlockBase()
+	if !ok {
+		return 0, false
+	}
+	delta, ok := checkedMul(address-1, cfg.BlockSize)
+	if !ok {
+		return 0, false
+	}
+	return checkedAdd(base, delta)
+}
+
 type ProcessConfig struct {
 	Tick                    time.Duration
 	InitialRTT              time.Duration

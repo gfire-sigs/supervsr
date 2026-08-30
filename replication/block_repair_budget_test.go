@@ -12,8 +12,8 @@ func TestBlockRepairBudgetRetryExpiryAndFulfillment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := BlockReference{Address: 4096, Checksum: protocol.Checksum{1}}
-	second := BlockReference{Address: 8192, Checksum: protocol.Checksum{2}}
+	first := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
+	second := BlockReference{Address: 2, Checksum: protocol.Checksum{2}}
 	if !budget.Reserve(1, []BlockReference{first, second}, 1) {
 		t.Fatal("initial batch rejected")
 	}
@@ -46,8 +46,8 @@ func TestBlockRepairBudgetDestinationRequiresFullBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	references := []BlockReference{
-		{Address: 4096, Checksum: protocol.Checksum{1}},
-		{Address: 8192, Checksum: protocol.Checksum{2}},
+		{Address: 1, Checksum: protocol.Checksum{1}},
+		{Address: 2, Checksum: protocol.Checksum{2}},
 	}
 	if !budget.Reserve(1, references, 1) {
 		t.Fatal("reservation rejected")
@@ -67,7 +67,7 @@ func BenchmarkBlockRepairBudget(b *testing.B) {
 		b.Fatal(err)
 	}
 	random := NewDeterministicRandom(1)
-	reference := BlockReference{Address: 4096, Checksum: protocol.Checksum{1}}
+	reference := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {

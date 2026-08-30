@@ -141,7 +141,7 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 		state.OldestManifestAddress, state.NewestManifestAddress, state.SnapshotRootAddress,
 	}
 	for _, address := range references {
-		if address != 0 && !validCheckpointBlockAddress(address, validation.BlockBase, validation.BlockSize, state.LogicalStorageSize) {
+		if address != 0 && !validCheckpointBlockAddress(address, blockCount) {
 			return ErrInvalidCheckpoint
 		}
 	}
@@ -186,8 +186,8 @@ func validSessionTrailerReference(address, encodedSize uint64, last, aggregate, 
 	return encodedSize == expectedSize && expectedSize != 0 && !last.IsZero()
 }
 
-func validCheckpointBlockAddress(address, base, blockSize, logical uint64) bool {
-	return address >= base && address < logical && (address-base)%blockSize == 0
+func validCheckpointBlockAddress(address, blockCount uint64) bool {
+	return address != 0 && address <= blockCount
 }
 
 func validManifestReferences(state *CheckpointState) bool {

@@ -27,7 +27,7 @@ func TestBlockAllocatorPublishesAndReusesOnlyAfterDurableRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != base || allocator.AcquiredCount() != 0 {
+	if first != 1 || allocator.AcquiredCount() != 0 {
 		t.Fatalf("reservation address=%d acquired=%d", first, allocator.AcquiredCount())
 	}
 	if err := allocator.Publish(first); err != nil {
@@ -40,7 +40,7 @@ func TestBlockAllocatorPublishesAndReusesOnlyAfterDurableRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second != base+cluster.BlockSize {
+	if second != 2 {
 		t.Fatalf("pending release reused as %d", second)
 	}
 	if err := allocator.Forfeit(second); err != nil {

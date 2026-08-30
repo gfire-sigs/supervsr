@@ -47,7 +47,6 @@ func (candidate BlockCheckpointCandidate) SessionAddresses() []uint64 {
 
 type BlockAllocator struct {
 	storage    Storage
-	base       uint64
 	blockSize  uint64
 	limit      uint64
 	logical    uint64
@@ -120,7 +119,7 @@ func OpenBlockAllocator(storage Storage, cluster ClusterConfig, process ProcessC
 		}
 	}
 	return &BlockAllocator{
-		storage: storage, base: base, blockSize: cluster.BlockSize, limit: process.StorageSizeLimit,
+		storage: storage, blockSize: cluster.BlockSize, limit: process.StorageSizeLimit,
 		logical: state.LogicalStorageSize, blockCount: blockCount, maximum: maximum,
 		acquired: acquiredMax, released: releasedMax, reserved: reserved, pending: pending,
 		reservedReleased: reservedReleased, checkpoint: checkpoint,
@@ -452,14 +451,14 @@ func (allocator *BlockAllocator) prefix(set *FixedBitSet) FixedBitSet {
 }
 
 func (allocator *BlockAllocator) address(index uint64) uint64 {
-	return allocator.base + index*allocator.blockSize
+	return index + 1
 }
 
 func (allocator *BlockAllocator) index(address uint64) (uint64, bool) {
-	if address < allocator.base || (address-allocator.base)%allocator.blockSize != 0 {
+	if address == 0 {
 		return 0, false
 	}
-	index := (address - allocator.base) / allocator.blockSize
+	index := address - 1
 	return index, index < allocator.blockCount
 }
 

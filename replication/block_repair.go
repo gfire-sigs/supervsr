@@ -222,7 +222,11 @@ func (replica *Replica) startBlockRepairRead(targetIndex uint32) bool {
 			continue
 		}
 		target := &replica.blockRepairTargets[targetIndex]
-		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: target.reference.Address, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		offset, ok := replica.config.Cluster.BlockOffset(target.reference.Address)
+		if !ok {
+			return false
+		}
+		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}
@@ -296,7 +300,11 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 			return
 		}
 		copy(operation.buffer[protocol.HeaderSize:], body)
-		handle, err := replica.io.Submit(IOOperation{Kind: IOWrite, Offset: reference.Address, Buffer: operation.buffer})
+		offset, ok := replica.config.Cluster.BlockOffset(reference.Address)
+		if !ok {
+			return
+		}
+		handle, err := replica.io.Submit(IOOperation{Kind: IOWrite, Offset: offset, Buffer: operation.buffer})
 		if err != nil {
 			return
 		}

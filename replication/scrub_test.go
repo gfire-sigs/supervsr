@@ -49,11 +49,7 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 		Group: protocol.GroupID{1}, CurrentRelease: 1,
 		Membership: Membership{Members: [MembersMax]protocol.MemberID{{1}}, ActiveCount: 1, LocalMember: protocol.MemberID{1}},
 	}
-	base, ok := config.Cluster.BlockBase()
-	if !ok {
-		t.Fatal("block base overflow")
-	}
-	wrongHeader, _ := makeRepairBlock(t, config, base, 7)
+	wrongHeader, _ := makeRepairBlock(t, config, 1, 7)
 	wrongFrame := make([]byte, config.Cluster.BlockSize)
 	body := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	copy(wrongFrame[protocol.HeaderSize:], body)
@@ -61,7 +57,7 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := BlockRequirement{
-		Reference: BlockReference{Address: base, Checksum: protocol.Checksum{9}},
+		Reference: BlockReference{Address: 1, Checksum: protocol.Checksum{9}},
 		Type:      protocol.BlockFreeSet, Snapshot: 7, SnapshotExact: true, BodySize: uint32(len(body)),
 	}
 	validator := &resolvingBlockValidator{requirement: expected}
@@ -70,7 +66,7 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 		deps:         Dependencies{BlockValidator: validator},
 		blockCatalog: make([]BlockRequirement, 1), blockRepairTargets: make([]blockRepairTarget, 1),
 	}
-	operation := blockRepairIO{buffer: wrongFrame, address: base, busy: true, stage: blockRepairIOScrub}
+	operation := blockRepairIO{buffer: wrongFrame, address: 1, busy: true, stage: blockRepairIOScrub}
 	replica.finishScrubRead(&operation, IOCompletion{})
 	if validator.resolveCalls != 1 {
 		t.Fatalf("resolve calls=%d, want 1", validator.resolveCalls)

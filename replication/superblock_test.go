@@ -64,7 +64,7 @@ func TestCheckpointRejectsOversizedEWAHTrailer(t *testing.T) {
 	checkpointValidation := checkpointValidationFor(t, validation)
 	state := superblock.State.Checkpoint
 	state.LogicalStorageSize += validation.Cluster.BlockSize
-	state.AcquiredTrailerLastAddress = checkpointValidation.BlockBase
+	state.AcquiredTrailerLastAddress = 1
 	state.AcquiredTrailerLastChecksum = protocol.Checksum{1}
 	state.AcquiredAggregateChecksum = protocol.Checksum{2}
 	state.AcquiredTrailerEncodedSize = 24

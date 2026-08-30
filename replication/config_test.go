@@ -20,6 +20,27 @@ func TestDefaultConfigurationFingerprint(t *testing.T) {
 		t.Fatalf("default process configuration: %v", err)
 	}
 }
+func TestBlockOffsetUsesOneBasedLogicalAddresses(t *testing.T) {
+	config := compactTestClusterConfig()
+	base, ok := config.BlockBase()
+	if !ok {
+		t.Fatal("block base overflow")
+	}
+	first, ok := config.BlockOffset(1)
+	if !ok || first != base {
+		t.Fatalf("first block offset = %d valid=%t, want %d", first, ok, base)
+	}
+	second, ok := config.BlockOffset(2)
+	if !ok || second != base+config.BlockSize {
+		t.Fatalf("second block offset = %d valid=%t, want %d", second, ok, base+config.BlockSize)
+	}
+	if _, ok := config.BlockOffset(0); ok {
+		t.Fatal("zero block address accepted")
+	}
+	if _, ok := config.BlockOffset(^uint64(0)); ok {
+		t.Fatal("overflowing block address accepted")
+	}
+}
 
 func TestQuorumTable(t *testing.T) {
 	want := [...]Quorums{

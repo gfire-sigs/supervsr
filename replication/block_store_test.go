@@ -25,9 +25,16 @@ func TestBlockStoreWritesAndReadsManifestWithZeroPadding(t *testing.T) {
 	var metadata [96]byte
 	binary.LittleEndian.PutUint32(metadata[40:44], 1)
 	body := []byte("manifest-entry")
-	reference, err := store.Write(base, 7, protocol.BlockManifest, metadata, body)
+	reference, err := store.Write(1, 7, protocol.BlockManifest, metadata, body)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if reference.Address != 1 {
+		t.Fatalf("block address = %d, want 1", reference.Address)
+	}
+	header, reason := protocol.DecodeHeader(storage.working[base:base+protocol.HeaderSize], protocol.GroupID{1}, uint32(cluster.BlockSize), 1)
+	if reason != protocol.RejectNone || binary.LittleEndian.Uint64(header.Fields[96:104]) != 1 {
+		t.Fatalf("stored block address = %d reason = %d", binary.LittleEndian.Uint64(header.Fields[96:104]), reason)
 	}
 	destination := make([]byte, cluster.BlockSize)
 	result, err := store.Read(reference, protocol.BlockManifest, destination)
@@ -58,7 +65,7 @@ func TestBlockStoreRejectsWrongReferenceAndMalformedMetadata(t *testing.T) {
 	binary.LittleEndian.PutUint32(metadata[:4], 1)
 	binary.LittleEndian.PutUint32(metadata[4:8], 1)
 	binary.LittleEndian.PutUint32(metadata[8:12], 3)
-	reference, err := store.Write(base, 0, protocol.BlockValue, metadata, []byte{1, 2, 3})
+	reference, err := store.Write(1, 0, protocol.BlockValue, metadata, []byte{1, 2, 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +75,7 @@ func TestBlockStoreRejectsWrongReferenceAndMalformedMetadata(t *testing.T) {
 		t.Fatalf("wrong reference error = %v", err)
 	}
 	binary.LittleEndian.PutUint32(metadata[4:8], 2)
-	if _, err := store.Write(base, 0, protocol.BlockValue, metadata, []byte{1, 2, 3}); !errors.Is(err, ErrInvalidBlock) {
+	if _, err := store.Write(1, 0, protocol.BlockValue, metadata, []byte{1, 2, 3}); !errors.Is(err, ErrInvalidBlock) {
 		t.Fatalf("malformed body error = %v", err)
 	}
 }
