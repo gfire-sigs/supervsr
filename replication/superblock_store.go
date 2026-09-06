@@ -19,6 +19,7 @@ type SuperblockStore struct {
 	validation SuperblockValidation
 	current    SuperblockCandidate
 	buffer     []byte
+	ioActive   bool
 }
 
 func OpenSuperblockStore(storage Storage, validation SuperblockValidation, beforeRepair ...func(Superblock) error) (*SuperblockStore, error) {
@@ -121,6 +122,23 @@ func (store *SuperblockStore) Current() Superblock {
 func (store *SuperblockStore) Persist(next Superblock) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	var sequence ioSequence
+	if err := store.beginPersist(&sequence, &next); err != nil {
+		return err
+	}
+	defer func() { store.ioActive = false }()
+	for sequence.phase != IOPhaseCompletion {
+		if err := store.advancePersist(&sequence, &next); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *SuperblockStore) beginPersist(sequence *ioSequence, next *Superblock) error {
+	if store.ioActive {
+		return ErrIOBackpressure
+	}
 	current := &store.current.Superblock
 	if next.Sequence != current.Sequence+1 || next.ParentChecksum != current.Checksum || durableStateRegressed(&current.State, &next.State) {
 		return ErrInvalidSuperblock
@@ -128,24 +146,45 @@ func (store *SuperblockStore) Persist(next Superblock) error {
 	if err := next.Validate(store.validation); err != nil {
 		return err
 	}
-	writeCopies, ok := superblockWriteCopies(store.validation.Cluster.SuperblockCopies)
-	if !ok {
+	if _, ok := superblockWriteCopies(store.validation.Cluster.SuperblockCopies); !ok {
 		return ErrInvalidSuperblock
 	}
-	start := next.Sequence % store.validation.Cluster.SuperblockCopies
-	for step := range writeCopies {
-		physicalIndex := uint16((start + uint64(step)) % store.validation.Cluster.SuperblockCopies)
-		if err := next.Encode(store.buffer, physicalIndex, store.validation); err != nil {
-			return err
-		}
-		if err := store.storage.WriteAt(store.buffer, uint64(physicalIndex)*SuperblockBytes); err != nil {
-			return fmt.Errorf("%w: superblock copy %d: %w", ErrStorage, physicalIndex, err)
-		}
-		if err := store.storage.Sync(); err != nil {
-			return err
-		}
+	*sequence = ioSequence{storage: store.storage, index: next.Sequence % store.validation.Cluster.SuperblockCopies}
+	if err := store.prepareCopy(sequence, next); err != nil {
+		return err
 	}
-	store.current = SuperblockCandidate{Superblock: next, PhysicalIndex: uint16(start)}
+	store.ioActive = true
+	return nil
+}
+
+func (store *SuperblockStore) prepareCopy(sequence *ioSequence, next *Superblock) error {
+	physicalIndex := uint16((sequence.index + uint64(sequence.step)) % store.validation.Cluster.SuperblockCopies)
+	if err := next.Encode(store.buffer, physicalIndex, store.validation); err != nil {
+		return err
+	}
+	sequence.phase, sequence.buffer = IOPhaseWrite, store.buffer
+	sequence.offset, sequence.size = uint64(physicalIndex)*SuperblockBytes, SuperblockBytes
+	return nil
+}
+
+func (store *SuperblockStore) advancePersist(sequence *ioSequence, next *Superblock) error {
+	if err := sequence.physical(); err != nil {
+		if sequence.phase == IOPhaseWrite {
+			return fmt.Errorf("%w: superblock copy %d: %w", ErrStorage, sequence.offset/SuperblockBytes, err)
+		}
+		return err
+	}
+	if sequence.phase == IOPhaseWrite {
+		sequence.syncNext()
+		return nil
+	}
+	sequence.step++
+	writeCopies, _ := superblockWriteCopies(store.validation.Cluster.SuperblockCopies)
+	if int(sequence.step) < int(writeCopies) {
+		return store.prepareCopy(sequence, next)
+	}
+	store.current = SuperblockCandidate{Superblock: *next, PhysicalIndex: uint16(sequence.index)}
+	sequence.phase = IOPhaseCompletion
 	return nil
 }
 

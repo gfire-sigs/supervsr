@@ -19,30 +19,35 @@ const (
 )
 
 type stateSyncRuntime struct {
-	checkpoint     CheckpointState
-	headers        []protocol.Header
-	completion     SMCompletion
-	io             IOHandle
-	ioKind         IOKind
-	view           protocol.View
-	commit         protocol.Op
-	head           protocol.Op
-	generation     uint64
-	count          int
-	persistPhase   uint8
-	completionKind SMCompletionKind
-	stage          SyncStage
-	cancelStarted  bool
-	resetStarted   bool
-	resetDone      bool
-	persistDone    bool
-	repairing      bool
-	resumeRecovery bool
-	recovery       WALRecoveryReport
-	replayRunning  bool
-	recoveryState  Superblock
-	opening        bool
-	repliesPending bool
+	checkpoint          CheckpointState
+	headers             []protocol.Header
+	completion          SMCompletion
+	io                  IOHandle
+	ioKind              IOKind
+	view                protocol.View
+	commit              protocol.Op
+	head                protocol.Op
+	requestedCheckpoint protocol.Op
+	generation          uint64
+	count               int
+	persistPhase        uint8
+	completionKind      SMCompletionKind
+	stage               SyncStage
+	cancelStarted       bool
+	resetStarted        bool
+	resetDone           bool
+	persistDone         bool
+	repairing           bool
+	resumeRecovery      bool
+	recovery            WALRecoveryReport
+	replayRunning       bool
+	recoveryState       Superblock
+	opening             bool
+	repliesPending      bool
+}
+
+func (replica *Replica) stateSyncAwaitingOpen() bool {
+	return replica.stateSync.repairing && !replica.stateSync.repliesPending
 }
 
 func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol.View, commit, head protocol.Op, headers []protocol.Header) {
@@ -56,6 +61,7 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	clear(replica.stateSync.headers)
 	copy(replica.stateSync.headers, headers)
 	replica.stateSync.checkpoint = checkpoint
+	replica.stateSync.requestedCheckpoint = checkpoint.PrepareOp()
 	replica.stateSync.view = view
 	replica.stateSync.commit = commit
 	replica.stateSync.head = head
@@ -390,6 +396,9 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.stateSync.persistPhase = 0
 	replica.stateSync.persistDone = false
 	replica.stateSync.repairing = true
+	if target.Release != replica.config.CurrentRelease {
+		replica.beginReleaseActivation(target.Release)
+	}
 }
 
 func (replica *Replica) queueStateSyncRoots() bool {
@@ -592,9 +601,8 @@ func (replica *Replica) handleStateSyncCompletion(completion *SMCompletion, gene
 }
 
 type recoveryReplayResult struct {
-	commitMin protocol.Op
-	upgrades  recoveredUpgradeState
-	err       error
+	replayResult
+	err error
 }
 
 func (replica *Replica) finishStateSyncOpen() {
@@ -611,11 +619,16 @@ func (replica *Replica) resumeStateSyncLog() {
 		replica.finishInterruptedStateSyncOpen()
 		return
 	}
-	if replica.stateSync.resumeRecovery && replica.membership.ActiveCount == 1 {
-		replica.fail(ErrWALUncertainSolo)
+	if replica.stateSync.resumeRecovery {
+		replica.stateSync.resumeRecovery = false
+		if replica.membership.ActiveCount == 1 {
+			replica.fail(ErrWALUncertainSolo)
+			return
+		}
+		replica.status = StatusRecoveringHead
+		replica.requestView(replica.view, replica.deps.Clock.Now().Monotonic)
 		return
 	}
-	replica.stateSync.resumeRecovery = false
 	if replica.stateSync.head > replica.checkpoint.PrepareOp() {
 		if replica.stateSync.commit > replica.commitMin && replica.stateSync.head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
 			if !replica.beginRepairWindow(replica.stateSync.view, replica.stateSync.commit) {
@@ -655,17 +668,25 @@ func (replica *Replica) finishInterruptedStateSyncOpen() {
 	durable := replica.stateSync.recoveryState
 	recovery := replica.stateSync.recovery
 	checkpoint := replica.checkpoint
-	go func() {
-		defer replica.recoveryWorkers.Done()
-		result := recoveryReplayResult{commitMin: checkpoint.PrepareOp()}
+	replay := func() recoveryReplayResult {
+		result := recoveryReplayResult{replayResult: replayResult{commitMin: checkpoint.PrepareOp()}}
 		if recovery.FaultySlots == 0 {
 			startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
-			result.commitMin, result.upgrades, result.err = replayCommitted(
+			result.replayResult, result.err = replayCommitted(
 				ctx, replica.config, replica.deps.StateMachine, replica.wal, replica.replies, replica.sessions,
 				startup, result.commitMin, checkpoint.Release, durable.State.CommitMax,
 			)
 		}
-		replica.recoveryReady <- result
+		return result
+	}
+	if replica.deps.SynchronousIO || replica.deps.IOController != nil {
+		replica.finishInterruptedReplay(replay())
+		replica.recoveryWorkers.Done()
+		return
+	}
+	go func() {
+		defer replica.recoveryWorkers.Done()
+		replica.recoveryReady <- replay()
 		replica.signal()
 	}()
 }
@@ -706,6 +727,10 @@ func (replica *Replica) finishInterruptedReplay(result recoveryReplayResult) {
 	replica.lastCommitTimestamp = prepareTimestamp(&committed)
 	replica.upgradeTarget = result.upgrades.target
 	replica.upgradeWindow = result.upgrades.window
+	replica.checkpointSessionOp = result.checkpointSession.op
+	if result.checkpointSession.data != nil {
+		replica.checkpointSession = result.checkpointSession.data
+	}
 	if status == StatusRecoveringHead {
 		replica.headOp = headOp
 		replica.headChecksum = recovery.HeadHeader.HeaderChecksum

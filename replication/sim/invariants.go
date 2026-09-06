@@ -2,6 +2,7 @@ package sim
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,12 +24,13 @@ type observedClientEvents struct {
 	target    replication.ClientEvents
 	lastReply protocol.RequestNo
 	replied   bool
+	frame     []byte
 }
 
 func (events *observedClientEvents) Reply(reply replication.ClientReply) {
 	if events.replied && reply.Request <= events.lastReply {
 		events.cluster.failInvariant("client %x reply %d followed reply %d", events.client, reply.Request, events.lastReply)
-	} else if err := events.cluster.checkDurableReply(reply); err != nil {
+	} else if err := events.cluster.checkDurableReply(events.frame); err != nil {
 		events.cluster.failInvariant("client %x reply %d: %v", events.client, reply.Request, err)
 	}
 	events.lastReply = reply.Request
@@ -50,8 +52,8 @@ func (cluster *Cluster) CheckInvariants() error {
 		uint16(cluster.quorums.Replication)+uint16(cluster.quorums.Negative) <= uint16(active) {
 		return fmt.Errorf("%w: configured quorums do not intersect", ErrInvariant)
 	}
-	if uint64(len(cluster.clients)) > cluster.config.Cluster.ClientsMax {
-		return fmt.Errorf("%w: client count %d exceeds %d", ErrInvariant, len(cluster.clients), cluster.config.Cluster.ClientsMax)
+	if uint32(len(cluster.clients)) > cluster.config.ClientProcessesMax {
+		return fmt.Errorf("%w: client count %d exceeds %d", ErrInvariant, len(cluster.clients), cluster.config.ClientProcessesMax)
 	}
 	if cluster.network.Pending() > cluster.network.maximum {
 		return fmt.Errorf("%w: packet count exceeds capacity", ErrInvariant)
@@ -70,7 +72,18 @@ func (cluster *Cluster) CheckInvariants() error {
 		if err := cluster.checkReplicaSnapshot(protocol.ReplicaIndex(index), snapshot); err != nil {
 			return err
 		}
+		if node.controller != nil {
+			used := node.controller.Used()
+			if used < 0 || used > node.controller.Capacity() {
+				return fmt.Errorf("%w: replica %d IO capacity exceeded", ErrInvariant, index)
+			}
+		}
 		switch machine := node.machine.(type) {
+		case *LedgerMachine:
+			state := machine.Snapshot()
+			if state.LastOp > snapshot.HeadOp || state.Value > uint64(snapshot.HeadOp) {
+				return fmt.Errorf("%w: replica %d ledger exceeds log head", ErrInvariant, index)
+			}
 		case *Machine:
 			if err := checkMachineOrder(protocol.ReplicaIndex(index), machine, snapshot.HeadOp); err != nil {
 				return err
@@ -174,6 +187,18 @@ func checkCommitOrder(index protocol.ReplicaIndex, commits []Commit, commitMax p
 }
 
 func checkMachineAgreement(leftIndex, rightIndex int, leftMachine, rightMachine replication.StateMachine) error {
+	leftLedger, leftLedgerOK := leftMachine.(*LedgerMachine)
+	rightLedger, rightLedgerOK := rightMachine.(*LedgerMachine)
+	if leftLedgerOK && rightLedgerOK {
+		left, right := leftLedger.Snapshot(), rightLedger.Snapshot()
+		if left.LastOp == right.LastOp && left.Value != right.Value {
+			return fmt.Errorf("%w: replicas %d and %d disagree at ledger op %d: values %d and %d", ErrInvariant, leftIndex, rightIndex, left.LastOp, left.Value, right.Value)
+		}
+		if left.Value == right.Value && left.Digest != right.Digest {
+			return fmt.Errorf("%w: replicas %d and %d disagree on ledger prefix %d", ErrInvariant, leftIndex, rightIndex, left.Value)
+		}
+		return nil
+	}
 	leftDefault, leftDefaultOK := leftMachine.(*Machine)
 	rightDefault, rightDefaultOK := rightMachine.(*Machine)
 	if leftDefaultOK && rightDefaultOK {
@@ -212,84 +237,84 @@ func compareCommits(left, right int, leftCommits, rightCommits []Commit) error {
 	return nil
 }
 
-func (cluster *Cluster) checkDurableReply(reply replication.ClientReply) error {
-	if reply.Operation < protocol.OperationApplicationMin {
-		return nil
+func (cluster *Cluster) checkDurableReply(frame []byte) error {
+	reply, _, reason := protocol.DecodeFrame(frame, cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)))
+	if reason != protocol.RejectNone || reply.Command != protocol.CommandReply {
+		return fmt.Errorf("%w: accepted reply has no valid wire identity", ErrInvariant)
 	}
-	var candidateOp protocol.Op
+	op := protocol.Op(binary.LittleEndian.Uint64(reply.Fields[80:88]))
 	var expected protocol.Checksum
-	found := false
 	for index := range cluster.nodes {
-		op, ok := findReplyCommit(cluster.nodes[index].machine, reply)
-		if ok && (!found || op > candidateOp) {
-			candidateOp = op
-			found = true
-			expected = protocol.Checksum{}
+		node := &cluster.nodes[index]
+		if node.replica == nil || node.replica.Snapshot().CommitMin < op {
+			continue
 		}
-		if ok && op == candidateOp && cluster.nodes[index].replica != nil {
-			if checksum, durable := cluster.nodes[index].replica.DurableChecksum(op); durable {
-				if !expected.IsZero() && expected != checksum {
-					return fmt.Errorf("%w: executed reply conflicts at op %d", ErrInvariant, op)
-				}
+		if checksum, durable := node.replica.DurableChecksum(op); durable {
+			if !expected.IsZero() && expected != checksum {
+				return fmt.Errorf("%w: committed reply conflicts at op %d", ErrInvariant, op)
+			}
+			expected = checksum
+		}
+	}
+	if expected.IsZero() {
+		for index := range cluster.config.ActiveCount {
+			if checksum, found := cluster.durablePrepareForReply(int(index), reply); found {
 				expected = checksum
+				break
 			}
 		}
-	}
-	if !found {
-		return fmt.Errorf("%w: reply has no committed operation", ErrInvariant)
 	}
 	durable := uint8(0)
 	for index := range cluster.config.ActiveCount {
 		node := &cluster.nodes[index]
-		if node.replica == nil {
-			continue
+		checkpoint := node.lastCheckpoint
+		if node.replica != nil {
+			checkpoint = node.replica.Snapshot().Checkpoint
 		}
-		snapshot := node.replica.Snapshot()
-		if snapshot.Checkpoint.PrepareOp() >= candidateOp {
+		if checkpoint.PrepareOp() >= op {
 			durable++
 			continue
 		}
-		checksum, ok := node.replica.DurableChecksum(candidateOp)
-		if !ok {
-			continue
+		var checksum protocol.Checksum
+		var found bool
+		if node.replica != nil {
+			checksum, found = node.replica.DurableChecksum(op)
+		} else {
+			checksum, found = cluster.durablePrepareForReply(int(index), reply)
 		}
-		// An old-view minority may retain a different, uncommitted suffix.
-		if expected.IsZero() || checksum != expected {
-			continue
+		if found && !expected.IsZero() && checksum == expected {
+			durable++
 		}
-		durable++
 	}
 	if durable < cluster.quorums.Replication {
-		return fmt.Errorf("%w: reply at op %d has %d durable replicas", ErrInvariant, candidateOp, durable)
+		return fmt.Errorf("%w: reply op %d has %d durable replicas, need %d", ErrInvariant, op, durable, cluster.quorums.Replication)
 	}
 	return nil
 }
 
-func findReplyCommit(stateMachine replication.StateMachine, reply replication.ClientReply) (protocol.Op, bool) {
-	if machine, ok := stateMachine.(*Machine); ok {
-		machine.mu.Lock()
-		defer machine.mu.Unlock()
-		return findCommit(machine.commits, reply)
+func (cluster *Cluster) durablePrepareForReply(index int, reply protocol.Header) (protocol.Checksum, bool) {
+	op := binary.LittleEndian.Uint64(reply.Fields[80:88])
+	offset := cluster.layout.PrepareBase + (op%cluster.config.Cluster.JournalSlots)*cluster.layout.PrepareStride
+	storage := cluster.stores[index]
+	storage.mu.Lock()
+	if offset > uint64(len(storage.durable)) || uint64(len(cluster.proofBuffer)) > uint64(len(storage.durable))-offset {
+		storage.mu.Unlock()
+		return protocol.Checksum{}, false
 	}
-	observer, ok := stateMachine.(interface{ Commits() []Commit })
-	if !ok {
-		return 0, false
+	copy(cluster.proofBuffer, storage.durable[offset:offset+uint64(len(cluster.proofBuffer))])
+	storage.mu.Unlock()
+	size := binary.LittleEndian.Uint32(cluster.proofBuffer[96:100])
+	if size < protocol.HeaderSize || uint64(size) > uint64(len(cluster.proofBuffer)) {
+		return protocol.Checksum{}, false
 	}
-	return findCommit(observer.Commits(), reply)
-}
-
-func findCommit(commits []Commit, reply replication.ClientReply) (protocol.Op, bool) {
-	var op protocol.Op
-	found := false
-	for _, commit := range commits {
-		sameReply := commit.Operation == reply.Operation && bytes.Equal(commit.Body, reply.Body)
-		newer := !found || commit.Op > op
-		if sameReply && newer {
-			op = commit.Op
-			found = true
-		}
+	header, _, reason := protocol.DecodeFrame(cluster.proofBuffer[:size], cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)))
+	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
+		return protocol.Checksum{}, false
 	}
-	return op, found
+	identity := bytes.Equal(header.Fields[32:48], reply.Fields[:16]) && bytes.Equal(header.Fields[80:96], reply.Fields[64:80])
+	position := bytes.Equal(header.Fields[96:104], reply.Fields[80:88]) && bytes.Equal(header.Fields[112:120], reply.Fields[96:104])
+	request := bytes.Equal(header.Fields[120:125], reply.Fields[104:109]) && header.Release == reply.Release
+	return header.HeaderChecksum, identity && position && request
 }
 
 func (cluster *Cluster) failInvariant(format string, arguments ...any) {

@@ -11,6 +11,18 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 	if header.View < replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
 		return false
 	}
+	if replica.stateSyncAwaitingOpen() {
+		switch header.Command {
+		case protocol.CommandPrepare, protocol.CommandCommit, protocol.CommandExitView, protocol.CommandJoinView:
+			replica.requestView(header.View, replica.deps.Clock.Now().Monotonic)
+			return true
+		case protocol.CommandPing, protocol.CommandPong:
+			if header.View > replica.view {
+				replica.requestView(header.View, replica.deps.Clock.Now().Monotonic)
+			}
+			return false
+		}
+	}
 	switch header.Command {
 	case protocol.CommandPrepare, protocol.CommandCommit:
 		if header.Command == protocol.CommandPrepare && replica.repairHeaderValid && header.HeaderChecksum == replica.repairHeader.HeaderChecksum {
@@ -581,6 +593,9 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		tail--
 	}
 	if prepareOp(&replica.canonicalHeaders[tail]) > commit+1 {
+		return
+	}
+	if replica.stateSyncAwaitingOpen() && checkpoint.PrepareOp() == replica.checkpoint.PrepareOp() {
 		return
 	}
 	if checkpoint.PrepareOp() > replica.checkpoint.PrepareOp() {

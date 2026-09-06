@@ -6,6 +6,32 @@ A nonzero durable sync range is recovery authority, not evidence that the newly 
 
 After reopening the checkpoint and repairing referenced blocks, an unavailable committed suffix enters canonical WAL repair instead of application replay against missing prepares. A solo member cannot resolve that uncertainty and stops. Latest-reply verification follows committed replay: peers retain only one latest reply per session and may already have overwritten checkpoint-era bodies. The durable sync range remains outstanding until the resulting latest bodies are verified or repaired. A superseding sync drains physical I/O before replacing the checkpoint and preserves the earliest outstanding sync minimum.
 
+Checkpoint block repair and state-machine open form an execution barrier. View
+evidence may update observations or select a newer checkpoint, but it must not
+start canonical suffix execution against a checkpoint that has not opened yet.
+Controlled I/O exposed skipped ledger effects when suffix execution ran before
+StartOpen and was then overwritten by the restored checkpoint state.
+
+Replay also retains the session-table snapshot at the next checkpoint boundary.
+When the checkpoint interval equals the compaction lag, publishing one checkpoint
+must capture the next boundary at the same operation. Otherwise a restart or
+adjacent checkpoint trigger loses the required historical session snapshot.
+These boundaries are exercised by the persistent ledger and controlled long campaigns.
+
+A crash can persist sync intent while leaving the old checkpoint selected.
+Persisted view-change suffixes are not complete wire `View` proofs. Restart keeps
+the stored log view, reopens the selected checkpoint, and either replays verified
+WAL or requests a fresh canonical View. If the intended newer checkpoint has not
+been installed, checkpoint selection continues while old content is repaired.
+`TestInterruptedViewPersistenceRecoverySeed6` preserves the exposed boundary.
+
+When state synchronization durably installs a checkpoint for a different release,
+the replica drains and invokes the release executor before interpreting that
+release's blocks or state machine. Activation does not require a completed normal
+checkpoint pipeline entry. The durable sync range lets the target release resume
+unfinished repair after handoff. `TestStateSyncActivatesCheckpointReleaseBeforeOpeningBlocks`
+and the process handoff tests cover this path.
+
 ## Sections 9.3, 18.4: trailer chain lengths
 
 Trailer payloads are not required to fill every block before the final block. In particular, the existing writer evenly divides an encoding over its reserved addresses. State synchronization accepts each checksummed block's actual nonempty payload length, subtracts it from the remaining aggregate length, and requires chain termination exactly when that length reaches zero. Opening still verifies the aggregate checksum and trailer schema.

@@ -348,9 +348,6 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	}
 
 	replica.beginReleaseActivation(2)
-	if replica.pipelineLen != 1 {
-		t.Fatalf("pipeline length after checkpoint release = %d, want 1", replica.pipelineLen)
-	}
 	if _, err := replica.Process(64); err != nil {
 		t.Fatal(err)
 	}

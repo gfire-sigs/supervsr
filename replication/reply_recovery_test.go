@@ -34,7 +34,7 @@ func replyRecoveryFixture(t testing.TB) (*Replica, *crashStorage, *captureBus) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := newIOEngine(storage, 4, 1, true)
+	engine, err := newIOEngine(storage, 4, 1, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

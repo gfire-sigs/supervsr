@@ -592,6 +592,9 @@ func (replica *Replica) handleCommit(header protocol.Header, sample TimeSample) 
 }
 
 func (replica *Replica) advanceCommit() {
+	if replica.stateSyncAwaitingOpen() {
+		return
+	}
 	recoveringCommit := replica.status == StatusRecoveringHead && replica.repairViewValid && replica.repairViewRebuilt
 	invalidStatus := replica.status != StatusNormal && !recoveringCommit
 	unavailable := replica.pipelineLen == 0 || replica.fatalErr != nil || replica.replyRepairBlocksCommit()

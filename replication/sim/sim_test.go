@@ -925,8 +925,8 @@ func driveUntilClusterStage(cluster *Cluster, advanceTime bool, reached func() b
 				clock.Advance(cluster.config.Process.Tick)
 			}
 			cluster.network.Advance()
-			for _, client := range cluster.clients {
-				if err := client.Tick(); err != nil {
+			for _, process := range cluster.clients {
+				if err := process.client.Tick(); err != nil {
 					return err
 				}
 				if reached() {

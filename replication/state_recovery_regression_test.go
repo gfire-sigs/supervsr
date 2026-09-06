@@ -139,7 +139,7 @@ func TestStateSyncAcceptsEvenlySplitClientTrailer(t *testing.T) {
 	if err := target.Resize(uint64(len(source.working))); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := newIOEngine(target, 2, 1, true)
+	engine, err := newIOEngine(target, 2, 1, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,5 +202,63 @@ func TestStateSyncAcceptsEvenlySplitClientTrailer(t *testing.T) {
 	}
 	if !bytes.Equal(decoded, encoded) {
 		t.Fatal("multi-block sync changed trailer bytes")
+	}
+}
+
+func TestStateSyncActivatesCheckpointReleaseBeforeOpeningBlocks(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	handoff := errors.New("target release started")
+	executor := &testReleaseExecutor{releases: []protocol.Release{1, 2}, err: handoff}
+	machine := &testStateMachine{capacities: StateMachineCapacities{
+		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+	}}
+	replica, err := newReplica(config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
+		Entropy: bytes.NewReader(make([]byte, 8)), StateMachine: machine, ReleaseExecutor: executor, SynchronousIO: true,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeReplica(t, replica)
+	target := initial.Checkpoint
+	op, valid := checkpointAfter(config.Cluster, 0)
+	if !valid {
+		t.Fatal("invalid checkpoint boundary")
+	}
+	frame := connectedPrepareFrame(t, config.Cluster, initial.HeadHeader, op)
+	header, _, reason := protocol.DecodeFrame(frame, protocol.GroupID{1}, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone {
+		t.Fatal(reason)
+	}
+	header.Group = config.Group
+	if err := protocol.SealFrame(frame, &header); err != nil {
+		t.Fatal(err)
+	}
+	copy(target.Header[:], frame[:protocol.HeaderSize])
+	target.ParentID, err = initial.Checkpoint.ID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Release = 2
+	next := superblocks.Current()
+	next.ParentChecksum = next.Checksum
+	next.Sequence++
+	next.State.Checkpoint = target
+	next.State.CommitMax = op
+	next.State.SyncMin, next.State.SyncMax = 1, op
+	next.ViewHeaderCount = 1
+	next.ViewHeaders[0] = target.Header
+	if err := superblocks.Persist(next); err != nil {
+		t.Fatal(err)
+	}
+	replica.stateSync.checkpoint, replica.stateSync.commit, replica.stateSync.head = target, op, op
+	operations := storage.operation
+	replica.installStateSyncCheckpoint()
+	if _, err := replica.Process(64); !errors.Is(err, handoff) {
+		t.Fatalf("release handoff: %v", err)
+	}
+	if executor.calls != 1 || executor.target != 2 || machine.openBlocks || storage.operation != operations {
+		t.Fatalf("foreign checkpoint interpreted before handoff: calls=%d target=%d opened=%t IO=%d want=%d", executor.calls, executor.target, machine.openBlocks, storage.operation, operations)
 	}
 }

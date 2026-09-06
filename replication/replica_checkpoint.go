@@ -300,6 +300,18 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		return
 	}
 	replica.checkpointSessionOp = 0
+	nextCheckpoint, valid := checkpointAfter(replica.config.Cluster, replica.checkpoint.PrepareOp())
+	if !valid {
+		replica.fail(ErrReplicaInvariant)
+		return
+	}
+	if prepareOp(&entry.header) == nextCheckpoint {
+		if _, err := replica.sessions.EncodeTrailer(replica.checkpointSession); err != nil {
+			replica.fail(err)
+			return
+		}
+		replica.checkpointSessionOp = nextCheckpoint
+	}
 	replica.checkpointTarget = 0
 	replica.checkpointTargetRelease = 0
 	replica.checkpointCandidate = BlockCheckpointCandidate{}
@@ -310,6 +322,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		replica.syncRangeRepaired = false
 	}
 	if targetRelease != replica.config.CurrentRelease {
+		replica.popPipeline()
 		replica.beginReleaseActivation(targetRelease)
 		return
 	}

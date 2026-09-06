@@ -279,7 +279,6 @@ func (replica *Replica) beginReleaseActivation(target protocol.Release) {
 		return
 	}
 	replica.accepting.Store(false)
-	replica.popPipeline()
 	replica.stage = CommitStageIdle
 	replica.releaseActivation = target
 	replica.releaseResetGeneration++

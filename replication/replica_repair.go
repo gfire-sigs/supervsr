@@ -261,7 +261,13 @@ func (replica *Replica) sendRepairFrame(peer protocol.ReplicaIndex, frame []byte
 }
 
 func (replica *Replica) handleRepairTimeout(sample TimeSample) {
+	if replica.stateSync.requestedCheckpoint > replica.checkpoint.PrepareOp() {
+		replica.sendGetView(sample.Monotonic)
+	}
 	if replica.continueBlockRepair(sample.Monotonic) {
+		return
+	}
+	if replica.stateSyncAwaitingOpen() {
 		return
 	}
 	if replica.stateSync.repliesPending && replica.continueReplyRepair(sample.Monotonic) {

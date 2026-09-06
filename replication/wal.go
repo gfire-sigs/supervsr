@@ -103,6 +103,7 @@ type WAL struct {
 	slots         []WALSlot
 	headerRing    []byte
 	prepareBuffer []byte
+	ioActive      bool
 }
 
 func NewWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCount uint8) (*WAL, error) {
@@ -147,6 +148,23 @@ func (wal *WAL) Layout() WALLayout {
 func (wal *WAL) Append(frame []byte, reusableThrough protocol.Op) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
+	var sequence ioSequence
+	if err := wal.beginAppend(&sequence, frame, reusableThrough); err != nil {
+		return err
+	}
+	defer func() { wal.ioActive = false }()
+	for sequence.phase != IOPhaseCompletion {
+		if err := wal.advanceAppend(&sequence, frame); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (wal *WAL) beginAppend(sequence *ioSequence, frame []byte, reusableThrough protocol.Op) error {
+	if wal.ioActive {
+		return ErrIOBackpressure
+	}
 	header, _, reason := protocol.DecodeFrame(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidWAL
@@ -157,46 +175,50 @@ func (wal *WAL) Append(frame []byte, reusableThrough protocol.Op) error {
 	if slot.Inhabited && slot.Op != op && slot.Op > reusableThrough {
 		return ErrWALSlotUnsafe
 	}
-
 	slot.Generation++
-	generation := slot.Generation
 	copy(slot.Authoritative[:], frame[:protocol.HeaderSize])
 	slot.Op = op
 	slot.Dirty = true
 	clear(wal.prepareBuffer)
 	copy(wal.prepareBuffer, frame)
-	prepareOffset, ok := checkedMul(index, wal.layout.PrepareStride)
-	if ok {
-		prepareOffset, ok = checkedAdd(wal.layout.PrepareBase, prepareOffset)
-	}
+	prepareOffset, ok := wal.prepareOffset(index)
 	if !ok {
 		return ErrInvalidWAL
 	}
-	if err := wal.storage.WriteAt(wal.prepareBuffer, prepareOffset); err != nil {
-		return fmt.Errorf("%w: prepare op %d: %w", ErrStorage, op, err)
-	}
-	if err := wal.storage.Sync(); err != nil {
-		return fmt.Errorf("%w: durable prepare op %d: %w", ErrStorage, op, err)
-	}
+	*sequence = ioSequence{phase: IOPhaseWrite, storage: wal.storage, buffer: wal.prepareBuffer, offset: prepareOffset, size: uint64(len(wal.prepareBuffer)), index: index, generation: slot.Generation, checksum: header.HeaderChecksum}
+	wal.ioActive = true
+	return nil
+}
 
-	headerOffset := index * protocol.HeaderSize
-	copy(wal.headerRing[headerOffset:headerOffset+protocol.HeaderSize], slot.Authoritative[:])
-	sectorOffset := headerOffset &^ (SectorSize - 1)
-	sector := wal.headerRing[sectorOffset : sectorOffset+SectorSize]
-	if err := wal.storage.WriteAt(sector, wal.layout.HeaderBase+sectorOffset); err != nil {
-		return fmt.Errorf("%w: header op %d: %w", ErrStorage, op, err)
+func (wal *WAL) advanceAppend(sequence *ioSequence, frame []byte) error {
+	slot := &wal.slots[sequence.index]
+	if err := sequence.physical(); err != nil {
+		labels := [...]string{"prepare", "durable prepare", "header", "durable header"}
+		return fmt.Errorf("%w: %s op %d: %w", ErrStorage, labels[sequence.step], slot.Op, err)
 	}
-	if err := wal.storage.Sync(); err != nil {
-		return fmt.Errorf("%w: durable header op %d: %w", ErrStorage, op, err)
+	switch sequence.step {
+	case 0, 2:
+		sequence.syncNext()
+	case 1:
+		headerOffset := sequence.index * protocol.HeaderSize
+		copy(wal.headerRing[headerOffset:headerOffset+protocol.HeaderSize], frame[:protocol.HeaderSize])
+		sectorOffset := headerOffset &^ (SectorSize - 1)
+		sequence.phase = IOPhaseWrite
+		sequence.buffer = wal.headerRing[sectorOffset : sectorOffset+SectorSize]
+		sequence.offset = wal.layout.HeaderBase + sectorOffset
+		sequence.size = SectorSize
+	case 3:
+		if slot.Generation != sequence.generation || slot.Authoritative != [protocol.HeaderSize]byte(frame[:protocol.HeaderSize]) {
+			return ErrInvalidWAL
+		}
+		slot.Redundant = slot.Authoritative
+		slot.PrepareChecksum = sequence.checksum
+		slot.Inhabited = true
+		slot.Dirty = false
+		slot.Faulty = false
+		sequence.phase = IOPhaseCompletion
 	}
-	if slot.Generation != generation || slot.Authoritative != [protocol.HeaderSize]byte(frame[:protocol.HeaderSize]) {
-		return ErrInvalidWAL
-	}
-	slot.Redundant = slot.Authoritative
-	slot.PrepareChecksum = header.HeaderChecksum
-	slot.Inhabited = true
-	slot.Dirty = false
-	slot.Faulty = false
+	sequence.step++
 	return nil
 }
 

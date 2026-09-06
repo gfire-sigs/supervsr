@@ -95,7 +95,7 @@ func TestSynchronousIOEngineCompletesInline(t *testing.T) {
 	if err := storage.Resize(1); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := newIOEngine(storage, 1, 0, true)
+	engine, err := newIOEngine(storage, 1, 0, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

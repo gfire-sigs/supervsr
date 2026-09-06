@@ -124,6 +124,12 @@ func (network *Network) RegisterClient(id protocol.ClientID, handle func(protoco
 	return nil
 }
 
+func (network *Network) UnregisterClient(id protocol.ClientID) {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	delete(network.clients, id)
+}
+
 func (network *Network) Partition(left, right protocol.ReplicaIndex) error {
 	return network.setLink(left, right, false)
 }

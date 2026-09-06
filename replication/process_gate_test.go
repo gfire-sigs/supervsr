@@ -26,6 +26,8 @@ const (
 	processReplicaHelperEnvironment = "SUPERVSR_PROCESS_REPLICA_HELPER"
 	processReplicaDirectory         = "SUPERVSR_PROCESS_REPLICA_DIRECTORY"
 	processReplicaIndex             = "SUPERVSR_PROCESS_REPLICA_INDEX"
+	processReplicaRelease           = "SUPERVSR_PROCESS_REPLICA_RELEASE"
+	processReplicaUpgrade           = "SUPERVSR_PROCESS_REPLICA_UPGRADE"
 )
 
 type processCrashStage uint32
@@ -53,15 +55,16 @@ func (stage processCrashStage) String() string {
 }
 
 type processWireMessage struct {
-	Kind   string            `json:"kind"`
-	Stage  processCrashStage `json:"stage,omitempty"`
-	From   uint8             `json:"from,omitempty"`
-	To     uint8             `json:"to,omitempty"`
-	Source string            `json:"source,omitempty"`
-	Frame  []byte            `json:"frame,omitempty"`
-	Op     uint64            `json:"op,omitempty"`
-	View   uint32            `json:"view,omitempty"`
-	Error  string            `json:"error,omitempty"`
+	Kind    string            `json:"kind"`
+	Stage   processCrashStage `json:"stage,omitempty"`
+	From    uint8             `json:"from,omitempty"`
+	To      uint8             `json:"to,omitempty"`
+	Source  string            `json:"source,omitempty"`
+	Frame   []byte            `json:"frame,omitempty"`
+	Op      uint64            `json:"op,omitempty"`
+	View    uint32            `json:"view,omitempty"`
+	Error   string            `json:"error,omitempty"`
+	Release protocol.Release  `json:"release,omitempty"`
 }
 
 type processEmitter struct {
@@ -336,11 +339,21 @@ func runReplicaProcessHelper() error {
 		return err
 	}
 	config := processGateReplicaConfig(index)
+	release := protocol.Release(1)
+	if value := os.Getenv(processReplicaRelease); value != "" {
+		parsed, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || parsed == 0 {
+			return errors.Join(ErrInvalidConfiguration, err, storage.Close())
+		}
+		release = protocol.Release(parsed)
+	}
+	config.CurrentRelease = release
+	executor := &processReleaseExecutor{current: release, mode: os.Getenv(processReplicaUpgrade), emitter: emitter, exit: make(chan struct{})}
 	bus := &processReplicaBus{index: index, activeCount: 3, gate: gate, emitter: emitter}
 	logger := zerolog.Nop()
 	replica, err := Open(context.Background(), config, Dependencies{
 		Storage: gatedStorage, MessageBus: bus, Clock: newProcessGateClock(), Entropy: bytes.NewReader(bytes.Repeat([]byte{byte(index) + 1}, 32)),
-		StateMachine: machine, Logger: &logger,
+		StateMachine: machine, Logger: &logger, ReleaseExecutor: executor,
 	})
 	if err != nil {
 		_ = storage.Close()
@@ -357,14 +370,33 @@ func runReplicaProcessHelper() error {
 	}
 	runDone := make(chan error, 1)
 	go func() { runDone <- replica.Run(context.Background()) }()
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4096), 256<<10)
-	for scanner.Scan() {
+	commands := make(chan processWireMessage)
+	inputErrors := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 4096), 256<<10)
+		for scanner.Scan() {
+			var command processWireMessage
+			if err := json.Unmarshal(scanner.Bytes(), &command); err != nil {
+				inputErrors <- err
+				return
+			}
+			commands <- command
+		}
+		inputErrors <- scanner.Err()
+	}()
+	for {
 		var command processWireMessage
-		if err := json.Unmarshal(scanner.Bytes(), &command); err != nil {
-			return err
+		select {
+		case command = <-commands:
+		case err := <-inputErrors:
+			return errors.Join(err, replica.Close(context.Background()))
+		case err := <-runDone:
+			return errors.Join(err, replica.Close(context.Background()))
 		}
 		switch command.Kind {
+		case "handoff_exit":
+			close(executor.exit)
 		case "arm":
 			gate.arm(command.Stage)
 			if err := emitter.emit(processWireMessage{Kind: "armed", Stage: command.Stage, From: uint8(index)}); err != nil {
@@ -387,6 +419,12 @@ func runReplicaProcessHelper() error {
 				if frame != nil {
 					frame.Release()
 				}
+				if errors.Is(err, ErrReplicaClosed) && executor.mode != "" {
+					if emitErr := emitter.emit(processWireMessage{Kind: "release_rejected_frame", Error: err.Error()}); emitErr != nil {
+						return errors.Join(err, emitErr)
+					}
+					continue
+				}
 				return err
 			}
 		case "stop":
@@ -401,13 +439,7 @@ func runReplicaProcessHelper() error {
 		default:
 			return ErrInvalidConfiguration
 		}
-		select {
-		case runErr := <-runDone:
-			return runErr
-		default:
-		}
 	}
-	return scanner.Err()
 }
 
 type processGateClock struct {
@@ -496,16 +528,23 @@ func (buffer *processLockedBuffer) String() string {
 }
 
 type replicaChildProcess struct {
-	index   protocol.ReplicaIndex
-	command *exec.Cmd
-	input   io.WriteCloser
-	encoder *json.Encoder
-	events  chan<- processReplicaEvent
-	stderr  processLockedBuffer
-	writeMu sync.Mutex
+	index        protocol.ReplicaIndex
+	command      *exec.Cmd
+	input        io.WriteCloser
+	encoder      *json.Encoder
+	events       chan<- processReplicaEvent
+	stderr       processLockedBuffer
+	writeMu      sync.Mutex
+	readerDone   chan struct{}
+	readerCancel chan struct{}
 }
 
 func startReplicaChild(t testing.TB, directory string, index protocol.ReplicaIndex, events chan<- processReplicaEvent) *replicaChildProcess {
+	t.Helper()
+	return startReplicaChildRelease(t, directory, index, events, 1, "")
+}
+
+func startReplicaChildRelease(t testing.TB, directory string, index protocol.ReplicaIndex, events chan<- processReplicaEvent, release protocol.Release, upgrade string) *replicaChildProcess {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
@@ -515,6 +554,7 @@ func startReplicaChild(t testing.TB, directory string, index protocol.ReplicaInd
 	command.Env = append(os.Environ(),
 		processReplicaHelperEnvironment+"=1", processReplicaDirectory+"="+directory,
 		processReplicaIndex+"="+strconv.FormatUint(uint64(index), 10),
+		processReplicaRelease+"="+strconv.FormatUint(uint64(release), 10), processReplicaUpgrade+"="+upgrade,
 	)
 	input, err := command.StdinPipe()
 	if err != nil {
@@ -522,25 +562,29 @@ func startReplicaChild(t testing.TB, directory string, index protocol.ReplicaInd
 	}
 	output, err := command.StdoutPipe()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal(errors.Join(err, input.Close()))
 	}
-	process := &replicaChildProcess{index: index, command: command, input: input, encoder: json.NewEncoder(input), events: events}
+	process := &replicaChildProcess{index: index, command: command, input: input, encoder: json.NewEncoder(input), events: events, readerDone: make(chan struct{}), readerCancel: make(chan struct{})}
 	command.Stderr = &process.stderr
 	if err := command.Start(); err != nil {
-		t.Fatal(err)
+		t.Fatal(errors.Join(err, input.Close(), output.Close()))
 	}
 	go process.readEvents(output)
 	return process
 }
 
 func (process *replicaChildProcess) readEvents(output io.Reader) {
+	defer close(process.readerDone)
 	decoder := json.NewDecoder(output)
 	for {
 		var message processWireMessage
 		if err := decoder.Decode(&message); err != nil {
 			return
 		}
-		process.events <- processReplicaEvent{process: process, message: message}
+		select {
+		case process.events <- processReplicaEvent{process: process, message: message}:
+		case <-process.readerCancel:
+		}
 	}
 }
 
@@ -551,32 +595,37 @@ func (process *replicaChildProcess) send(message processWireMessage) error {
 }
 
 func (process *replicaChildProcess) kill() error {
-	if err := process.command.Process.Kill(); err != nil {
-		return err
+	close(process.readerCancel)
+	killErr := process.command.Process.Kill()
+	waitErr := process.command.Wait()
+	<-process.readerDone
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) && !exitErr.Success() {
+		waitErr = nil
+	} else if waitErr == nil {
+		waitErr = errors.New("killed replica process exited successfully")
 	}
-	if err := process.command.Wait(); err == nil {
-		return errors.New("killed replica process exited successfully")
-	}
-	return nil
+	return errors.Join(killErr, waitErr)
 }
 
 func (process *replicaChildProcess) stop() error {
 	if err := process.send(processWireMessage{Kind: "stop"}); err != nil {
-		return err
+		return errors.Join(err, process.kill())
 	}
+	close(process.readerCancel)
 	waited := make(chan error, 1)
 	go func() { waited <- process.command.Wait() }()
+	var err error
 	select {
-	case err := <-waited:
-		if err != nil {
-			return fmt.Errorf("replica %d stop: %w: %s", process.index, err, process.stderr.String())
-		}
-		return nil
+	case err = <-waited:
 	case <-time.After(30 * time.Second):
-		_ = process.command.Process.Kill()
-		<-waited
-		return fmt.Errorf("replica %d stop timed out: %s", process.index, process.stderr.String())
+		err = errors.Join(errors.New("stop timed out"), process.command.Process.Kill(), <-waited)
 	}
+	<-process.readerDone
+	if err != nil {
+		return fmt.Errorf("replica %d stop: %w: %s", process.index, err, process.stderr.String())
+	}
+	return nil
 }
 
 type processClientEvents struct {
@@ -608,6 +657,7 @@ type processClusterHarness struct {
 	clock          *processGateClock
 	lastReplyFrom  protocol.ReplicaIndex
 	lastReplyView  protocol.View
+	handoff        [3]processWireMessage
 }
 
 func newProcessClusterHarness(t testing.TB) *processClusterHarness {
@@ -675,6 +725,10 @@ func (cluster *processClusterHarness) route(event processReplicaEvent) {
 		cluster.armed[index] = message.Stage
 	case "stage":
 		cluster.stage = message
+	case "handoff":
+		cluster.handoff[index] = message
+	case "release_rejected_frame":
+		cluster.t.Logf("replica %d rejected transport frame during release activation: %s", index, message.Error)
 	case "replica_frame":
 		if cluster.dropFromActive && index == cluster.dropFrom && protocol.ReplicaIndex(message.To) != index {
 			return
@@ -723,7 +777,7 @@ func (cluster *processClusterHarness) wait(timeout time.Duration, ready func() b
 			if cluster.clientEvents != nil {
 				replies = len(cluster.clientEvents.replies)
 			}
-			cluster.t.Fatalf("process gate timed out: stage=%s replies=%d stderr=%s", cluster.stage.Stage, replies, cluster.stderr())
+			cluster.t.Fatalf("process gate timed out: stage=%s replies=%d ready=%v handoff=%+v stderr=%s", cluster.stage.Stage, replies, cluster.ready, cluster.handoff, cluster.stderr())
 		}
 	}
 }
@@ -793,7 +847,9 @@ func (cluster *processClusterHarness) waitApplied(key string) {
 
 func (cluster *processClusterHarness) close() {
 	if cluster.client != nil {
-		_ = cluster.client.Close()
+		if err := cluster.client.Close(); err != nil {
+			cluster.t.Error(err)
+		}
 	}
 	for index := range cluster.processes {
 		process := cluster.processes[index]
@@ -830,6 +886,7 @@ func (bus processHarnessClientBus) SendReplica(to protocol.ReplicaIndex, message
 	}
 	frame, err := message.Bytes()
 	if err != nil {
+		bus.cluster.t.Fatal(err)
 		return
 	}
 	if err := process.send(processWireMessage{Kind: "frame", Source: "client", Frame: frame}); err != nil {

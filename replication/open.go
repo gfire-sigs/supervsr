@@ -111,6 +111,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	}
 	commitMin := durable.State.Checkpoint.PrepareOp()
 	var upgrades recoveredUpgradeState
+	var replayed replayResult
 	if !resumeStateSync {
 		startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
 		if err := startOpenStateMachine(ctx, dependencies.StateMachine, durable.State.Checkpoint, newCheckpointBlockReader(blocks.allocator, blocks.store), startup); err != nil {
@@ -121,10 +122,11 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 			if targetErr != nil {
 				return nil, targetErr
 			}
-			commitMin, upgrades, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, replayTarget)
+			replayed, err = replayCommitted(ctx, config, dependencies.StateMachine, wal, replyStore, sessions, startup, commitMin, durable.State.Checkpoint.Release, replayTarget)
 			if err != nil {
 				return nil, err
 			}
+			commitMin, upgrades = replayed.commitMin, replayed.upgrades
 		}
 	}
 	var initial ReplicaInitialState
@@ -136,6 +138,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	if err != nil {
 		return nil, err
 	}
+	initial.checkpointSession = replayed.checkpointSession
 	replica, err = newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, blocks)
 	if err != nil {
 		return nil, err
@@ -230,19 +233,18 @@ func (replica *Replica) resumeInterruptedStateSync(durable Superblock, recovery 
 	replica.stateSync.checkpoint = durable.State.Checkpoint
 	replica.stateSync.view = durable.State.View
 	replica.stateSync.commit = durable.State.CommitMax
-	replica.stateSync.head = prepareOp(&replica.stateSync.headers[0])
+	replica.stateSync.head = max(durable.State.Checkpoint.PrepareOp(), recovery.HeadOp, prepareOp(&replica.stateSync.headers[0]))
 	replica.stateSync.count = count
-	copy(replica.canonicalHeaders, replica.stateSync.headers[:count])
-	if !replica.validStateSyncView(durable.State.Checkpoint, replica.stateSync.head, min(replica.stateSync.commit, replica.stateSync.head), count) {
-		return ErrInvalidSuperblock
-	}
+	// Stored view-change headers are hints, not a complete remote View proof.
+	// Missing WAL is resolved through a fresh View after the checkpoint opens.
 	replica.stateSync.resumeRecovery = true
 	replica.stateSync.recovery = recovery
 	replica.stateSync.recoveryState = durable
-	replica.installStateSyncCheckpoint()
-	if replica.fatalErr != nil {
-		return replica.fatalErr
-	}
+	replica.stateSync.requestedCheckpoint = durable.State.SyncMax
+	replica.stateSync.stage = SyncStageResizingStorage
+	replica.stateSync.persistPhase = 0
+	replica.stateSync.persistDone = false
+	replica.stateSync.repairing = true
 	return nil
 }
 
@@ -370,6 +372,17 @@ func startOpenStateMachine(ctx context.Context, machine StateMachine, checkpoint
 	return completed.Err
 }
 
+type checkpointSessionSnapshot struct {
+	op   protocol.Op
+	data []byte
+}
+
+type replayResult struct {
+	commitMin         protocol.Op
+	upgrades          recoveredUpgradeState
+	checkpointSession checkpointSessionSnapshot
+}
+
 func replayCommitted(
 	ctx context.Context,
 	config Config,
@@ -381,40 +394,49 @@ func replayCommitted(
 	from protocol.Op,
 	checkpointRelease protocol.Release,
 	target protocol.Op,
-) (protocol.Op, recoveredUpgradeState, error) {
-	var upgrades recoveredUpgradeState
-	if target < from {
-		return from, upgrades, ErrWALRecovery
+) (replayResult, error) {
+	result := replayResult{commitMin: from}
+	nextCheckpoint, valid := checkpointAfter(config.Cluster, from)
+	if target < from || !valid {
+		return result, ErrWALRecovery
 	}
 	prepareBuffer, err := NewAlignedBuffer(wal.Layout().PrepareStride, SectorSize)
 	if err != nil {
-		return from, upgrades, err
+		return result, err
 	}
 	replyFrame := make([]byte, int(config.Cluster.MessageSizeMax))
 	for op := from + 1; op <= target; op++ {
 		if err := ctx.Err(); err != nil {
-			return op - 1, upgrades, err
+			return result, err
 		}
 		frame, err := wal.ReadPrepare(op, prepareBuffer)
 		if err != nil {
-			return op - 1, upgrades, err
+			return result, err
 		}
 		header, body, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount)
 		if reason != protocol.RejectNone {
-			return op - 1, upgrades, ErrWALRecovery
+			return result, ErrWALRecovery
 		}
-		if err := upgrades.observe(config.Cluster, from, checkpointRelease, header, body); err != nil {
-			return op - 1, upgrades, err
+		if err := result.upgrades.observe(config.Cluster, from, checkpointRelease, header, body); err != nil {
+			return result, err
 		}
 		token, err := replayPrefetch(ctx, machine, sink, header, body)
 		if err != nil {
-			return op - 1, upgrades, err
+			return result, err
 		}
 		if err := replayExecute(config, machine, replies, sessions, header, body, token, replyFrame); err != nil {
-			return op - 1, upgrades, err
+			return result, err
+		}
+		result.commitMin = op
+		if op == nextCheckpoint {
+			data := make([]byte, sessions.TrailerSize())
+			if _, err := sessions.EncodeTrailer(data); err != nil {
+				return result, err
+			}
+			result.checkpointSession = checkpointSessionSnapshot{op: op, data: data}
 		}
 	}
-	return target, upgrades, nil
+	return result, nil
 }
 
 func replayPrefetch(ctx context.Context, machine StateMachine, sink *startupCompletionSink, header protocol.Header, body []byte) (PrefetchToken, error) {

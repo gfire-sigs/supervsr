@@ -13,14 +13,17 @@ import (
 type MachineFactory func(protocol.ReplicaIndex) replication.StateMachine
 
 type Config struct {
-	Group          protocol.GroupID
-	ActiveCount    uint8
-	StandbyCount   uint8
-	CurrentRelease protocol.Release
-	Cluster        replication.ClusterConfig
-	Process        replication.ProcessConfig
-	MaximumPackets uint32
-	WorkLimit      int
+	Group              protocol.GroupID
+	ActiveCount        uint8
+	StandbyCount       uint8
+	CurrentRelease     protocol.Release
+	Cluster            replication.ClusterConfig
+	Process            replication.ProcessConfig
+	MaximumPackets     uint32
+	WorkLimit          int
+	ControlledIO       bool
+	BlockValidator     replication.BlockValidator
+	ClientProcessesMax uint32
 }
 
 func DefaultConfig(activeCount uint8) Config {
@@ -54,12 +57,20 @@ func (err *NodeError) Unwrap() error {
 }
 
 type node struct {
-	config     replication.Config
-	replica    *replication.Replica
-	machine    replication.StateMachine
-	metrics    *replication.ReplicaMetrics
-	generation uint64
-	pauseTicks uint32
+	config         replication.Config
+	replica        *replication.Replica
+	machine        replication.StateMachine
+	metrics        *replication.ReplicaMetrics
+	generation     uint64
+	pauseTicks     uint32
+	controller     *replication.IOController
+	ioEvents       []replication.IOEvent
+	lastCheckpoint replication.CheckpointState
+}
+
+type clientProcess struct {
+	id     protocol.ClientID
+	client *replication.Client
 }
 
 type Cluster struct {
@@ -72,14 +83,32 @@ type Cluster struct {
 	members      [replication.MembersMax]protocol.MemberID
 	stores       []*Storage
 	nodes        []node
-	clients      []*replication.Client
+	clients      []clientProcess
 	closed       bool
 	invariants   invariantState
+	layout       replication.WALLayout
+	proofBuffer  []byte
 }
 
 func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cluster, error) {
 	memberCount := config.ActiveCount + config.StandbyCount
 	if memberCount == 0 || config.MaximumPackets == 0 || config.WorkLimit <= 0 {
+		return nil, replication.ErrInvalidConfiguration
+	}
+	if err := config.Cluster.Validate(config.ActiveCount, config.StandbyCount); err != nil {
+		return nil, err
+	}
+	if err := config.Process.Validate(config.Cluster); err != nil {
+		return nil, err
+	}
+	if config.ClientProcessesMax == 0 {
+		config.ClientProcessesMax = uint32(config.Cluster.ClientsMax)
+	}
+	if config.ClientProcessesMax > config.MaximumPackets {
+		return nil, replication.ErrInvalidConfiguration
+	}
+	layout, ok := replication.DeriveWALLayout(config.Cluster)
+	if !ok {
 		return nil, replication.ErrInvalidConfiguration
 	}
 	quorumLimit := uint8(min(config.Cluster.ReplicationQuorumMax, uint64(^uint8(0))))
@@ -94,6 +123,8 @@ func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cl
 	cluster := &Cluster{
 		config: config, clock: NewClock(), network: network, factory: factory, quorums: quorums,
 		memberClocks: make([]*Clock, memberCount), stores: make([]*Storage, memberCount), nodes: make([]node, memberCount),
+		clients: make([]clientProcess, 0, config.ClientProcessesMax),
+		layout:  layout, proofBuffer: make([]byte, layout.PrepareStride),
 	}
 	for index := range memberCount {
 		cluster.memberClocks[index] = NewClock()
@@ -188,7 +219,7 @@ func (cluster *Cluster) Metrics(index protocol.ReplicaIndex) (replication.Replic
 }
 
 func (cluster *Cluster) AddClient(id protocol.ClientID, events replication.ClientEvents) (*replication.Client, error) {
-	if uint64(len(cluster.clients)) >= cluster.config.Cluster.ClientsMax {
+	if uint32(len(cluster.clients)) >= cluster.config.ClientProcessesMax || events == nil {
 		return nil, replication.ErrInvalidConfiguration
 	}
 	if cluster.closed {
@@ -202,12 +233,33 @@ func (cluster *Cluster) AddClient(id protocol.ClientID, events replication.Clien
 	if err != nil {
 		return nil, err
 	}
-	if err := cluster.network.RegisterClient(id, client.HandleFrame); err != nil {
+	if err := cluster.network.RegisterClient(id, func(sender protocol.ReplicaIndex, frame []byte) {
+		observer.frame = frame
+		client.HandleFrame(sender, frame)
+		observer.frame = nil
+	}); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
-	cluster.clients = append(cluster.clients, client)
+	cluster.clients = append(cluster.clients, clientProcess{id: id, client: client})
 	return client, nil
+}
+
+func (cluster *Cluster) CloseClient(id protocol.ClientID) error {
+	for index, process := range cluster.clients {
+		if process.id != id {
+			continue
+		}
+		if err := process.client.Close(); err != nil {
+			return err
+		}
+		cluster.network.UnregisterClient(id)
+		copy(cluster.clients[index:], cluster.clients[index+1:])
+		cluster.clients[len(cluster.clients)-1] = clientProcess{}
+		cluster.clients = cluster.clients[:len(cluster.clients)-1]
+		return nil
+	}
+	return replication.ErrInvalidConfiguration
 }
 
 // Pause suspends a member's event loop for ticks Steps; its clock and inbound network continue.
@@ -238,8 +290,8 @@ func (cluster *Cluster) Step() error {
 	if err := cluster.CheckInvariants(); err != nil {
 		return err
 	}
-	for _, client := range cluster.clients {
-		if err := client.Tick(); err != nil {
+	for _, process := range cluster.clients {
+		if err := process.client.Tick(); err != nil {
 			return err
 		}
 		if err := cluster.CheckInvariants(); err != nil {
@@ -284,10 +336,18 @@ func (cluster *Cluster) Crash(ctx context.Context, index protocol.ReplicaIndex) 
 		return replication.ErrInvalidConfiguration
 	}
 	node := &cluster.nodes[index]
+	node.lastCheckpoint = node.replica.Snapshot().Checkpoint
+	if node.controller != nil {
+		if err := node.controller.Crash(); err != nil {
+			return err
+		}
+	}
 	cluster.network.UnregisterReplica(index)
 	_ = node.replica.Close(ctx)
 	node.replica = nil
 	node.machine = nil
+	node.controller = nil
+	node.ioEvents = nil
 	node.pauseTicks = 0
 	cluster.stores[index].Crash()
 	return cluster.CheckInvariants()
@@ -309,8 +369,9 @@ func (cluster *Cluster) Close(ctx context.Context) error {
 	}
 	cluster.closed = true
 	var first error
-	for _, client := range cluster.clients {
-		if err := client.Close(); err != nil && first == nil {
+	for _, process := range cluster.clients {
+		cluster.network.UnregisterClient(process.id)
+		if err := process.client.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -342,9 +403,15 @@ func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaInde
 	var seed [8]byte
 	binary.LittleEndian.PutUint64(seed[:], node.generation<<8|(uint64(index)+1))
 	metrics := &replication.ReplicaMetrics{}
+	var controller *replication.IOController
+	if cluster.config.ControlledIO {
+		controller = replication.NewIOController()
+	}
 	replica, err := replication.Open(ctx, node.config, replication.Dependencies{
 		Storage: cluster.stores[index], MessageBus: cluster.network.ReplicaBus(index), Clock: cluster.memberClocks[index],
-		Entropy: bytes.NewReader(seed[:]), StateMachine: machine, Metrics: metrics, SynchronousIO: true,
+		Entropy: bytes.NewReader(seed[:]), StateMachine: machine, Metrics: metrics,
+		SynchronousIO: !cluster.config.ControlledIO, IOController: controller,
+		BlockValidator: cluster.config.BlockValidator,
 	})
 	if err != nil {
 		return err
@@ -352,6 +419,10 @@ func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaInde
 	node.replica = replica
 	node.machine = machine
 	node.metrics = metrics
+	node.controller = controller
+	if controller != nil {
+		node.ioEvents = make([]replication.IOEvent, controller.Capacity())
+	}
 	if err := cluster.network.RegisterReplica(index, replica.Submit); err != nil {
 		_ = replica.Close(context.Background())
 		node.replica = nil

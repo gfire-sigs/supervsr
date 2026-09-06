@@ -37,6 +37,7 @@ type Dependencies struct {
 	Metrics         *ReplicaMetrics
 	Logger          *zerolog.Logger
 	SynchronousIO   bool
+	IOController    *IOController
 }
 
 type ReplicaInitialState struct {
@@ -52,6 +53,7 @@ type ReplicaInitialState struct {
 	upgradeTarget     protocol.Release
 	upgradeWindow     upgradeWindow
 	syncRangeRepaired bool
+	checkpointSession checkpointSessionSnapshot
 }
 
 type CommitStage uint8
@@ -348,7 +350,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	}
 	blockIOCount := max(config.Process.RepairReadsMax, config.Process.ScrubWriteConcurrency)
 	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + blockIOCount + 4
-	ioEngine, err := newIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)), dependencies.SynchronousIO)
+	ioEngine, err := newIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)), dependencies.SynchronousIO, dependencies.IOController)
 	if err != nil {
 		return nil, err
 	}
@@ -432,6 +434,10 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		_ = ioEngine.Close(context.Background())
 		return nil, err
 	}
+	checkpointSession := initial.checkpointSession.data
+	if checkpointSession == nil {
+		checkpointSession = make([]byte, sessions.TrailerSize())
+	}
 	replica := &Replica{
 		config:               config,
 		membership:           config.Membership,
@@ -456,7 +462,8 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		failureDetector:      NewFailureDetector(initialTime.Monotonic),
 		timers:               timers,
 		random:               random,
-		checkpointSession:    make([]byte, sessions.TrailerSize()),
+		checkpointSession:    checkpointSession,
+		checkpointSessionOp:  initial.checkpointSession.op,
 		wal:                  wal,
 		replies:              replyStore,
 		superblocks:          superblocks,
@@ -685,10 +692,10 @@ func (replica *Replica) Process(limit int) (int, error) {
 		drained, err := replica.processReleaseActivation(limit - processed)
 		return processed + drained, err
 	}
-	if replica.pendingView > replica.view && replica.viewIO == (IOHandle{}) && !replica.commitInFlight() {
+	if !replica.stateSyncAwaitingOpen() && replica.pendingView > replica.view && replica.viewIO == (IOHandle{}) && !replica.commitInFlight() {
 		replica.resumePendingViewChange()
 	}
-	if replica.stateSync.stage == SyncStageIdle && !replica.stateSync.replayRunning {
+	if replica.stateSync.stage == SyncStageIdle && !replica.stateSync.replayRunning && !replica.stateSyncAwaitingOpen() {
 		if replica.repairViewValid {
 			replica.continueRecoveringView(replica.deps.Clock.Now().Monotonic)
 		}

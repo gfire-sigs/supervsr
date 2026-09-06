@@ -19,6 +19,7 @@ type ReplyStore struct {
 	group       protocol.GroupID
 	memberCount uint8
 	buffer      []byte
+	ioActive    bool
 }
 
 func NewReplyStore(storage Storage, config ClusterConfig, group protocol.GroupID, memberCount uint8) (*ReplyStore, error) {
@@ -43,7 +44,59 @@ func NewReplyStore(storage Storage, config ClusterConfig, group protocol.GroupID
 func (store *ReplyStore) Write(slot uint32, frame []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if slot >= store.clientsMax || uint64(len(frame)) > store.layout.ReplyStride {
+	operation := IOOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame}
+	var sequence ioSequence
+	if err := store.beginIO(&sequence, &operation); err != nil {
+		return err
+	}
+	defer func() { store.ioActive = false }()
+	for sequence.phase != IOPhaseCompletion {
+		if err := store.advanceIO(&sequence, &operation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *ReplyStore) Read(slot uint32, expected protocol.Header, destination []byte) ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	operation := IOOperation{Kind: IOReplyRead, Offset: uint64(slot), Buffer: destination, ExpectedHeader: expected}
+	var sequence ioSequence
+	if err := store.beginIO(&sequence, &operation); err != nil {
+		return nil, err
+	}
+	defer func() { store.ioActive = false }()
+	if err := store.advanceIO(&sequence, &operation); err != nil {
+		return nil, err
+	}
+	return destination[:operation.Size:operation.Size], nil
+}
+
+func (store *ReplyStore) beginIO(sequence *ioSequence, operation *IOOperation) error {
+	if store.ioActive {
+		return ErrIOBackpressure
+	}
+	if operation.Offset >= uint64(store.clientsMax) {
+		return ErrInvalidReplyStore
+	}
+	slot := uint32(operation.Offset)
+	offset, ok := store.slotOffset(slot)
+	if !ok {
+		return ErrInvalidReplyStore
+	}
+	*sequence = ioSequence{storage: store.storage, offset: offset, size: store.layout.ReplyStride}
+	if operation.Kind == IOReplyRead {
+		operation.Size = 0
+		if uint64(len(operation.Buffer)) < store.layout.ReplyStride {
+			return ErrInvalidReplyStore
+		}
+		sequence.phase, sequence.buffer = IOPhaseRead, operation.Buffer[:store.layout.ReplyStride]
+		store.ioActive = true
+		return nil
+	}
+	frame := operation.Buffer
+	if uint64(len(frame)) > store.layout.ReplyStride {
 		return ErrInvalidReplyStore
 	}
 	header, body, reason := protocol.DecodeFrame(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount)
@@ -52,43 +105,36 @@ func (store *ReplyStore) Write(slot uint32, frame []byte) error {
 	}
 	clear(store.buffer)
 	copy(store.buffer, frame)
-	offset, ok := store.slotOffset(slot)
-	if !ok {
-		return ErrInvalidReplyStore
-	}
-	if err := store.storage.WriteAt(store.buffer, offset); err != nil {
-		return fmt.Errorf("%w: reply slot %d: %w", ErrStorage, slot, err)
-	}
-	if err := store.storage.Sync(); err != nil {
-		return fmt.Errorf("%w: durable reply slot %d: %w", ErrStorage, slot, err)
-	}
+	sequence.phase, sequence.buffer = IOPhaseWrite, store.buffer
+	store.ioActive = true
 	return nil
 }
 
-func (store *ReplyStore) Read(slot uint32, expected protocol.Header, destination []byte) ([]byte, error) {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if slot >= store.clientsMax || uint64(len(destination)) < store.layout.ReplyStride {
-		return nil, ErrInvalidReplyStore
+func (store *ReplyStore) advanceIO(sequence *ioSequence, operation *IOOperation) error {
+	if err := sequence.physical(); err != nil {
+		return fmt.Errorf("%w: reply slot %d phase %d: %w", ErrStorage, operation.Offset, sequence.phase, err)
 	}
-	offset, ok := store.slotOffset(slot)
-	if !ok {
-		return nil, ErrInvalidReplyStore
+	if operation.Kind == IOReplyWrite && sequence.phase == IOPhaseWrite {
+		sequence.syncNext()
+		return nil
 	}
-	physical := destination[:store.layout.ReplyStride]
-	if err := store.storage.ReadAt(physical, offset); err != nil {
-		return nil, fmt.Errorf("%w: reply slot %d: %w", ErrStorage, slot, err)
+	sequence.phase = IOPhaseCompletion
+	if operation.Kind == IOReplyWrite {
+		return nil
 	}
+	physical := sequence.buffer
 	size := binary.LittleEndian.Uint32(physical[96:100])
 	if size < protocol.HeaderSize || uint64(size) > store.layout.ReplyStride {
-		return nil, ErrInvalidReplyStore
+		return ErrInvalidReplyStore
 	}
 	frame := physical[:size:size]
 	header, _, reason := protocol.DecodeFrame(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount)
-	if reason != protocol.RejectNone || header.Command != protocol.CommandReply || header.HeaderChecksum != expected.HeaderChecksum || replyClient(&header) != replyClient(&expected) || replyOp(&header) != replyOp(&expected) {
-		return nil, ErrInvalidReplyStore
+	expected := &operation.ExpectedHeader
+	if reason != protocol.RejectNone || header.Command != protocol.CommandReply || header.HeaderChecksum != expected.HeaderChecksum || replyClient(&header) != replyClient(expected) || replyOp(&header) != replyOp(expected) {
+		return ErrInvalidReplyStore
 	}
-	return frame, nil
+	operation.Size = uint64(size)
+	return nil
 }
 
 func (store *ReplyStore) slotOffset(slot uint32) (uint64, bool) {

@@ -90,12 +90,15 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
           SHARD: ${{ matrix.shard }}
           VSR_SIM_SEED_COUNT: ${{ inputs.short_seed_sweep && '1' || '8' }}
+          VSR_LONG_SEED_COUNT: ${{ inputs.short_seed_sweep && '1' || '8' }}
+          TEST_PATTERN: ${{ inputs.short_seed_sweep && '^TestFoundationDBFaultCampaign$' || '^Test(FoundationDB|LongDeterministic)FaultCampaign$' }}
           TEST_TIMEOUT: ${{ inputs.short_seed_sweep && '3m' || '40m' }}
         run: |
           export VSR_SIM_SEED_START=$((RUN_NUMBER * 32 + SHARD * 8))
+          export VSR_LONG_SEED_START="$VSR_SIM_SEED_START"
           printf 'VSR_SIM_SEED_START=%s VSR_SIM_SEED_COUNT=%s\n' \
             "$VSR_SIM_SEED_START" "$VSR_SIM_SEED_COUNT"
-          go test ./replication/sim -run '^TestFoundationDBFaultCampaign$' -count=1 -timeout="$TEST_TIMEOUT" -v
+          go test ./replication/sim -run "$TEST_PATTERN" -count=1 -timeout="$TEST_TIMEOUT" -v
 
   tla:
     name: TLA+ (${{ matrix.config }})

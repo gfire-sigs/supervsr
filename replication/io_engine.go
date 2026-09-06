@@ -11,7 +11,7 @@ import (
 
 var (
 	ErrIOBackpressure = errors.New("replication: storage request pool exhausted")
-	ErrIOCanceled     = errors.New("replication: storage request canceled before effect")
+	ErrIOCanceled     = errors.New("replication: storage request canceled")
 	ErrIOHandle       = errors.New("replication: invalid storage request handle")
 )
 
@@ -70,6 +70,7 @@ type ioSlot struct {
 	generation atomic.Uint64
 	operation  IOOperation
 	err        error
+	sequence   ioSequence
 }
 
 type IOEngine struct {
@@ -86,18 +87,27 @@ type IOEngine struct {
 	freeLen     int
 	ready       *MPSCRing[uint32]
 	synchronous bool
+	controller  *IOController
 }
 
 func NewIOEngine(storage Storage, requestCount, workerCount uint32) (*IOEngine, error) {
-	return newIOEngine(storage, requestCount, workerCount, false)
+	return newIOEngine(storage, requestCount, workerCount, false, nil)
 }
 
-func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool) (*IOEngine, error) {
+func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool, controller *IOController) (*IOEngine, error) {
 	if storage == nil || requestCount == 0 {
 		return nil, ErrInvalidConfiguration
 	}
+	if controller != nil {
+		if synchronous {
+			return nil, ErrInvalidConfiguration
+		}
+		if controller.engine != nil {
+			return nil, errIOControllerBound
+		}
+	}
 	workersInvalid := workerCount == 0 || workerCount > requestCount
-	if !synchronous && workersInvalid {
+	if !synchronous && controller == nil && workersInvalid {
 		return nil, ErrInvalidConfiguration
 	}
 	ringCapacity := uint64(2)
@@ -113,11 +123,15 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 		work: make(chan uint32, requestCount), done: make(chan struct{}), notify: make(chan struct{}, 1),
 		slots: make([]ioSlot, int(requestCount)), free: make([]uint32, int(requestCount)),
 		freeLen: int(requestCount), ready: ready,
+		controller: controller,
 	}
 	for index := range engine.free {
 		engine.free[index] = uint32(len(engine.free) - index - 1)
 	}
-	if synchronous {
+	if controller != nil {
+		controller.engine = engine
+	}
+	if synchronous || controller != nil {
 		close(engine.done)
 		return engine, nil
 	}
@@ -166,13 +180,14 @@ func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
 	generation := slot.generation.Add(1)
 	slot.operation = operation
 	slot.err = nil
+	slot.sequence = ioSequence{}
 	slot.state.Store(ioSlotQueued)
 	handle := IOHandle{Index: index, Generation: generation}
 	if engine.synchronous {
 		slot.state.Store(ioSlotRunning)
 		slot.err = engine.execute(&slot.operation)
 		engine.complete(index, slot)
-	} else {
+	} else if engine.controller == nil {
 		engine.work <- index
 	}
 	return handle, nil
@@ -213,6 +228,7 @@ func (engine *IOEngine) Poll(completion *IOCompletion) bool {
 	}
 	slot.operation = IOOperation{}
 	slot.err = nil
+	slot.sequence = ioSequence{}
 	slot.state.Store(ioSlotFree)
 	engine.free[engine.freeLen] = index
 	engine.freeLen++
@@ -237,6 +253,11 @@ func (engine *IOEngine) Close(ctx context.Context) error {
 		close(engine.work)
 	}
 	engine.lifecycle.Unlock()
+	if engine.controller != nil {
+		if err := engine.controller.Drain(); err != nil {
+			return err
+		}
+	}
 	select {
 	case <-engine.done:
 		return nil
