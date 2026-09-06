@@ -26,7 +26,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   bus,
 		Clock:        fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{1}),
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
@@ -195,7 +195,7 @@ func TestReplicaRejectsUnboundAndUnknownMemberFrames(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
 			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 		}},
@@ -254,7 +254,7 @@ func TestReplicaFailStopsUnknownSupportedCommand(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
 			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 		}},
@@ -298,7 +298,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: bus,
 		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: StateMachineCapacities{
 			RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 			PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 		}},
@@ -443,7 +443,7 @@ func TestOpenAdvancesSoloViewAndReplaysDurablePrepare(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   &captureBus{},
 		Clock:        fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{1}),
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: &testStateMachine{capacities: capacities},
 	})
 	if err != nil {
@@ -470,7 +470,7 @@ func TestOpenAdvancesSoloViewAndReplaysDurablePrepare(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   &captureBus{},
 		Clock:        fixedClock{sample: TimeSample{Wall: 2, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{2}),
+		Entropy:      bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: &testStateMachine{capacities: capacities},
 	})
 	if err != nil {
@@ -501,7 +501,7 @@ func TestReplicaConcurrentCloseOwnsShutdownOnce(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   &captureBus{},
 		Clock:        fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{1}),
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
@@ -559,7 +559,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 	validator := manifestTestValidator{}
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: bus,
-		Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}}, Entropy: bytes.NewReader([]byte{1}),
+		Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}}, Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: machine, BlockValidator: validator,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
@@ -666,7 +666,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 	reopenMachine := &testStateMachine{capacities: capacities, writeCheckpoint: true}
 	reopened, err := Open(context.Background(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
-		Clock: fixedClock{sample: TimeSample{Wall: 200, Monotonic: 20, Synchronized: true}}, Entropy: bytes.NewReader([]byte{2}),
+		Clock: fixedClock{sample: TimeSample{Wall: 200, Monotonic: 20, Synchronized: true}}, Entropy: bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: reopenMachine, BlockValidator: validator,
 	})
 	if err != nil {
@@ -760,7 +760,7 @@ func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wal.Recover(superblock.State.Checkpoint, superblock.State.CommitMax, config.Process); err != nil {
+	if _, err := wal.Recover(superblock.State.Checkpoint, superblock.State.CommitMax, WALRecoveryView{}); err != nil {
 		t.Fatal(err)
 	}
 	replies, err := NewReplyStore(storage, cluster, config.Group, 1)
@@ -970,7 +970,7 @@ func TestHigherViewPingEntersViewChangeBeforeClockTraffic(t *testing.T) {
 		CheckpointMax: 1,
 	}}
 	replica, err := newReplica(config, Dependencies{
-		Storage: storage, MessageBus: bus, Clock: clock, Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+		Storage: storage, MessageBus: bus, Clock: clock, Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -1022,7 +1022,7 @@ func TestReplicaTimersBroadcastCommitAndPing(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   bus,
 		Clock:        fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{1}),
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {

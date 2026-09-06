@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go:
+    name: Go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l replication cmd)"
+      - name: Static analysis
+        run: |
+          go vet ./...
+          go install github.com/gosuda/JustGoodPractices/cmd/gojgp@v1.1.1
+          gojgp lint ./...
+      - name: Test including deterministic fault campaigns
+        run: go test -count=1 -timeout=20m ./...
+
+  race:
+    name: Race (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check races outside the separately gated seed campaign
+        run: go test -race -count=1 -timeout=20m -skip '^TestFoundationDBFaultCampaign$' ./...
+
+  simulation:
+    name: Simulation seed sweep (${{ matrix.shard }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Exercise recoverable fault campaigns
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          SHARD: ${{ matrix.shard }}
+          VSR_SIM_SEED_COUNT: '8'
+        run: |
+          export VSR_SIM_SEED_START=$((RUN_NUMBER * 32 + SHARD * 8))
+          printf 'VSR_SIM_SEED_START=%s VSR_SIM_SEED_COUNT=%s\n' \
+            "$VSR_SIM_SEED_START" "$VSR_SIM_SEED_COUNT"
+          go test ./replication/sim -run '^TestFoundationDBFaultCampaign$' -count=1 -timeout=40m -v
+
+  tla:
+    name: TLA+ (${{ matrix.config }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: MPSCRing
+            config: MPSCRing
+          - module: VSR
+            config: VSR
+          - module: VSR
+            config: VSRConsensus
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: formal
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch pinned TLC
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 --output tla2tools.jar \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          printf '%s  %s\n' \
+            936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88 \
+            tla2tools.jar | sha256sum --check --strict
+      - name: Check model
+        working-directory: formal
+        env:
+          TLA_MODULE: ${{ matrix.module }}
+          TLA_CONFIG: ${{ matrix.config }}
+        run: |
+          set -euo pipefail
+          java -Xmx4g -cp "$RUNNER_TEMP/tla2tools.jar" tlc2.TLC \
+            -workers 2 -config "$TLA_CONFIG.cfg" \
+            -metadir "$RUNNER_TEMP/tlc-states" "$TLA_MODULE.tla" 2>&1 | tee tlc.log
+      - name: Preserve model checking output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlc-${{ matrix.config }}
+          path: formal/tlc.log
+          if-no-files-found: ignore
+          retention-days: 14

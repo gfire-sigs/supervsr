@@ -14,7 +14,7 @@ func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, DefaultProcessConfig())
+	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = recovered.Recover(checkpoint, 0, DefaultProcessConfig())
+	report, err = recovered.Recover(checkpoint, 0, WALRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,40 +54,179 @@ func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 }
 
 func TestWALRecoverSoloRejectsUncertainBody(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		head    protocol.Op
+		missing bool
+	}{
+		{name: "older corrupt body", head: 2},
+		{name: "latest corrupt body", head: 1},
+		{name: "latest missing body", head: 1, missing: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, storage, checkpoint := formattedWALFixture(t)
+			wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent := report.HeadHeader
+			for op := protocol.Op(1); op <= test.head; op++ {
+				prepare := connectedPrepareFrame(t, config, parent, op)
+				if err := wal.Append(prepare, 0); err != nil {
+					t.Fatal(err)
+				}
+				var reason protocol.RejectReason
+				parent, _, reason = protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1)
+				if reason != protocol.RejectNone {
+					t.Fatal(reason)
+				}
+			}
+			layout := wal.Layout()
+			offset := layout.PrepareBase + layout.PrepareStride
+			if test.missing {
+				clear(storage.working[offset : offset+layout.PrepareStride])
+			} else {
+				storage.working[offset+protocol.HeaderSize] ^= 0x80
+			}
+			if err := storage.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			storage.Crash()
+
+			recovered, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recovered.Recover(checkpoint, 0, WALRecoveryView{}); !errors.Is(err, ErrWALUncertainSolo) {
+				t.Fatalf("error = %v, want %v", err, ErrWALUncertainSolo)
+			}
+		})
+	}
+}
+
+func TestWALRecoverLatestBodyNeedsRemoteRepair(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		name := "corrupt body"
+		if missing {
+			name = "missing body"
+		}
+		t.Run(name, func(t *testing.T) {
+			config, storage, checkpoint := formattedWALFixture(t)
+			wal, err := NewWAL(storage, config, protocol.GroupID{1}, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepare := connectedPrepareFrame(t, config, report.HeadHeader, 1)
+			if err := wal.Append(prepare, 0); err != nil {
+				t.Fatal(err)
+			}
+			layout := wal.Layout()
+			offset := layout.PrepareBase + layout.PrepareStride
+			if missing {
+				clear(storage.working[offset : offset+layout.PrepareStride])
+			} else {
+				storage.working[offset+protocol.HeaderSize] ^= 0x80
+			}
+			if err := storage.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			storage.Crash()
+
+			for reopen := range 2 {
+				wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+				if err != nil {
+					t.Fatal(err)
+				}
+				report, err = wal.Recover(checkpoint, 1, WALRecoveryView{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if report.HeadOp != 0 || report.FaultySlots != 1 || report.UntrustedMax != 1 {
+					t.Fatalf("reopen %d: report = %+v, want unresolved op 1", reopen, report)
+				}
+				if _, found := wal.RecoveredHeader(1); found {
+					t.Fatal("uncertain prepare exposed as recovered")
+				}
+				if _, present, nack := wal.JoinEvidence(1); present || nack {
+					t.Fatalf("uncertain prepare evidence: present=%t nack=%t", present, nack)
+				}
+				// Rewriting a neighboring header must not persist the reserved placeholder.
+				if err := wal.Append(checkpoint.Header[:], 0); err != nil {
+					t.Fatal(err)
+				}
+				storage.Crash()
+			}
+
+			if err := wal.Append(prepare, 0); err != nil {
+				t.Fatal(err)
+			}
+			storage.Crash()
+			wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report, err = wal.Recover(checkpoint, 1, WALRecoveryView{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.HeadOp != 1 || report.FaultySlots != 0 {
+				t.Fatalf("repaired report = %+v", report)
+			}
+			if _, present, nack := wal.JoinEvidence(1); !present || nack {
+				t.Fatalf("repaired prepare evidence: present=%t nack=%t", present, nack)
+			}
+		})
+	}
+}
+
+func TestWALRecoverTruncatesProvenFutureHeader(t *testing.T) {
 	config, storage, checkpoint := formattedWALFixture(t)
 	wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, DefaultProcessConfig())
+	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepare := connectedPrepareFrame(t, config, report.HeadHeader, 1)
+	maximum, ok := wal.prepareMaximum(checkpoint.PrepareOp())
+	if !ok {
+		t.Fatal("invalid prepare maximum")
+	}
+	op := maximum + 1
+	prepare := connectedPrepareFrame(t, config, report.HeadHeader, op)
 	if err := wal.Append(prepare, 0); err != nil {
 		t.Fatal(err)
 	}
-	firstHeader, _, reason := protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1)
-	if reason != protocol.RejectNone {
-		t.Fatal(reason)
-	}
-	second := connectedPrepareFrame(t, config, firstHeader, 2)
-	if err := wal.Append(second, 0); err != nil {
-		t.Fatal(err)
-	}
 	layout := wal.Layout()
-	storage.working[layout.PrepareBase+layout.PrepareStride+protocol.HeaderSize] ^= 0x80
+	offset := layout.PrepareBase + uint64(op)%config.JournalSlots*layout.PrepareStride
+	clear(storage.working[offset : offset+layout.PrepareStride])
 	if err := storage.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	storage.Crash()
 
-	recovered, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err = NewWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recovered.Recover(checkpoint, 0, DefaultProcessConfig()); !errors.Is(err, ErrWALUncertainSolo) {
-		t.Fatalf("error = %v, want %v", err, ErrWALUncertainSolo)
+	report, err = wal.Recover(checkpoint, 0, WALRecoveryView{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.HeadOp != 0 || report.FaultySlots != 0 {
+		t.Fatalf("future header recovery = %+v", report)
+	}
+	if _, present, nack := wal.JoinEvidence(op); present || !nack {
+		t.Fatalf("proven future evidence: present=%t nack=%t", present, nack)
 	}
 }
 

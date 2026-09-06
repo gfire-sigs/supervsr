@@ -78,6 +78,42 @@ func TestClockSynchronizerRejectsAndExpiresSamples(t *testing.T) {
 	}
 }
 
+func TestClockSynchronizerClampsWallJumpsAcrossSamplingWindows(t *testing.T) {
+	base := uint64(time.Hour)
+	raw := &manualLocalClock{wall: base}
+	clock, err := NewClockSynchronizer(raw, 0, 3, 2, DefaultProcessConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.monotonic = uint64(3 * time.Second)
+	raw.wall = base + raw.monotonic
+	if err := clock.Observe(1, raw.monotonic, raw.wall, raw.monotonic); err != nil {
+		t.Fatal(err)
+	}
+	if reading := clock.Now(); !reading.Synchronized || reading.Wall != raw.wall {
+		t.Fatalf("aligned clocks did not establish an epoch: %+v", reading)
+	}
+	for _, scenario := range []struct {
+		name      string
+		monotonic time.Duration
+		wall      uint64
+	}{
+		{"forward_jump", 4 * time.Second, base + uint64(time.Hour)},
+		{"rollback", 5 * time.Second, 0},
+		{"sampling_window_rollover", 25 * time.Second, base + uint64(time.Hour)},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			raw.monotonic = uint64(scenario.monotonic)
+			raw.wall = scenario.wall
+			reading := clock.Now()
+			want := base + raw.monotonic
+			if !reading.Synchronized || reading.Wall != want {
+				t.Fatalf("reading=%+v, want synchronized wall=%d", reading, want)
+			}
+		})
+	}
+}
+
 func BenchmarkClockSynchronizerNow(b *testing.B) {
 	raw := &manualLocalClock{wall: 1, monotonic: 1}
 	clock, err := NewClockSynchronizer(raw, protocol.ReplicaIndex(0), 1, 1, DefaultProcessConfig())
@@ -86,6 +122,8 @@ func BenchmarkClockSynchronizerNow(b *testing.B) {
 	}
 	clock.synchronized = true
 	clock.epochMono = 1
+	clock.epochLower = 1
+	clock.epochUpper = 1
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

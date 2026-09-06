@@ -105,13 +105,20 @@ func (replica *Replica) resolveCheckpointReachability(manifest CheckpointManifes
 	if err != nil {
 		return FixedBitSet{}, FixedBitSet{}, nil, err
 	}
+	reachable, err = replica.checkpointApplicationReachability(checkpoint, manifest)
+	return reachable, protected, superseded, err
+}
+
+func (replica *Replica) checkpointApplicationReachability(checkpoint CheckpointState, manifest CheckpointManifest) (FixedBitSet, error) {
+	scratch := &replica.checkpointScratch
+	reachable := checkpointBitPrefix(&scratch.reachable, replica.blockAllocator.blockCount)
 	checkpointMax := replica.checkpointBlockLimit
 	if uint64(checkpointMax) > uint64(^uint(0)>>1) {
-		return FixedBitSet{}, FixedBitSet{}, nil, ErrCheckpointBlockLimit
+		return FixedBitSet{}, ErrCheckpointBlockLimit
 	}
 	limit := int(checkpointMax)
 	if uint64(manifest.BlockCount) > uint64(limit) {
-		return FixedBitSet{}, FixedBitSet{}, nil, ErrCheckpointBlockLimit
+		return FixedBitSet{}, ErrCheckpointBlockLimit
 	}
 	graph := checkpointGraph{
 		replica: replica, checkpoint: checkpoint, reachable: reachable, limit: limit,
@@ -119,23 +126,75 @@ func (replica *Replica) resolveCheckpointReachability(manifest CheckpointManifes
 		stack: scratch.stack, outputs: scratch.outputs, buffer: scratch.buffer,
 	}
 	if err := graph.visitManifestChain(manifest); err != nil {
-		return FixedBitSet{}, FixedBitSet{}, nil, err
+		return FixedBitSet{}, err
 	}
 	if manifest.Root != (BlockReference{}) {
 		requirement, err := replica.deps.BlockValidator.CheckpointRoot(checkpoint)
 		if err != nil || requirement.Reference != manifest.Root {
-			return FixedBitSet{}, FixedBitSet{}, nil, ErrInvalidCheckpoint
+			return FixedBitSet{}, ErrInvalidCheckpoint
 		}
 		if _, err := graph.enqueue(requirement); err != nil {
-			return FixedBitSet{}, FixedBitSet{}, nil, err
+			return FixedBitSet{}, err
 		}
 	}
 	if err := graph.visitStack(); err != nil {
-		return FixedBitSet{}, FixedBitSet{}, nil, err
+		return FixedBitSet{}, err
 	}
 	scratch.nodes = graph.nodes
 	scratch.stack = graph.stack
-	return graph.reachable, protected, superseded, nil
+	return graph.reachable, nil
+}
+
+func (replica *Replica) restoreCheckpointReleases() error {
+	scratch := &replica.checkpointScratch
+	if err := scratch.reset(replica.blockAllocator.blockCount, replica.blockAllocator.acquired.Len()); err != nil {
+		return err
+	}
+	protected, _, err := replica.currentCheckpointTrailerBlocks()
+	if err != nil {
+		return err
+	}
+	reachable := checkpointBitPrefix(&scratch.reachable, replica.blockAllocator.blockCount)
+	checkpoint := replica.checkpoint
+	manifest := CheckpointManifest{
+		Oldest:     BlockReference{Address: checkpoint.OldestManifestAddress, Checksum: checkpoint.OldestManifestChecksum},
+		Newest:     BlockReference{Address: checkpoint.NewestManifestAddress, Checksum: checkpoint.NewestManifestChecksum},
+		Root:       BlockReference{Address: checkpoint.SnapshotRootAddress, Checksum: checkpoint.SnapshotRootChecksum},
+		BlockCount: checkpoint.ManifestBlockCount,
+	}
+	if !validCheckpointManifestShape(manifest) {
+		return ErrInvalidCheckpoint
+	}
+	if manifest.BlockCount != 0 || manifest.Root != (BlockReference{}) {
+		if replica.deps.BlockValidator == nil {
+			return ErrInvalidCheckpoint
+		}
+		reachable, err = replica.checkpointApplicationReachability(checkpoint, manifest)
+		if err != nil {
+			return err
+		}
+	}
+	for index := uint64(0); index < replica.blockAllocator.blockCount; index++ {
+		if !protected.Test(index) && !reachable.Test(index) {
+			continue
+		}
+		if !replica.blockAllocator.acquired.Test(index) || replica.blockAllocator.released.Test(index) {
+			return ErrInvalidCheckpoint
+		}
+	}
+	for index := uint64(0); index < replica.blockAllocator.blockCount; index++ {
+		if protected.Test(index) || reachable.Test(index) {
+			continue
+		}
+		if !replica.blockAllocator.acquired.Test(index) || replica.blockAllocator.released.Test(index) || replica.blockAllocator.pending.Test(index) {
+			continue
+		}
+		// A checkpoint does not persist releases of its predecessor's trailers.
+		if err := replica.blockAllocator.Release(replica.blockAllocator.address(index)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validCheckpointManifestShape(manifest CheckpointManifest) bool {

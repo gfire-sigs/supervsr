@@ -1,7 +1,6 @@
 package replication
 
 import (
-	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -43,10 +42,11 @@ type stateSyncRuntime struct {
 	replayRunning  bool
 	recoveryState  Superblock
 	opening        bool
+	repliesPending bool
 }
 
 func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol.View, commit, head protocol.Op, headers []protocol.Header) {
-	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.repairing || checkpoint.PrepareOp() <= replica.checkpoint.PrepareOp() {
+	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.opening || replica.stateSync.replayRunning || checkpoint.PrepareOp() <= replica.checkpoint.PrepareOp() {
 		return
 	}
 	if len(headers) == 0 || len(headers) > len(replica.stateSync.headers) || head < checkpoint.PrepareOp() || commit < checkpoint.PrepareOp() || head < commit {
@@ -65,6 +65,8 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	replica.stateSync.resetStarted = false
 	replica.stateSync.resetDone = false
 	replica.stateSync.persistDone = false
+	replica.stateSync.resumeRecovery = false
+	replica.stateSync.repliesPending = false
 	replica.status = StatusRecovering
 	replica.releaseQueuedRequests()
 	if replica.stage == CommitStageIdle {
@@ -106,6 +108,9 @@ func (replica *Replica) dispatchStateSyncCancelingGrid() {
 }
 
 func (replica *Replica) cancelStateSyncReads() {
+	if replica.replyRepair.kind == IOReplyRead {
+		replica.io.Cancel(replica.replyRepair.handle)
+	}
 	for index := range replica.duplicateReads {
 		read := &replica.duplicateReads[index]
 		if read.busy {
@@ -127,6 +132,9 @@ func (replica *Replica) cancelStateSyncReads() {
 }
 
 func (replica *Replica) handleStateSyncDrainIO(completion IOCompletion) {
+	if replica.handleReplyRepairIO(completion) {
+		return
+	}
 	if replica.viewIO == completion.Handle {
 		replica.viewIO = IOHandle{}
 		if completion.Err != nil {
@@ -213,7 +221,9 @@ func (replica *Replica) dispatchStateSyncCheckpoint() {
 		next := replica.superblocks.Current()
 		next.ParentChecksum = next.Checksum
 		next.Sequence++
-		next.State.SyncMin = replica.checkpoint.PrepareOp() + 1
+		if next.State.SyncMin == 0 {
+			next.State.SyncMin = replica.checkpoint.PrepareOp() + 1
+		}
 		next.State.SyncMax = replica.stateSync.checkpoint.PrepareOp()
 		replica.startStateSyncPersistence(next, 1)
 	case 1:
@@ -351,6 +361,9 @@ func (replica *Replica) handleStateSyncPersistence(completion IOCompletion) bool
 }
 
 func (replica *Replica) installStateSyncCheckpoint() {
+	replica.releaseReplyRepair()
+	replica.stateSync.repliesPending = false
+	replica.syncRangeRepaired = false
 	target := replica.stateSync.checkpoint
 	checkpointID, err := target.ID()
 	if err != nil {
@@ -428,9 +441,7 @@ func (replica *Replica) queueStateSyncTrailer(reference BlockReference, blockTyp
 	if reference == (BlockReference{}) {
 		return encodedSize == 0
 	}
-	payload := replica.config.Cluster.BlockSize - protocol.HeaderSize
-	expected := cmp.Or(encodedSize%payload, payload)
-	if !replica.queueBlockRepair(reference, blockType, checkpoint, blockSnapshotExpectation{value: uint64(checkpoint), exact: true}, uint32(expected), blockRepairStateSync) {
+	if !replica.queueBlockRepair(reference, blockType, checkpoint, blockSnapshotExpectation{value: uint64(checkpoint), exact: true}, 0, blockRepairStateSync) {
 		return false
 	}
 	target, _ := replica.blockRepairTarget(reference)
@@ -449,7 +460,7 @@ func (replica *Replica) continueStateSyncBlocks(completed *blockRepairTarget, ph
 	copy(previous.Checksum[:], header.Fields[:16])
 	previous.Address = binary.LittleEndian.Uint64(header.Fields[32:40])
 	if completed.chainBytes != 0 {
-		if uint64(len(body)) > completed.chainBytes {
+		if len(body) == 0 || uint64(len(body)) > completed.chainBytes {
 			replica.fail(ErrInvalidBlock)
 			return
 		}
@@ -459,9 +470,7 @@ func (replica *Replica) continueStateSyncBlocks(completed *blockRepairTarget, ph
 			return
 		}
 		if remaining != 0 {
-			payload := replica.config.Cluster.BlockSize - protocol.HeaderSize
-			expected := min(payload, remaining)
-			if !replica.queueBlockRepair(previous, completed.blockType, completed.neededAtCheckpoint, completed.snapshot, uint32(expected), blockRepairStateSync) {
+			if !replica.queueBlockRepair(previous, completed.blockType, completed.neededAtCheckpoint, completed.snapshot, 0, blockRepairStateSync) {
 				replica.fail(ErrReplicaBackpressure)
 				return
 			}
@@ -538,7 +547,7 @@ func (replica *Replica) finishStateSyncBlocks() {
 	replica.blockAllocator = blocks.allocator
 	replica.clearBlockCatalog()
 	replica.seedScrubCatalog(replica.checkpoint)
-	if err := replica.catalogCurrentCheckpointTrailers(); err != nil {
+	if err := replica.restoreCheckpointReleases(); err != nil {
 		replica.fail(err)
 		return
 	}
@@ -590,12 +599,23 @@ type recoveryReplayResult struct {
 
 func (replica *Replica) finishStateSyncOpen() {
 	replica.stateSync.opening = false
-	if replica.stateSync.resumeRecovery {
+	replica.stateSync.repliesPending = true
+	replica.replyRepair.cursor = 0
+	replica.replyRepair.scanning = true
+	replica.resumeStateSyncLog()
+	replica.continueReplyRepair(replica.deps.Clock.Now().Monotonic)
+}
+
+func (replica *Replica) resumeStateSyncLog() {
+	if replica.stateSync.resumeRecovery && replica.stateSync.recovery.FaultySlots == 0 && replica.stateSync.recovery.HeadOp >= replica.stateSync.commit {
 		replica.finishInterruptedStateSyncOpen()
 		return
 	}
-	replica.stateSync.repairing = false
-	replica.syncRangeRepaired = true
+	if replica.stateSync.resumeRecovery && replica.membership.ActiveCount == 1 {
+		replica.fail(ErrWALUncertainSolo)
+		return
+	}
+	replica.stateSync.resumeRecovery = false
 	if replica.stateSync.head > replica.checkpoint.PrepareOp() {
 		if replica.stateSync.commit > replica.commitMin && replica.stateSync.head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
 			if !replica.beginRepairWindow(replica.stateSync.view, replica.stateSync.commit) {
@@ -695,10 +715,9 @@ func (replica *Replica) finishInterruptedReplay(result recoveryReplayResult) {
 		return
 	}
 	replica.stateSync.resumeRecovery = false
-	replica.stateSync.repairing = false
 	replica.stateSync.recovery = WALRecoveryReport{}
 	replica.stateSync.recoveryState = Superblock{}
-	replica.syncRangeRepaired = true
+	replica.continueReplyRepair(replica.deps.Clock.Now().Monotonic)
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 }

@@ -134,7 +134,7 @@ func TestOpenRecoversPartialUpgradeBar(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: capacities},
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities},
 		ReleaseExecutor: executor,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
@@ -155,7 +155,7 @@ func TestOpenRecoversPartialUpgradeBar(t *testing.T) {
 	reopened, err := Open(context.Background(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 100, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities},
+		Entropy: bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities},
 		ReleaseExecutor: executor,
 	})
 	if err != nil {
@@ -184,7 +184,7 @@ func TestUpgradeHandoffReopensAtTargetRelease(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine, ReleaseExecutor: executor,
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine, ReleaseExecutor: executor,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestUpgradeHandoffReopensAtTargetRelease(t *testing.T) {
 	if _, err := Open(context.Background(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities},
+		Entropy: bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities},
 		ReleaseExecutor: recoveryHandoff,
 	}); !errors.Is(err, handoffErr) {
 		t.Fatalf("old release open error = %v", err)
@@ -267,7 +267,7 @@ func TestUpgradeHandoffReopensAtTargetRelease(t *testing.T) {
 	reopened, err := Open(context.Background(), targetConfig, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 300, Monotonic: 300, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{3}), StateMachine: &testStateMachine{capacities: capacities},
+		Entropy: bytes.NewReader([]byte{3, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities},
 		ReleaseExecutor: targetExecutor,
 	})
 	if err != nil {
@@ -305,7 +305,7 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine, ReleaseExecutor: executor,
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine, ReleaseExecutor: executor,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)

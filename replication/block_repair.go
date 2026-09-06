@@ -127,6 +127,9 @@ func (replica *Replica) queueBlockRepair(reference BlockReference, blockType pro
 }
 
 func (replica *Replica) continueBlockRepair(now uint64) bool {
+	if replica.checkpointTransitionActive() {
+		return false
+	}
 	replica.blockRepairBudget.Expire(now)
 	for index := range replica.blockRepairTargets {
 		target := &replica.blockRepairTargets[index]
@@ -282,6 +285,9 @@ func (replica *Replica) sendGetBlocks(peer protocol.ReplicaIndex, references []B
 }
 
 func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
+	if replica.checkpointTransitionActive() {
+		return
+	}
 	reference := BlockReference{Checksum: header.HeaderChecksum, Address: binary.LittleEndian.Uint64(header.Fields[96:104])}
 	if !replica.blockRepairBudget.Outstanding(reference) {
 		return
@@ -376,6 +382,7 @@ func (replica *Replica) validRequestedBlock(target *blockRepairTarget, header pr
 }
 
 func (replica *Replica) handleBlockRepairIO(completion IOCompletion) bool {
+	defer replica.finishCheckpointRepairDrain()
 	for index := range replica.blockRepairIO {
 		operation := &replica.blockRepairIO[index]
 		if !operation.busy || operation.handle != completion.Handle {
@@ -422,12 +429,14 @@ func (replica *Replica) finishBlockRepairWrite(operation *blockRepairIO, target 
 	if completion.Err != nil {
 		operation.busy = false
 		target.state = blockRepairMissing
+		replica.fail(completion.Err)
 		return
 	}
 	handle, err := replica.io.Submit(IOOperation{Kind: IOSync})
 	if err != nil {
 		operation.busy = false
 		target.state = blockRepairMissing
+		replica.fail(err)
 		return
 	}
 	operation.handle = handle
@@ -438,6 +447,7 @@ func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *
 	operation.busy = false
 	if completion.Err != nil {
 		target.state = blockRepairMissing
+		replica.fail(completion.Err)
 		return
 	}
 	target.state = blockRepairDurable
@@ -489,5 +499,40 @@ func (replica *Replica) blockRepairCompleted(target *blockRepairTarget, physical
 	}
 	if completed.waiters&blockRepairStateSync != 0 {
 		replica.continueStateSyncBlocks(&completed, physical)
+	}
+}
+
+func (replica *Replica) blockRepairIOActive() bool {
+	for index := range replica.blockRepairIO {
+		if replica.blockRepairIO[index].busy {
+			return true
+		}
+	}
+	return false
+}
+
+func (replica *Replica) finishCheckpointRepairDrain() {
+	if !replica.checkpointRepairDrain || replica.blockRepairIOActive() || replica.fatalErr != nil {
+		return
+	}
+	if replica.pipelineLen == 0 {
+		replica.fail(ErrReplicaInvariant)
+		return
+	}
+	replica.finishCheckpointPersistence(replica.pipelineEntry(0))
+}
+
+func (replica *Replica) discardReleasedBlockRepairs() {
+	for index := range replica.blockRepairTargets {
+		target := &replica.blockRepairTargets[index]
+		if target.state == 0 {
+			continue
+		}
+		blockIndex, ok := replica.blockAllocator.index(target.reference.Address)
+		if ok && replica.blockAllocator.acquired.Test(blockIndex) && !replica.blockAllocator.released.Test(blockIndex) {
+			continue
+		}
+		replica.blockRepairBudget.Fulfill(target.reference)
+		*target = blockRepairTarget{}
 	}
 }

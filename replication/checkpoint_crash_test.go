@@ -27,7 +27,7 @@ func runCheckpointCrashCase(t testing.TB, failAt int, expectFailure bool) int {
 	validator := manifestTestValidator{}
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine, BlockValidator: validator,
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine, BlockValidator: validator,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func runCheckpointCrashCase(t testing.TB, failAt int, expectFailure bool) int {
 	}
 	reopened, err := Open(context.Background(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{2}), StateMachine: &testStateMachine{capacities: capacities}, BlockValidator: validator,
+		Entropy: bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities}, BlockValidator: validator,
 	})
 	if err != nil {
 		t.Fatalf("reopen sequence %d: %v", store.Current().Sequence, err)

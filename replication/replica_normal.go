@@ -62,6 +62,8 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.handleGetPrepare(header)
 	case protocol.CommandGetReply:
 		replica.handleGetReply(header)
+	case protocol.CommandReply:
+		return replica.handleReplyRepair(message, header)
 	case protocol.CommandGetBlocks:
 		replica.handleGetBlocks(header, body)
 	case protocol.CommandBlock:
@@ -174,6 +176,14 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 	requestNo := protocol.RequestNo(binary.LittleEndian.Uint32(header.Fields[64:68]))
 	if replica.pipelineConflict(client, requestNo, header.HeaderChecksum) {
 		return false
+	}
+	// Registrations may evict sessions. Keep their execution ordered against admission.
+	if operation != protocol.OperationRegister {
+		for offset := range replica.pipelineLen {
+			if prepareOperation(&replica.pipelineEntry(offset).header) == protocol.OperationRegister {
+				return replica.queueRequest(message, sample)
+			}
+		}
 	}
 	if replica.pipelineLen == uint32(len(replica.pipeline)) {
 		return replica.queueRequest(message, sample)
@@ -354,16 +364,35 @@ func (replica *Replica) createPrepare(request protocol.Header, requestBody []byt
 }
 
 func (replica *Replica) handlePrepare(message *Message, header protocol.Header, sample TimeSample) bool {
-	if replica.status != StatusNormal || header.View != replica.view || header.Author != replica.membership.Primary(header.View) {
+	if replica.status != StatusNormal || replica.durableView != replica.view || header.View > replica.view || header.Author != replica.membership.Primary(header.View) {
 		return false
 	}
-	replica.failureDetector.Signal(sample.Monotonic)
+	if header.View == replica.view {
+		replica.failureDetector.Signal(sample.Monotonic)
+	}
 	op := prepareOp(&header)
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
 		if prepareOp(&entry.header) == op {
+			if entry.header.HeaderChecksum == header.HeaderChecksum && entry.durable {
+				replica.sendPrepareOK(entry)
+			}
 			return false
 		}
+	}
+	if op <= replica.commitMin {
+		local, present, dirty, found := replica.localHeaderEvidence(op)
+		if found && present && !dirty && local.HeaderChecksum == header.HeaderChecksum {
+			replica.sendPrepareOK(&pipelineEntry{header: local, durable: true})
+		}
+		return false
+	}
+	if header.View != replica.view {
+		return false
+	}
+	if op != replica.headOp+1 || prepareParent(&header) != replica.headChecksum || prepareCommit(&header) > replica.commitMin {
+		replica.requestView(header.View, sample.Monotonic)
+		return false
 	}
 	return replica.acceptPrepare(message, header)
 }
@@ -409,6 +438,9 @@ func (replica *Replica) handleIOCompletion(completion IOCompletion) {
 	if replica.handleBlockRepairIO(completion) {
 		return
 	}
+	if replica.handleReplyRepairIO(completion) {
+		return
+	}
 	for index := range replica.repairReads {
 		read := &replica.repairReads[index]
 		if !read.busy || read.handle != completion.Handle || completion.Kind != IORead {
@@ -448,6 +480,9 @@ func (replica *Replica) handleIOCompletion(completion IOCompletion) {
 		case IOWALAppend:
 			entry.durable = true
 			replica.metrics.preparesDurable.Add(1)
+			if !replica.canAcknowledge(entry) {
+				return
+			}
 			if replica.isPrimary() {
 				replica.countPrepareAck(entry, replica.local)
 			} else {
@@ -466,6 +501,9 @@ func (replica *Replica) handleIOCompletion(completion IOCompletion) {
 }
 
 func (replica *Replica) sendPrepareOK(entry *pipelineEntry) {
+	if !replica.canAcknowledge(entry) {
+		return
+	}
 	message, err := replica.frames.Acquire(0)
 	if err != nil {
 		replica.fail(err)
@@ -490,11 +528,12 @@ func (replica *Replica) sendPrepareOK(entry *pipelineEntry) {
 		return
 	}
 	replica.deps.MessageBus.SendReplica(replica.membership.Primary(replica.view), message)
+	entry.acks |= uint16(1) << uint8(replica.local)
 	message.Release()
 }
 
 func (replica *Replica) handlePrepareOK(ack protocol.Header) {
-	if replica.status != StatusNormal || !replica.isPrimary() || ack.View != replica.view || uint8(ack.Author) >= replica.membership.ActiveCount {
+	if replica.status != StatusNormal || replica.durableView != replica.view || !replica.isPrimary() || ack.View != replica.view || uint8(ack.Author) >= replica.membership.ActiveCount {
 		return
 	}
 	op := protocol.Op(binary.LittleEndian.Uint64(ack.Fields[96:104]))
@@ -533,6 +572,11 @@ func (replica *Replica) handleCommit(header protocol.Header, sample TimeSample) 
 	}
 	commit := protocol.Op(binary.LittleEndian.Uint64(header.Fields[56:64]))
 	if local, _, _, found := replica.localHeaderEvidence(commit); found && local.HeaderChecksum != protocol.Checksum(header.Fields[:16]) {
+		if commit > replica.commitMin {
+			replica.status = StatusRecoveringHead
+			replica.releaseQueuedRequests()
+			replica.requestView(header.View, sample.Monotonic)
+		}
 		return
 	}
 	replica.lastPrimaryCommit = monotonic
@@ -540,12 +584,17 @@ func (replica *Replica) handleCommit(header protocol.Header, sample TimeSample) 
 	if commit > replica.commitMax {
 		replica.commitMax = commit
 	}
+	if commit > replica.headOp && !replica.commitInFlight() {
+		replica.status = StatusRecoveringHead
+		replica.releaseQueuedRequests()
+		replica.requestView(header.View, sample.Monotonic)
+	}
 }
 
 func (replica *Replica) advanceCommit() {
 	recoveringCommit := replica.status == StatusRecoveringHead && replica.repairViewValid && replica.repairViewRebuilt
 	invalidStatus := replica.status != StatusNormal && !recoveringCommit
-	unavailable := replica.pipelineLen == 0 || replica.fatalErr != nil
+	unavailable := replica.pipelineLen == 0 || replica.fatalErr != nil || replica.replyRepairBlocksCommit()
 	if invalidStatus || unavailable {
 		return
 	}
@@ -571,6 +620,58 @@ func (replica *Replica) advanceCommit() {
 		entry.stage = CommitStageExecute
 		replica.executeEntry(entry)
 	}
+}
+
+func (replica *Replica) commitInFlight() bool {
+	for offset := range replica.pipelineLen {
+		if replica.pipelineEntry(offset).stage != CommitStageIdle {
+			return true
+		}
+	}
+	return false
+}
+
+func (replica *Replica) acknowledgeDurablePrepares() {
+	if replica.status != StatusNormal {
+		return
+	}
+	localBit := uint16(1) << uint8(replica.local)
+	for offset := range replica.pipelineLen {
+		entry := replica.pipelineEntry(offset)
+		if entry.acks&localBit != 0 || !replica.canAcknowledge(entry) {
+			continue
+		}
+		if replica.isPrimary() {
+			replica.countPrepareAck(entry, replica.local)
+		} else {
+			replica.sendPrepareOK(entry)
+		}
+	}
+}
+
+func (replica *Replica) canAcknowledge(entry *pipelineEntry) bool {
+	normalView := replica.status == StatusNormal && replica.view == replica.durableView && replica.logView == replica.view
+	if !entry.durable || !normalView || replica.viewIO != (IOHandle{}) || uint8(replica.local) >= replica.membership.ActiveCount {
+		return false
+	}
+	checkpoint := replica.checkpoint.PrepareOp()
+	next, ok := checkpointAfter(replica.config.Cluster, checkpoint)
+	if !ok {
+		return false
+	}
+	if replica.superblocks != nil && replica.superblocks.Current().State.SyncMin != 0 && !replica.syncRangeRepaired {
+		trigger, valid := checkpointTrigger(replica.config.Cluster, checkpoint)
+		bound, fits := checkedAdd(uint64(trigger), replica.config.Cluster.PipelineMax)
+		if !valid || !fits {
+			return false
+		}
+		if checkpoint != 0 && uint64(replica.commitMax) <= bound {
+			next = checkpoint
+		}
+	}
+	trigger, ok := checkpointTrigger(replica.config.Cluster, next)
+	bound, fits := checkedAdd(uint64(trigger), replica.config.Cluster.PipelineMax)
+	return ok && fits && uint64(prepareOp(&entry.header)) <= bound
 }
 
 func (replica *Replica) startPrefetch(entry *pipelineEntry) {
@@ -831,6 +932,7 @@ func (replica *Replica) sendHeaderOnlyCachedReply(client protocol.ClientID, head
 		return
 	}
 	header.View = replica.logView
+	header.Author = replica.membership.Primary(header.View)
 	if err := message.Seal(&header); err != nil {
 		message.Release()
 		return
@@ -848,6 +950,7 @@ func (replica *Replica) finishDuplicateRead(read *duplicateRead, completion IOCo
 	read.client = protocol.ClientID{}
 	if completion.Err != nil || completion.Size < protocol.HeaderSize || completion.Size != uint64(header.Size) {
 		replica.metrics.storageFailures.Add(1)
+		replica.markReplyFault(header)
 		return
 	}
 	message, err := replica.frames.Acquire(uint32(completion.Size - protocol.HeaderSize))
@@ -861,6 +964,7 @@ func (replica *Replica) finishDuplicateRead(read *duplicateRead, completion IOCo
 	}
 	copy(body, completion.Buffer[protocol.HeaderSize:completion.Size])
 	header.View = replica.logView
+	header.Author = replica.membership.Primary(header.View)
 	if err := message.Seal(&header); err != nil {
 		message.Release()
 		return

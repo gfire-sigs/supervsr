@@ -174,6 +174,9 @@ func (replica *Replica) finishRepairRead(read *repairRead, completion IOCompleti
 	buffer := read.buffer
 	*read = repairRead{buffer: buffer}
 	if completion.Err != nil {
+		if kind == repairReadReply {
+			replica.markReplyIdentityFault(client, op, checksum)
+		}
 		return
 	}
 	maximum := uint32(replica.config.Cluster.MessageSizeMax)
@@ -182,11 +185,17 @@ func (replica *Replica) finishRepairRead(read *repairRead, completion IOCompleti
 	}
 	frame, header, ok := decodeRepairFrame(completion.Buffer, replica.config.Group, maximum, replica.membership.ActiveCount+replica.membership.StandbyCount)
 	if !ok || header.HeaderChecksum != checksum {
+		if kind == repairReadReply {
+			replica.markReplyIdentityFault(client, op, checksum)
+		}
 		return
 	}
 	context := replica.validationContext(protocol.FrameSourceReplica, header.Author)
 	context.MessageSizeMax = maximum
 	if protocol.ValidateSemantics(&header, frame[protocol.HeaderSize:], context) != protocol.RejectNone {
+		if kind == repairReadReply {
+			replica.markReplyIdentityFault(client, op, checksum)
+		}
 		return
 	}
 	switch kind {
@@ -196,6 +205,7 @@ func (replica *Replica) finishRepairRead(read *repairRead, completion IOCompleti
 		}
 	case repairReadReply:
 		if header.Command != protocol.CommandReply || replyClient(&header) != client || replyOp(&header) != op {
+			replica.markReplyIdentityFault(client, op, checksum)
 			return
 		}
 	case repairReadBlock:
@@ -254,12 +264,15 @@ func (replica *Replica) handleRepairTimeout(sample TimeSample) {
 	if replica.continueBlockRepair(sample.Monotonic) {
 		return
 	}
+	if replica.stateSync.repliesPending && replica.continueReplyRepair(sample.Monotonic) {
+		return
+	}
 	replica.repairBudget.Expire(sample.Monotonic)
 	if replica.repairViewValid {
 		replica.continueRecoveringView(sample.Monotonic)
 		return
 	}
-	if replica.headOp < replica.commitMax {
+	if replica.headOp < replica.commitMax || replica.status == StatusRecoveringHead {
 		replica.sendGetView(sample.Monotonic)
 		return
 	}
@@ -272,6 +285,9 @@ func (replica *Replica) handleRepairTimeout(sample TimeSample) {
 	}
 	missing, found := replica.newestMissingHeader()
 	if !found {
+		if replica.continueReplyRepair(sample.Monotonic) {
+			return
+		}
 		replica.continueScrub(sample.Monotonic)
 		return
 	}
@@ -376,7 +392,11 @@ func (replica *Replica) handleRepairWindowHeaders(header protocol.Header, body [
 		return
 	}
 	expected := replica.commitMin + 1
-	parent := replica.headChecksum
+	committed, present, dirty, found := replica.localHeaderEvidence(replica.commitMin)
+	if !found || !present || dirty {
+		return
+	}
+	parent := committed.HeaderChecksum
 	for index := range count {
 		candidate, reason := protocol.DecodeHeader(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
 		if reason != protocol.RejectNone || prepareOp(&candidate) != expected || candidate.View > replica.repairView || prepareParent(&candidate) != parent {
@@ -501,6 +521,12 @@ func (replica *Replica) continueRecoveringView(now uint64) {
 	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
 		return
 	}
+	for offset := range replica.pipelineLen {
+		entry := replica.pipelineEntry(offset)
+		if entry.io != (IOHandle{}) || entry.stage != CommitStageIdle {
+			return
+		}
+	}
 	if replica.repairViewWindow {
 		replica.requestRepairWindowHeaders(now)
 		return
@@ -534,7 +560,6 @@ func (replica *Replica) finishRecoveringView() {
 			}
 		}
 		if !replica.truncatePipelineAfter(replica.repairViewAncestor) {
-			replica.fail(ErrReplicaInvariant)
 			return
 		}
 		for index := replica.repairViewCount - 1; index >= 0; index-- {
@@ -551,11 +576,19 @@ func (replica *Replica) finishRecoveringView() {
 			entry.durable = true
 			replica.repairFrames[index] = nil
 		}
+		for offset := range replica.pipelineLen {
+			entry := replica.pipelineEntry(offset)
+			entry.acks = 0
+			entry.quorum = false
+		}
+		replica.headOp = replica.repairViewHead
+		replica.headChecksum = replica.canonicalHeaders[0].HeaderChecksum
+		replica.lastPrepareTimestamp = prepareTimestamp(&replica.canonicalHeaders[0])
 		replica.view = replica.repairView
 		replica.commitMax = max(replica.commitMax, replica.repairViewCommit)
 		replica.repairViewRebuilt = true
 	}
-	if replica.isPrimary() && replica.commitMin < replica.repairViewCommit {
+	if replica.commitMin < replica.repairViewCommit {
 		for offset := range replica.pipelineLen {
 			entry := replica.pipelineEntry(offset)
 			if prepareOp(&entry.header) <= replica.repairViewCommit {
@@ -576,6 +609,19 @@ func (replica *Replica) finishRecoveringView() {
 }
 
 func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {
+	if ancestor < replica.commitMin {
+		return false
+	}
+	header, present, _, found := replica.localHeaderEvidence(ancestor)
+	if !found || !present {
+		return false
+	}
+	for offset := range replica.pipelineLen {
+		entry := replica.pipelineEntry(offset)
+		if prepareOp(&entry.header) > ancestor && (entry.io != (IOHandle{}) || entry.stage != CommitStageIdle) {
+			return false
+		}
+	}
 	for replica.pipelineLen > 0 {
 		entry := replica.pipelineEntry(replica.pipelineLen - 1)
 		if prepareOp(&entry.header) <= ancestor {
@@ -593,10 +639,6 @@ func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {
 		generation := entry.generation
 		*entry = pipelineEntry{generation: generation}
 		replica.pipelineLen--
-	}
-	header, present, _, found := replica.localHeaderEvidence(ancestor)
-	if !found || !present {
-		return false
 	}
 	replica.headOp = ancestor
 	replica.headChecksum = header.HeaderChecksum
@@ -683,8 +725,18 @@ func (replica *Replica) finishRepairWrite(completion IOCompletion) {
 	replica.repairHeaderValid = false
 }
 
+func (replica *Replica) requestView(view protocol.View, now uint64) {
+	if view > replica.getViewTarget {
+		replica.getViewTarget = view
+		replica.getViewNonce = protocol.Nonce{}
+		replica.getViewLast = 0
+	}
+	replica.sendGetView(now)
+}
+
 func (replica *Replica) sendGetView(now uint64) {
-	primary := replica.membership.Primary(replica.view)
+	view := max(replica.view, replica.getViewTarget)
+	primary := replica.membership.Primary(view)
 	if primary == replica.local {
 		return
 	}
@@ -703,7 +755,7 @@ func (replica *Replica) sendGetView(now uint64) {
 	if err != nil {
 		return
 	}
-	header := protocol.Header{Group: replica.config.Group, View: replica.view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetView, Author: replica.local}
+	header := protocol.Header{Group: replica.config.Group, View: view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetView, Author: replica.local}
 	copy(header.Fields[:16], replica.getViewNonce[:])
 	if message.Seal(&header) == nil {
 		replica.deps.MessageBus.SendReplica(primary, message)

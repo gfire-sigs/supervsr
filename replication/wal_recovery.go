@@ -10,6 +10,13 @@ import (
 
 var ErrWALRecovery = errors.New("replication: WAL recovery failed")
 
+// WALRecoveryView is the head selected when LogView was durably installed.
+// Later prepares in that log view are not bounded by HeadOp.
+type WALRecoveryView struct {
+	LogView protocol.View
+	HeadOp  protocol.Op
+}
+
 type WALRecoveryReport struct {
 	HeadOp       protocol.Op
 	HeadHeader   protocol.Header
@@ -17,7 +24,7 @@ type WALRecoveryReport struct {
 	UntrustedMax protocol.Op
 }
 
-func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, process ProcessConfig) (WALRecoveryReport, error) {
+func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, installed WALRecoveryView) (WALRecoveryReport, error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	if err := wal.storage.ReadAt(wal.headerRing, wal.layout.HeaderBase); err != nil {
@@ -49,14 +56,6 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, proce
 	if !ok {
 		return WALRecoveryReport{}, ErrWALRecovery
 	}
-	tornWidth := protocol.Op(min(uint64(process.JournalWriteConcurrency), wal.config.JournalSlots))
-	if wal.memberCount == 1 {
-		tornWidth = 1
-	}
-	tornMin := protocol.Op(0)
-	if untrustedMax >= tornWidth {
-		tornMin = untrustedMax - tornWidth + 1
-	}
 	repairHeaders := false
 	faulty := uint32(0)
 	firstFaulty := -1
@@ -67,7 +66,7 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, proce
 			RetainedMin:  checkpoint.PrepareOp(),
 			PrepareMax:   prepareMax,
 			UntrustedMax: untrustedMax,
-			TornMin:      tornMin,
+			Installed:    installed,
 		}
 		decision := ClassifyWALSlot(headerCandidates[slot], prepareCandidates[slot], context)
 		switch decision {
@@ -188,6 +187,22 @@ func (wal *WAL) JoinEvidence(op protocol.Op) (protocol.Header, bool, bool) {
 		return protocol.Header{}, false, false
 	}
 	return header, true, slot.Dirty
+}
+
+// DiscardAfter invalidates the cache only after the caller has drained writes
+// and durably installed a view whose canonical head excludes this suffix.
+func (wal *WAL) DiscardAfter(head protocol.Op) {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	for index := range wal.slots {
+		slot := &wal.slots[index]
+		if !slot.Inhabited || slot.Op <= head {
+			continue
+		}
+		slot.Generation++
+		wal.installReservedSlot(index)
+		copy(wal.headerRing[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], slot.Authoritative[:])
+	}
 }
 
 func (wal *WAL) decodeRecoveryHeader(encoded []byte, physical uint64) WALCandidate {

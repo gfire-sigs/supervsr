@@ -3,6 +3,7 @@ package sim
 import (
 	"errors"
 	"sync"
+	"syscall"
 
 	"github.com/gfire-sigs/supervsr/replication"
 )
@@ -29,7 +30,9 @@ const (
 )
 
 type StorageFault struct {
-	At     uint64
+	At uint64
+	// Kind zero targets exactly At; otherwise target the first matching operation at or after At.
+	Kind   replication.IOKind
 	Effect FaultEffect
 	Prefix uint64
 	Target uint64
@@ -42,13 +45,14 @@ type delayedWrite struct {
 }
 
 type Storage struct {
-	mu           sync.Mutex
-	working      []byte
-	durable      []byte
-	operation    uint64
-	fault        StorageFault
-	delayed      [DelayedWritesMax]delayedWrite
-	delayedCount int
+	mu            sync.Mutex
+	working       []byte
+	durable       []byte
+	operation     uint64
+	fault         StorageFault
+	delayed       [DelayedWritesMax]delayedWrite
+	delayedCount  int
+	capacityLimit uint64
 }
 
 func NewStorage() *Storage {
@@ -58,7 +62,7 @@ func NewStorage() *Storage {
 func (storage *Storage) Arm(fault StorageFault) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.fault.Effect != 0 || fault.At <= storage.operation || fault.Effect < FaultFail || fault.Effect > FaultDelayedWrite {
+	if storage.fault.Effect != 0 || fault.At <= storage.operation || fault.Effect < FaultFail || fault.Effect > FaultDelayedWrite || fault.Kind > replication.IOResize {
 		return replication.ErrInvalidConfiguration
 	}
 	storage.fault = fault
@@ -77,10 +81,27 @@ func (storage *Storage) NextOperation() uint64 {
 	return storage.operation + 1
 }
 
+func (storage *Storage) FaultPending() bool {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	return storage.fault.Effect != 0
+}
+
+// SetCapacityLimit bounds file growth, not overwrites in already allocated zones. Zero removes the limit.
+func (storage *Storage) SetCapacityLimit(bytes uint64) error {
+	storage.mu.Lock()
+	defer storage.mu.Unlock()
+	if bytes != 0 && bytes < uint64(len(storage.working)) {
+		return replication.ErrInvalidConfiguration
+	}
+	storage.capacityLimit = bytes
+	return nil
+}
+
 func (storage *Storage) ReadAt(buffer []byte, offset uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault()
+	fault := storage.nextFault(replication.IORead)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -118,7 +139,7 @@ func (storage *Storage) ReadAt(buffer []byte, offset uint64) error {
 func (storage *Storage) WriteAt(buffer []byte, offset uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault()
+	fault := storage.nextFault(replication.IOWrite)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -161,7 +182,7 @@ func (storage *Storage) WriteAt(buffer []byte, offset uint64) error {
 func (storage *Storage) Sync() error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault()
+	fault := storage.nextFault(replication.IOSync)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -189,8 +210,11 @@ func (storage *Storage) Sync() error {
 func (storage *Storage) Resize(size uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.nextFault().Effect != 0 {
+	if storage.nextFault(replication.IOResize).Effect != 0 {
 		return ErrInjectedFault
+	}
+	if storage.capacityLimit != 0 && size > storage.capacityLimit {
+		return errors.Join(ErrInjectedFault, syscall.ENOSPC)
 	}
 	if size > uint64(int(^uint(0)>>1)) {
 		return replication.ErrStorage
@@ -204,7 +228,7 @@ func (storage *Storage) Resize(size uint64) error {
 func (storage *Storage) Size() (uint64, error) {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.nextFault().Effect != 0 {
+	if storage.nextFault(0).Effect != 0 {
 		return 0, ErrInjectedFault
 	}
 	return uint64(len(storage.working)), nil
@@ -213,7 +237,7 @@ func (storage *Storage) Size() (uint64, error) {
 func (storage *Storage) SyncParent() error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.nextFault().Effect != 0 {
+	if storage.nextFault(0).Effect != 0 {
 		return ErrInjectedFault
 	}
 	return nil
@@ -293,9 +317,14 @@ func (storage *Storage) DurableBytes() []byte {
 	return append([]byte(nil), storage.durable...)
 }
 
-func (storage *Storage) nextFault() StorageFault {
+func (storage *Storage) nextFault(kind replication.IOKind) StorageFault {
 	storage.operation++
-	if storage.fault.At != storage.operation {
+	if storage.fault.At > storage.operation {
+		return StorageFault{}
+	}
+	missedExactOperation := storage.fault.Kind == 0 && storage.fault.At != storage.operation
+	mismatchedKind := storage.fault.Kind != 0 && storage.fault.Kind != kind
+	if missedExactOperation || mismatchedKind {
 		return StorageFault{}
 	}
 	fault := storage.fault

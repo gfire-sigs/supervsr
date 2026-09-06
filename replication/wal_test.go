@@ -104,7 +104,6 @@ func TestWALRecoveryDecisionMatrix(t *testing.T) {
 		RetainedMin:  1,
 		PrepareMax:   20,
 		UntrustedMax: 17,
-		TornMin:      17,
 	}
 	ordinary := func(op protocol.Op, checksum byte) WALCandidate {
 		return WALCandidate{Kind: WALCandidateOrdinary, Op: op, View: 1, HeaderChecksum: protocol.Checksum{checksum}, BodyChecksum: protocol.Checksum{checksum + 1}}
@@ -123,7 +122,8 @@ func TestWALRecoveryDecisionMatrix(t *testing.T) {
 		{name: "invalid header unique maximum", header: invalid, prepare: ordinary(17, 1), want: WALRecoveryLocalRepair},
 		{name: "newer prepare same slot", header: ordinary(9, 1), prepare: ordinary(17, 2), want: WALRecoveryLocalRepair},
 		{name: "old header missing body", header: ordinary(9, 1), prepare: invalid, want: WALRecoveryRemoteRepair},
-		{name: "bounded torn header", header: ordinary(17, 1), prepare: invalid, want: WALRecoveryTruncate},
+		{name: "latest header corrupt body", header: ordinary(17, 1), prepare: invalid, want: WALRecoveryRemoteRepair},
+		{name: "latest header missing body", header: ordinary(17, 1), prepare: reserved, want: WALRecoveryRemoteRepair},
 		{name: "invalid uncertainty", header: invalid, prepare: invalid, want: WALRecoveryRemoteRepair},
 		{name: "nonmaximum prepare uncertainty", header: invalid, prepare: ordinary(9, 1), want: WALRecoveryRemoteRepair},
 		{name: "conflicting checksum", header: ordinary(9, 1), prepare: ordinary(9, 2), want: WALRecoveryRemoteRepair},

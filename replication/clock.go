@@ -46,6 +46,8 @@ type ClockSynchronizer struct {
 	windowWall   uint64
 	windowMono   uint64
 	epochMono    uint64
+	epochLower   uint64
+	epochUpper   uint64
 	samples      [MembersMax]clockSample
 	endpoints    [MembersMax * 2]clockEndpoint
 	installed    ClockInterval
@@ -111,14 +113,10 @@ func (clock *ClockSynchronizer) Now() TimeSample {
 		clock.synchronized = false
 		return TimeSample{Wall: wall, Monotonic: monotonic}
 	}
-	correction := int64(0)
-	if correction < clock.installed.Lower {
-		correction = clock.installed.Lower
-	}
-	if correction > clock.installed.Upper {
-		correction = clock.installed.Upper
-	}
-	return TimeSample{Wall: addSigned(wall, correction), Monotonic: monotonic, Synchronized: true}
+	elapsed := monotonic - clock.epochMono
+	lower := saturatingAdd(clock.epochLower, elapsed)
+	upper := saturatingAdd(clock.epochUpper, elapsed)
+	return TimeSample{Wall: min(max(wall, lower), upper), Monotonic: monotonic, Synchronized: true}
 }
 
 func (clock *ClockSynchronizer) Interval() (ClockInterval, bool) {
@@ -148,6 +146,9 @@ func (clock *ClockSynchronizer) install(monotonic uint64) {
 	}
 	clock.installed = best
 	clock.epochMono = monotonic
+	wall := saturatingAdd(clock.windowWall, monotonic-clock.windowMono)
+	clock.epochLower = addSigned(wall, best.Lower)
+	clock.epochUpper = addSigned(wall, best.Upper)
 	clock.synchronized = true
 }
 

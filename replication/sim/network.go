@@ -229,6 +229,26 @@ func (network *Network) ClearFault() {
 	network.fault = nil
 }
 
+// HealAll removes future packet faults and reconnects every link. Queued packets
+// retain their bytes and delivery times; healing cannot retract an earlier send.
+func (network *Network) HealAll() {
+	network.mu.Lock()
+	defer network.mu.Unlock()
+	network.delay = 0
+	network.nextDelay = 0
+	network.delayNext = false
+	network.drop = 0
+	network.duplicate = 0
+	network.corrupt = corruption{}
+	network.misdirect = misdirection{}
+	for from := range network.memberCount {
+		for to := range network.memberCount {
+			network.links[from][to] = true
+			network.linkDelay[from][to] = 0
+		}
+	}
+}
+
 func (network *Network) Advance() {
 	network.mu.Lock()
 	defer network.mu.Unlock()

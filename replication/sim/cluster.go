@@ -3,6 +3,7 @@ package sim
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/gfire-sigs/supervsr/replication"
@@ -58,6 +59,7 @@ type node struct {
 	machine    replication.StateMachine
 	metrics    *replication.ReplicaMetrics
 	generation uint64
+	pauseTicks uint32
 }
 
 type Cluster struct {
@@ -208,10 +210,26 @@ func (cluster *Cluster) AddClient(id protocol.ClientID, events replication.Clien
 	return client, nil
 }
 
+// Pause suspends a member's event loop for ticks Steps; its clock and inbound network continue.
+func (cluster *Cluster) Pause(index protocol.ReplicaIndex, ticks uint32) error {
+	if int(index) >= len(cluster.nodes) || cluster.nodes[index].replica == nil {
+		return replication.ErrInvalidConfiguration
+	}
+	cluster.nodes[index].pauseTicks = ticks
+	return nil
+}
+
 func (cluster *Cluster) Step() error {
 	if cluster.closed {
 		return replication.ErrReplicaClosed
 	}
+	defer func() {
+		for index := range cluster.nodes {
+			if cluster.nodes[index].pauseTicks != 0 {
+				cluster.nodes[index].pauseTicks--
+			}
+		}
+	}()
 	cluster.clock.Advance(cluster.config.Process.Tick)
 	for _, clock := range cluster.memberClocks {
 		clock.Advance(cluster.config.Process.Tick)
@@ -233,7 +251,7 @@ func (cluster *Cluster) Step() error {
 	}
 	for index := range cluster.nodes {
 		replica := cluster.nodes[index].replica
-		if replica == nil {
+		if replica == nil || cluster.nodes[index].pauseTicks != 0 {
 			continue
 		}
 		if err := replica.Tick(); err != nil {
@@ -270,6 +288,7 @@ func (cluster *Cluster) Crash(ctx context.Context, index protocol.ReplicaIndex) 
 	_ = node.replica.Close(ctx)
 	node.replica = nil
 	node.machine = nil
+	node.pauseTicks = 0
 	cluster.stores[index].Crash()
 	return cluster.CheckInvariants()
 }
@@ -312,14 +331,16 @@ func (cluster *Cluster) Close(ctx context.Context) error {
 
 func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaIndex) error {
 	node := &cluster.nodes[index]
+	if node.generation >= ^uint64(0)>>8 {
+		return replication.ErrInvalidConfiguration
+	}
 	node.generation++
 	machine := cluster.factory(index)
 	if machine == nil {
 		return replication.ErrInvalidConfiguration
 	}
 	var seed [8]byte
-	seed[0] = byte(index) + 1
-	seed[7] = byte(node.generation)
+	binary.LittleEndian.PutUint64(seed[:], node.generation<<8|(uint64(index)+1))
 	metrics := &replication.ReplicaMetrics{}
 	replica, err := replication.Open(ctx, node.config, replication.Dependencies{
 		Storage: cluster.stores[index], MessageBus: cluster.network.ReplicaBus(index), Clock: cluster.memberClocks[index],
@@ -356,7 +377,7 @@ func (cluster *Cluster) settle() error {
 		processed := 0
 		for index := range cluster.nodes {
 			replica := cluster.nodes[index].replica
-			if replica == nil {
+			if replica == nil || cluster.nodes[index].pauseTicks != 0 {
 				continue
 			}
 			count, err := replica.Process(64)

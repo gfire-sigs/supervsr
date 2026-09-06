@@ -22,7 +22,7 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	source, err := newReplica(sourceConfig, Dependencies{
 		Storage: sourceStorage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: &testStateMachine{capacities: capacities, pulseNeeded: true},
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities, pulseNeeded: true},
 	}, sourceInitial, sourceWAL, sourceReplies, sourceSessions, sourceSuperblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	target, err := newReplica(targetConfig, Dependencies{
 		Storage: targetStorage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 100, Monotonic: 100, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{2}), StateMachine: targetMachine,
+		Entropy: bytes.NewReader([]byte{2, 0, 0, 0, 0, 0, 0, 0}), StateMachine: targetMachine,
 	}, targetInitial, targetWAL, targetReplies, targetSessions, targetSuperblocks)
 	if err != nil {
 		t.Fatal(err)
@@ -90,8 +90,8 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	view := protocol.Header{
-		Group: targetConfig.Group, View: target.view, Protocol: protocol.ProtocolVersion,
-		Command: protocol.CommandView, Author: target.membership.Primary(target.view),
+		Group: targetConfig.Group, View: target.view + 1, Protocol: protocol.ProtocolVersion,
+		Command: protocol.CommandView, Author: target.membership.Primary(target.view + 1),
 	}
 	binary.LittleEndian.PutUint64(view.Fields[16:24], uint64(checkpointOp))
 	binary.LittleEndian.PutUint64(view.Fields[24:32], uint64(checkpointOp))
@@ -152,7 +152,7 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	pending, err := Open(context.Background(), targetConfig, Dependencies{
 		Storage: targetStorage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 175, Monotonic: 175, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{3}), StateMachine: &pendingReplayMachine{testStateMachine: testStateMachine{capacities: capacities}},
+		Entropy: bytes.NewReader([]byte{3, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &pendingReplayMachine{testStateMachine: testStateMachine{capacities: capacities}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +174,7 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	reopened, err := Open(context.Background(), targetConfig, Dependencies{
 		Storage: targetStorage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 200, Monotonic: 200, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{3}), StateMachine: replayMachine,
+		Entropy: bytes.NewReader([]byte{3, 0, 0, 0, 0, 0, 0, 0}), StateMachine: replayMachine,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	damaged, err := Open(context.Background(), targetConfig, Dependencies{
 		Storage: targetStorage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 300, Monotonic: 300, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{4}), StateMachine: &testStateMachine{capacities: capacities},
+		Entropy: bytes.NewReader([]byte{4, 0, 0, 0, 0, 0, 0, 0}), StateMachine: &testStateMachine{capacities: capacities},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +247,7 @@ func TestStateSyncDrainDoesNotAcknowledgeCompletedWALAppend(t *testing.T) {
 	replica.pipeline[0].io = handle
 	replica.pipeline[0].ioKind = IOWALAppend
 	replica.handleStateSyncDrainIO(IOCompletion{Handle: handle})
-	entry := replica.pipeline[0]
+	entry := &replica.pipeline[0]
 	if entry.io != (IOHandle{}) || entry.ioKind != 0 || entry.durable || entry.acks != 0 {
 		t.Fatalf("drained entry=%+v", entry)
 	}

@@ -178,6 +178,7 @@ type Replica struct {
 	checkpointReleases      []uint64
 	checkpointSuperseded    []uint64
 	checkpointScratch       checkpointGraphScratch
+	checkpointRepairDrain   bool
 
 	wal                    *WAL
 	replies                *ReplyStore
@@ -198,6 +199,7 @@ type Replica struct {
 	requestLen             uint32
 	duplicateReads         []duplicateRead
 	repairReads            []repairRead
+	replyRepair            replyRepairRuntime
 	stage                  CommitStage
 	stageGeneration        uint64
 	exitViewBits           uint16
@@ -224,6 +226,7 @@ type Replica struct {
 	blockCatalogCount      int
 	scrub                  scrubRuntime
 	getViewLast            uint64
+	getViewTarget          protocol.View
 	repairViewValid        bool
 	repairView             protocol.View
 	repairViewCommit       protocol.Op
@@ -276,14 +279,13 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if dependencies.StateMachine == nil || wal == nil || replyStore == nil || sessions == nil || superblocks == nil {
 		return nil, ErrInvalidConfiguration
 	}
-	capacities := dependencies.StateMachine.Capacities()
-	if uint64(capacities.RequestBytes) != config.Cluster.ApplicationBatchSizeMax || uint64(capacities.ReplyBytes) != config.Cluster.ApplicationReplySizeMax || uint64(capacities.PrefetchMax) < config.Cluster.PipelineMax || capacities.CheckpointMax == 0 {
-		return nil, ErrInvalidConfiguration
+	if err := validateStateMachineCapacities(config, dependencies.StateMachine); err != nil {
+		return nil, err
 	}
-	blockBase, _ := config.Cluster.BlockBase()
-	maximumCheckpointBlocks := (config.Process.StorageSizeLimit - blockBase) / config.Cluster.BlockSize
-	if uint64(capacities.CheckpointMax) > maximumCheckpointBlocks {
-		return nil, ErrInvalidConfiguration
+	capacities := dependencies.StateMachine.Capacities()
+	random, err := newReplicaRandom(dependencies.Entropy)
+	if err != nil {
+		return nil, err
 	}
 	local, ok := config.Membership.LocalIndex()
 	if !ok {
@@ -453,7 +455,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		lastCommitTimestamp:  prepareTimestamp(&initial.HeadHeader),
 		failureDetector:      NewFailureDetector(initialTime.Monotonic),
 		timers:               timers,
-		random:               NewDeterministicRandom(uint64(local) + 1),
+		random:               random,
 		checkpointSession:    make([]byte, sessions.TrailerSize()),
 		wal:                  wal,
 		replies:              replyStore,
@@ -504,6 +506,10 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 	if err := replica.checkInvariants(); err != nil {
+		_ = ioEngine.Close(context.Background())
+		return nil, err
+	}
+	if err := replica.initReplyRepair(); err != nil {
 		_ = ioEngine.Close(context.Background())
 		return nil, err
 	}
@@ -679,6 +685,15 @@ func (replica *Replica) Process(limit int) (int, error) {
 		drained, err := replica.processReleaseActivation(limit - processed)
 		return processed + drained, err
 	}
+	if replica.pendingView > replica.view && replica.viewIO == (IOHandle{}) && !replica.commitInFlight() {
+		replica.resumePendingViewChange()
+	}
+	if replica.stateSync.stage == SyncStageIdle && !replica.stateSync.replayRunning {
+		if replica.repairViewValid {
+			replica.continueRecoveringView(replica.deps.Clock.Now().Monotonic)
+		}
+		replica.acknowledgeDurablePrepares()
+	}
 	if !replica.stateSync.replayRunning && (replica.stateSync.stage == SyncStageIdle || replica.stateSync.stage == SyncStageCancelingCommit) {
 		replica.advanceCommit()
 	}
@@ -788,6 +803,7 @@ func (replica *Replica) drainShutdownEvents(generation uint64) bool {
 }
 
 func (replica *Replica) releaseOwnedFrames() {
+	replica.releaseReplyRepair()
 	for replica.requestLen > 0 {
 		queued := &replica.requestQueue[replica.requestHead]
 		if queued.message != nil {

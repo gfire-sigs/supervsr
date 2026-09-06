@@ -252,7 +252,7 @@ type WALRecoveryContext struct {
 	RetainedMin  protocol.Op
 	PrepareMax   protocol.Op
 	UntrustedMax protocol.Op
-	TornMin      protocol.Op
+	Installed    WALRecoveryView
 }
 
 func ClassifyWALSlot(header, prepare WALCandidate, context WALRecoveryContext) WALRecoveryDecision {
@@ -261,6 +261,22 @@ func ClassifyWALSlot(header, prepare WALCandidate, context WALRecoveryContext) W
 	}
 	if futureWALCandidate(header, context) || futureWALCandidate(prepare, context) {
 		return WALRecoveryTruncate
+	}
+	obsoleteHeader := obsoleteWALCandidate(header, context.Installed)
+	obsoletePrepare := obsoleteWALCandidate(prepare, context.Installed)
+	if obsoleteHeader || obsoletePrepare {
+		if header.Kind == WALCandidateInvalid || prepare.Kind == WALCandidateInvalid {
+			return WALRecoveryRemoteRepair
+		}
+		retainedHeader := header.Kind == WALCandidateOrdinary && !obsoleteHeader
+		retainedPrepare := prepare.Kind == WALCandidateOrdinary && !obsoletePrepare
+		if !retainedHeader && !retainedPrepare {
+			return WALRecoveryTruncate
+		}
+		if obsoleteHeader && retainedOrdinary(prepare, context) {
+			return WALRecoveryLocalRepair
+		}
+		return WALRecoveryRemoteRepair
 	}
 	switch {
 	case header.Kind == WALCandidateOrdinary && prepare.Kind == WALCandidateOrdinary && candidatesEqual(header, prepare):
@@ -274,9 +290,7 @@ func ClassifyWALSlot(header, prepare WALCandidate, context WALRecoveryContext) W
 	case header.Kind == WALCandidateOrdinary && retainedOrdinary(prepare, context) && prepare.Op > header.Op:
 		return WALRecoveryLocalRepair
 	case header.Kind == WALCandidateOrdinary && (prepare.Kind == WALCandidateInvalid || prepare.Kind == WALCandidateReserved):
-		if header.Op >= context.TornMin && header.Op <= context.UntrustedMax {
-			return WALRecoveryTruncate
-		}
+		// A durable append can lose its body later; recency cannot prove it uncommitted.
 		return WALRecoveryRemoteRepair
 	case header.Kind == WALCandidateInvalid && prepare.Kind != WALCandidateOrdinary:
 		return WALRecoveryRemoteRepair
@@ -303,4 +317,8 @@ func futureWALCandidate(candidate WALCandidate, context WALRecoveryContext) bool
 
 func impossibleWALCandidate(candidate WALCandidate, context WALRecoveryContext) bool {
 	return candidate.Kind == WALCandidateOrdinary && (context.JournalSlots == 0 || uint64(candidate.Op)%context.JournalSlots != context.PhysicalSlot)
+}
+
+func obsoleteWALCandidate(candidate WALCandidate, installed WALRecoveryView) bool {
+	return candidate.Kind == WALCandidateOrdinary && candidate.Op > installed.HeadOp && candidate.View < installed.LogView
 }

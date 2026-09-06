@@ -217,19 +217,28 @@ func (cluster *Cluster) checkDurableReply(reply replication.ClientReply) error {
 		return nil
 	}
 	var candidateOp protocol.Op
+	var expected protocol.Checksum
 	found := false
 	for index := range cluster.nodes {
 		op, ok := findReplyCommit(cluster.nodes[index].machine, reply)
 		if ok && (!found || op > candidateOp) {
 			candidateOp = op
 			found = true
+			expected = protocol.Checksum{}
+		}
+		if ok && op == candidateOp && cluster.nodes[index].replica != nil {
+			if checksum, durable := cluster.nodes[index].replica.DurableChecksum(op); durable {
+				if !expected.IsZero() && expected != checksum {
+					return fmt.Errorf("%w: executed reply conflicts at op %d", ErrInvariant, op)
+				}
+				expected = checksum
+			}
 		}
 	}
 	if !found {
 		return fmt.Errorf("%w: reply has no committed operation", ErrInvariant)
 	}
 	durable := uint8(0)
-	var expected protocol.Checksum
 	for index := range cluster.config.ActiveCount {
 		node := &cluster.nodes[index]
 		if node.replica == nil {
@@ -244,10 +253,9 @@ func (cluster *Cluster) checkDurableReply(reply replication.ClientReply) error {
 		if !ok {
 			continue
 		}
-		if expected.IsZero() {
-			expected = checksum
-		} else if checksum != expected {
-			return fmt.Errorf("%w: durable reply quorum conflicts at op %d", ErrInvariant, candidateOp)
+		// An old-view minority may retain a different, uncommitted suffix.
+		if expected.IsZero() || checksum != expected {
+			continue
 		}
 		durable++
 	}

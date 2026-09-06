@@ -31,6 +31,9 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	if dependencies.Storage == nil || dependencies.MessageBus == nil || dependencies.Clock == nil || dependencies.Entropy == nil || dependencies.StateMachine == nil {
 		return nil, ErrInvalidConfiguration
 	}
+	if err := validateStateMachineCapacities(config, dependencies.StateMachine); err != nil {
+		return nil, err
+	}
 	releases, err := executableReleases(config, dependencies.ReleaseExecutor)
 	if err != nil {
 		return nil, err
@@ -63,14 +66,27 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 		return nil, err
 	}
 	durable := superblocks.Current()
-	recovery, err := wal.Recover(durable.State.Checkpoint, durable.State.CommitMax, config.Process)
+	resumeStateSync := durable.State.SyncMin != 0
+	recoveryCommit := durable.State.CommitMax
+	if resumeStateSync {
+		recoveryCommit = durable.State.Checkpoint.PrepareOp()
+	}
+	var installed WALRecoveryView
+	if durable.ViewHeaderCount != 0 {
+		header, reason := protocol.DecodeHeader(durable.ViewHeaders[0][:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount)
+		if reason != protocol.RejectNone {
+			return nil, ErrInvalidSuperblock
+		}
+		installed = WALRecoveryView{LogView: durable.State.LogView, HeadOp: prepareOp(&header)}
+	}
+	recovery, err := wal.Recover(durable.State.Checkpoint, recoveryCommit, installed)
 	if err != nil {
 		return nil, err
 	}
 	if dependencies.Metrics != nil && recovery.FaultySlots != 0 {
 		dependencies.Metrics.storageCorruptions.Add(uint64(recovery.FaultySlots))
 	}
-	if config.Membership.ActiveCount == 1 && recovery.FaultySlots == 0 {
+	if !resumeStateSync && config.Membership.ActiveCount == 1 && recovery.FaultySlots == 0 {
 		durable.State.CommitMax = recovery.HeadOp
 	}
 	replyStore, err := NewReplyStore(dependencies.Storage, config.Cluster, config.Group, memberCount)
@@ -81,7 +97,6 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	if err != nil {
 		return nil, err
 	}
-	resumeStateSync := durable.State.SyncMin != 0
 	var blocks *blockRuntime
 	if resumeStateSync {
 		blocks, err = newBlockRepairRuntime(dependencies.Storage, config)
@@ -128,13 +143,27 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	if resumeStateSync {
 		err = replica.resumeInterruptedStateSync(durable, recovery, memberCount)
 	} else {
-		err = loadOpenSuffix(replica, recovery, commitMin)
+		err = replica.restoreCheckpointReleases()
+		if err == nil {
+			err = loadOpenSuffix(replica, recovery, commitMin)
+		}
 	}
 	if err != nil {
 		_ = replica.Close(context.Background())
 		return nil, err
 	}
 	return replica, nil
+}
+
+func validateStateMachineCapacities(config Config, machine StateMachine) error {
+	if machine == nil {
+		return ErrInvalidConfiguration
+	}
+	capacities := machine.Capacities()
+	if uint64(capacities.RequestBytes) != config.Cluster.ApplicationBatchSizeMax || uint64(capacities.ReplyBytes) != config.Cluster.ApplicationReplySizeMax || uint64(capacities.PrefetchMax) < config.Cluster.PipelineMax || capacities.CheckpointMax == 0 {
+		return ErrInvalidConfiguration
+	}
+	return nil
 }
 
 func recordOpenMetric(metrics *ReplicaMetrics, err error) {
@@ -182,7 +211,7 @@ func deriveInterruptedStateSync(config Config, durable Superblock, memberCount u
 	return ReplicaInitialState{
 		Status: StatusRecovering, View: durable.State.View, DurableView: durable.State.View, LogView: durable.State.LogView,
 		HeadOp: durable.State.Checkpoint.PrepareOp(), CommitMin: durable.State.Checkpoint.PrepareOp(), CommitMax: durable.State.CommitMax,
-		Checkpoint: durable.State.Checkpoint, HeadHeader: header, syncRangeRepaired: true,
+		Checkpoint: durable.State.Checkpoint, HeadHeader: header,
 	}, nil
 }
 

@@ -57,17 +57,11 @@ func TestCanonicalRecoveryRequiresDurableLocalEntry(t *testing.T) {
 	replica.canonicalHeaders[0] = first
 	replica.canonicalHeaders[1] = root
 
-	if replica.canonicalAvailable(1, 2) {
-		t.Fatal("non-durable canonical entry reported available")
-	}
 	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 0 {
 		t.Fatalf("non-durable recovery ancestor = %d, found %t", ancestor, found)
 	}
 
 	replica.pipeline[0].durable = true
-	if !replica.canonicalAvailable(1, 2) {
-		t.Fatal("durable canonical entry reported unavailable")
-	}
 	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 1 {
 		t.Fatalf("durable recovery ancestor = %d, found %t", ancestor, found)
 	}
@@ -124,7 +118,7 @@ func TestExitViewQuorumPersistsBeforeJoin(t *testing.T) {
 		Storage:      storage,
 		MessageBus:   &captureBus{},
 		Clock:        fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
-		Entropy:      bytes.NewReader([]byte{1}),
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
 		StateMachine: machine,
 	})
 	if err != nil {
@@ -233,7 +227,7 @@ func TestViewChangeWaitsForCheckpointTransition(t *testing.T) {
 	replica, err := newReplica(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{},
 		Clock:   fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine,
 	}, initial, wal, replies, sessions, superblocks)
 	if err != nil {
 		t.Fatal(err)

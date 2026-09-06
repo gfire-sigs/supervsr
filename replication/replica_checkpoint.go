@@ -266,11 +266,17 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		replica.fail(ErrReplicaInvariant)
 		return
 	}
+	if replica.blockRepairIOActive() {
+		replica.checkpointRepairDrain = true
+		return
+	}
+	replica.checkpointRepairDrain = false
 	reachable := replica.checkpointCandidate.Reachable()
 	if err := replica.blockAllocator.CheckpointDurable(replica.checkpointCandidate, &reachable); err != nil {
 		replica.fail(err)
 		return
 	}
+	replica.discardReleasedBlockRepairs()
 	replica.checkpointReleases = replica.checkpointReleases[:0]
 	for _, address := range replica.checkpointSuperseded {
 		if err := replica.blockAllocator.Release(address); err != nil {

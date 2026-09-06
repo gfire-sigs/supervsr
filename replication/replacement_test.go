@@ -45,7 +45,7 @@ func TestReplaceLostReplicaFencesAdvancesPipelineAndFormatsFutureView(t *testing
 	}}
 	replica, err := Open(t.Context(), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1}), StateMachine: machine,
+		Entropy: bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}), StateMachine: machine,
 	})
 	if err != nil {
 		t.Fatal(err)

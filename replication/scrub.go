@@ -216,6 +216,9 @@ func (replica *Replica) nextScrubIndex(acquired, released *FixedBitSet) (uint64,
 	for range length {
 		index := replica.scrub.cursor % length
 		replica.scrub.cursor = (index + 1) % length
+		if replica.blockAllocator != nil && index < replica.blockAllocator.pending.Len() && replica.blockAllocator.pending.Test(index) {
+			continue
+		}
 		if acquired.Test(index) && !released.Test(index) {
 			return index, true
 		}
