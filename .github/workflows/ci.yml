@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      short_seed_sweep:
+        description: Run only one seed once, without the other CI jobs
+        type: boolean
+        default: false
   schedule:
     - cron: '23 3 * * *'
 
@@ -21,6 +26,7 @@ defaults:
 jobs:
   go:
     name: Go (${{ matrix.os }})
+    if: ${{ !inputs.short_seed_sweep }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -28,10 +34,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
       - name: Check formatting
@@ -46,6 +52,7 @@ jobs:
 
   race:
     name: Race (${{ matrix.os }})
+    if: ${{ !inputs.short_seed_sweep }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -53,10 +60,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
       - name: Check races outside the separately gated seed campaign
@@ -66,31 +73,33 @@ jobs:
     name: Simulation seed sweep (${{ matrix.shard }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.short_seed_sweep && 5 || 45 }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: ${{ fromJSON(inputs.short_seed_sweep && '[0]' || '[0,1,2,3]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
       - name: Exercise recoverable fault campaigns
         env:
           RUN_NUMBER: ${{ github.run_number }}
           SHARD: ${{ matrix.shard }}
-          VSR_SIM_SEED_COUNT: '8'
+          VSR_SIM_SEED_COUNT: ${{ inputs.short_seed_sweep && '1' || '8' }}
+          TEST_TIMEOUT: ${{ inputs.short_seed_sweep && '3m' || '40m' }}
         run: |
           export VSR_SIM_SEED_START=$((RUN_NUMBER * 32 + SHARD * 8))
           printf 'VSR_SIM_SEED_START=%s VSR_SIM_SEED_COUNT=%s\n' \
             "$VSR_SIM_SEED_START" "$VSR_SIM_SEED_COUNT"
-          go test ./replication/sim -run '^TestFoundationDBFaultCampaign$' -count=1 -timeout=40m -v
+          go test ./replication/sim -run '^TestFoundationDBFaultCampaign$' -count=1 -timeout="$TEST_TIMEOUT" -v
 
   tla:
     name: TLA+ (${{ matrix.config }})
+    if: ${{ !inputs.short_seed_sweep }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -104,11 +113,11 @@ jobs:
           - module: VSR
             config: VSRConsensus
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: formal
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6.0.0
         with:
           distribution: temurin
           java-version: '21'
@@ -132,7 +141,7 @@ jobs:
             -metadir "$RUNNER_TEMP/tlc-states" "$TLA_MODULE.tla" 2>&1 | tee tlc.log
       - name: Preserve model checking output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: tlc-${{ matrix.config }}
           path: formal/tlc.log

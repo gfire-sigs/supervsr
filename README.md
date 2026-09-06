@@ -26,9 +26,12 @@ VSR_SIM_SEED_START=3 VSR_SIM_SEED_COUNT=1 go test ./replication/sim \
   -run '^TestFoundationDBFaultCampaign$/^seed_3$/^overlapping_faults$' -count=1
 ```
 
-Default runs cover seeds 1–3. Scheduled and manually dispatched CI runs sweep
-32 seeds across four jobs and print the seed range for replay. Failures report
-seed, scenario, simulation step, and member state; they are not retried or skipped.
+Default runs cover seeds 1–3. Scheduled and ordinary manually dispatched CI runs
+sweep 32 seeds across four jobs and print the seed range for replay. Selecting
+`short_seed_sweep=true` for manual dispatch runs one seed once in a single job,
+with a three-minute test timeout and no duplicate Go, race, or TLA jobs.
+Failures report seed, scenario, simulation step, and member state; they are not
+retried or skipped.
 
 Campaign histories stay below the first checkpoint and vary active membership
 from 3 through the configured maximum, plus standbys. Separate existing tests
