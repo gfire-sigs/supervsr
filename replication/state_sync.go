@@ -672,10 +672,15 @@ func (replica *Replica) finishInterruptedStateSyncOpen() {
 	replay := func() recoveryReplayResult {
 		result := recoveryReplayResult{replayResult: replayResult{commitMin: checkpoint.PrepareOp()}}
 		if recovery.FaultySlots == 0 {
+			replayTarget, targetErr := recoveredCommitTarget(replica.config.Cluster, durable, recovery)
+			if targetErr != nil {
+				result.err = targetErr
+				return result
+			}
 			startup := &startupCompletionSink{ready: make(chan *SMCompletion, 1)}
 			result.replayResult, result.err = replayCommitted(
 				ctx, replica.config, replica.deps.StateMachine, replica.wal, replica.replies, replica.sessions,
-				startup, result.commitMin, checkpoint.Release, durable.State.CommitMax,
+				startup, result.commitMin, checkpoint.Release, replayTarget,
 			)
 		}
 		return result
@@ -705,6 +710,7 @@ func (replica *Replica) finishInterruptedReplay(result recoveryReplayResult) {
 		return
 	}
 	durable := replica.stateSync.recoveryState
+	durable.State.CommitMax = max(durable.State.CommitMax, result.commitMin)
 	recovery := replica.stateSync.recovery
 	status, view, durableView, logView, headOp, err := deriveRecoveredStatus(replica.config, durable, recovery, replica.wal, replica.superblocks)
 	if err != nil {

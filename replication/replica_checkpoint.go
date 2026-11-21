@@ -52,7 +52,7 @@ func (replica *Replica) applyCompact(entry *pipelineEntry, _ CompactResult) {
 }
 
 func (replica *Replica) afterCompact(entry *pipelineEntry) {
-	if replica.pendingView > replica.view {
+	if replica.pendingView > replica.view && replica.canEnterViewChange() {
 		replica.yieldCheckpointToView(entry)
 		return
 	}
@@ -118,7 +118,7 @@ func (replica *Replica) afterCompact(entry *pipelineEntry) {
 }
 
 func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest CheckpointManifest) {
-	if replica.pendingView > replica.view {
+	if replica.pendingView > replica.view && replica.canEnterViewChange() {
 		replica.yieldCheckpointToView(entry)
 		return
 	}
@@ -327,7 +327,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 		replica.beginReleaseActivation(targetRelease)
 		return
 	}
-	if replica.pendingView > replica.view {
+	if replica.pendingView > replica.view && replica.canEnterViewChange() {
 		target := replica.pendingView
 		replica.pendingView = 0
 		replica.beginViewChangeNow(target)

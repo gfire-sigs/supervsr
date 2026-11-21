@@ -105,7 +105,7 @@ func (replica *Replica) handleJoinTimeout() {
 }
 
 func (replica *Replica) handleExitTimeout(sample TimeSample) {
-	if replica.status != StatusNormal || replica.isPrimary() {
+	if replica.status != StatusNormal || replica.isPrimary() || uint8(replica.local) >= replica.membership.ActiveCount {
 		return
 	}
 	if replica.failureDetector.Level(sample.Monotonic) == failureRed {

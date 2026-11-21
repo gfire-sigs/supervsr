@@ -278,3 +278,64 @@ func threeReplicaFormat(t testing.TB) (Config, *crashStorage) {
 	storage.Crash()
 	return config, storage
 }
+
+func TestStandbyAndRecoveringIgnoreExitViewAndStateSyncView(t *testing.T) {
+	cluster := compactTestClusterConfig()
+	members := [MembersMax]protocol.MemberID{{1}, {2}, {3}, {4}}
+	standbyMembership := Membership{Members: members, ActiveCount: 3, StandbyCount: 1, LocalMember: members[3]}
+	frames, err := protocol.NewFramePool(16, uint32(cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := &captureBus{}
+	standbyConfig := Config{
+		Group: protocol.GroupID{8}, Membership: standbyMembership, Cluster: cluster,
+		Process: DefaultProcessConfig(), CurrentRelease: 1, ClientReleaseMin: 1,
+	}
+	standby := &Replica{
+		config:          standbyConfig,
+		membership:      standbyMembership,
+		local:           3,
+		status:          StatusNormal,
+		failureDetector: newLivenessDetector(1),
+		frames:          frames,
+		deps:            Dependencies{MessageBus: bus},
+		logger:          zerolog.Nop(),
+	}
+	standby.handleExitTimeout(TimeSample{Wall: 1000, Monotonic: uint64(10 * time.Second), Synchronized: true})
+	if standby.status != StatusNormal || standby.view != 0 || standby.durableView != 0 || bus.replicaCount() != 0 {
+		t.Fatalf("standby unexpectedly initiated view change: status=%d view=%d durable=%d sent=%d", standby.status, standby.view, standby.durableView, bus.replicaCount())
+	}
+
+	activeMembership := Membership{Members: members, ActiveCount: 3, StandbyCount: 1, LocalMember: members[0]}
+	activeConfig := Config{
+		Group: protocol.GroupID{8}, Membership: activeMembership, Cluster: cluster,
+		Process: DefaultProcessConfig(), CurrentRelease: 1, ClientReleaseMin: 1,
+	}
+	active := &Replica{
+		config:      activeConfig,
+		membership:  activeMembership,
+		local:       0,
+		status:      StatusRecovering,
+		view:        4,
+		durableView: 4,
+		logView:     4,
+		stateSync:   stateSyncRuntime{repairing: true},
+		frames:      frames,
+		deps: Dependencies{
+			MessageBus: bus,
+			Clock:      fixedClock{sample: TimeSample{Wall: 1, Monotonic: 100, Synchronized: true}},
+		},
+		logger: zerolog.Nop(),
+	}
+	active.handleExitView(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 3})
+	active.handleJoinView(protocol.Header{Command: protocol.CommandJoinView, View: 6, Author: 3}, nil)
+	if !active.handleHigherViewEvidence(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 1}) {
+		t.Fatal("active recovering replica did not handle active higher view")
+	}
+	active.beginViewChange(6)
+	if active.view != 4 || active.durableView != 4 || active.pendingView != 0 || active.status != StatusRecovering || active.getViewTarget != 6 {
+		t.Fatalf("recovering replica altered view unexpectedly: status=%d view=%d durable=%d pending=%d getViewTarget=%d",
+			active.status, active.view, active.durableView, active.pendingView, active.getViewTarget)
+	}
+}

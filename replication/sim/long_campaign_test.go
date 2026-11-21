@@ -412,3 +412,11 @@ func TestClientSessionChurnKeepsBoundedOwnership(t *testing.T) {
 func TestInterruptedViewPersistenceRecoverySeed6(t *testing.T) {
 	runLongFaultCampaign(t, 6)
 }
+
+func TestLongCampaignSeed2247(t *testing.T) {
+	runLongFaultCampaign(t, 2247)
+}
+
+func TestLongCampaignSeed2261(t *testing.T) {
+	runLongFaultCampaign(t, 2261)
+}

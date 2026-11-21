@@ -33,11 +33,13 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 			return true
 		}
 	case protocol.CommandExitView, protocol.CommandJoinView, protocol.CommandPing, protocol.CommandPong:
-		if replica.status == StatusRecoveringHead {
-			replica.requestView(header.View, replica.deps.Clock.Now().Monotonic)
-			return true
+		if replica.status == StatusRecoveringHead || replica.status == StatusRecovering {
+			if header.View > replica.view {
+				replica.requestView(header.View, replica.deps.Clock.Now().Monotonic)
+			}
+			return header.Command != protocol.CommandPing && header.Command != protocol.CommandPong
 		}
-		if header.View > replica.view && uint8(replica.local) < replica.membership.ActiveCount {
+		if header.View > replica.view && replica.canEnterViewChange() {
 			replica.beginViewChange(header.View)
 			return true
 		}
@@ -46,11 +48,14 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 }
 
 func (replica *Replica) handleExitView(header protocol.Header) {
+	if uint8(header.Author) >= replica.membership.ActiveCount {
+		return
+	}
 	if header.View > replica.view {
 		replica.beginViewChange(header.View)
 		return
 	}
-	if replica.status != StatusNormal || header.View != replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
+	if replica.status != StatusNormal || header.View != replica.view {
 		return
 	}
 	bit := uint16(1) << uint8(header.Author)
@@ -68,8 +73,24 @@ func (replica *Replica) handleExitView(header protocol.Header) {
 	replica.beginViewChange(replica.view + 1)
 }
 
+func (replica *Replica) canEnterViewChange() bool {
+	if uint8(replica.local) >= replica.membership.ActiveCount {
+		return false
+	}
+	if replica.status != StatusNormal && replica.status != StatusViewChange {
+		return false
+	}
+	if replica.repairViewValid || replica.stateSync.stage != syncStageIdle {
+		return false
+	}
+	if replica.stateSync.repairing || replica.stateSync.opening {
+		return false
+	}
+	return !replica.stateSync.replayRunning
+}
+
 func (replica *Replica) beginViewChange(target protocol.View) {
-	if target <= replica.view || replica.status == StatusRecoveringHead {
+	if target <= replica.view || !replica.canEnterViewChange() {
 		return
 	}
 	if replica.viewIO != (IOHandle{}) || replica.commitInFlight() {
@@ -220,6 +241,9 @@ func (replica *Replica) resumePendingViewChange() bool {
 		replica.pendingView = 0
 		return false
 	}
+	if !replica.canEnterViewChange() {
+		return false
+	}
 	target := replica.pendingView
 	replica.pendingView = 0
 	replica.beginViewChangeNow(target)
@@ -299,6 +323,9 @@ func (replica *Replica) localHeaderEvidence(op protocol.Op) (protocol.Header, bo
 }
 
 func (replica *Replica) handleJoinView(header protocol.Header, body []byte) {
+	if uint8(header.Author) >= replica.membership.ActiveCount {
+		return
+	}
 	if header.View > replica.view {
 		replica.beginViewChange(header.View)
 		return
@@ -307,7 +334,7 @@ func (replica *Replica) handleJoinView(header protocol.Header, body []byte) {
 		replica.broadcastView()
 		return
 	}
-	if replica.status != StatusViewChange || header.View != replica.view || !replica.isPrimary() || replica.durableView != replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
+	if replica.status != StatusViewChange || header.View != replica.view || !replica.isPrimary() || replica.durableView != replica.view {
 		return
 	}
 	replica.recordJoinView(header, body)
