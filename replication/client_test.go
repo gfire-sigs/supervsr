@@ -23,7 +23,7 @@ func TestClientRegistrationRetryReplyAndEviction(t *testing.T) {
 	if len(bus.frames) != 2 || bus.destinations[0] != 0 || bus.destinations[1] == 0 || !bytes.Equal(bus.frames[0], bus.frames[1]) {
 		t.Fatalf("registration routes=%v frames=%d", bus.destinations, len(bus.frames))
 	}
-	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3)
+	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || protocol.Operation(registration.Fields[68]) != protocol.OperationRegister || registration.View != 0 {
 		t.Fatalf("registration header=%+v reason=%v", registration, reason)
 	}
@@ -38,7 +38,7 @@ func TestClientRegistrationRetryReplyAndEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	application := append([]byte(nil), bus.frames[2]...)
-	requestHeader, _, reason := protocol.DecodeFrame(application, protocol.GroupID{1}, 4096, 3)
+	requestHeader, _, reason := protocol.DecodeFrame(application, protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || requestHeader.View != 2 || binary.LittleEndian.Uint64(requestHeader.Fields[48:56]) != 1 || binary.LittleEndian.Uint32(requestHeader.Fields[64:68]) != 1 {
 		t.Fatalf("application request=%+v reason=%v", requestHeader, reason)
 	}
@@ -84,7 +84,7 @@ func TestClientPingPongRaisesViewWithoutRequestResend(t *testing.T) {
 	if len(bus.frames) != 3 {
 		t.Fatalf("client ping routes = %d", len(bus.frames))
 	}
-	ping, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3)
+	ping, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || ping.Command != protocol.CommandClientPing {
 		t.Fatalf("ping command=%d reason=%v", ping.Command, reason)
 	}
@@ -109,7 +109,7 @@ func TestClientReplyCallbackCanSubmit(t *testing.T) {
 	if err := client.Register(); err != nil {
 		t.Fatal(err)
 	}
-	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3)
+	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
@@ -122,7 +122,7 @@ func TestClientReplyCallbackCanSubmit(t *testing.T) {
 	if err := client.Submit(protocol.OperationApplicationMin, nil); !errors.Is(err, ErrRequestInFlight) {
 		t.Fatalf("second submit error=%v", err)
 	}
-	next, _, reason := protocol.DecodeFrame(bus.frames[2], protocol.GroupID{1}, 4096, 3)
+	next, _, reason := protocol.DecodeFrame(bus.frames[2], protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
@@ -170,7 +170,7 @@ func TestClientClosePreservesInflightRequest(t *testing.T) {
 	if len(bus.frames) != 4 || client.State() != ClientUnregistered {
 		t.Fatalf("close lost request: routes=%d state=%d", len(bus.frames), client.State())
 	}
-	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3)
+	registration, _, reason := protocol.DecodeFrame(bus.frames[0], protocol.GroupID{1}, 4096, 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
@@ -215,7 +215,7 @@ func makeClientReply(t testing.TB, request protocol.Header, op protocol.Op, view
 	binary.LittleEndian.PutUint64(header.Fields[88:96], uint64(op))
 	binary.LittleEndian.PutUint64(header.Fields[96:104], 10)
 	copy(header.Fields[104:109], request.Fields[64:69])
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame
@@ -227,7 +227,7 @@ func makeClientEviction(t testing.TB, config ClientConfig, view protocol.View, a
 	header := protocol.Header{Group: config.Group, View: view, Release: config.Release, Protocol: protocol.ProtocolVersion, Command: protocol.CommandEviction, Author: author}
 	copy(header.Fields[:16], config.ID[:])
 	header.Fields[127] = byte(reason)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame
@@ -238,7 +238,7 @@ func makeClientPong(t testing.TB, config ClientConfig, author protocol.ReplicaIn
 	frame := make([]byte, protocol.HeaderSize)
 	header := protocol.Header{Group: config.Group, View: view, Release: config.Release, Protocol: protocol.ProtocolVersion, Command: protocol.CommandClientPong, Author: author}
 	binary.LittleEndian.PutUint64(header.Fields[:8], ping)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame

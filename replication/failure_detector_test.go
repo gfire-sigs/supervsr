@@ -6,24 +6,24 @@ import (
 )
 
 func TestFailureDetectorThresholdBoundaries(t *testing.T) {
-	detector := NewFailureDetector(1)
+	detector := newLivenessDetector(1)
 	ewma := uint64(2 * time.Second)
-	if level := detector.Level(1 + 3*ewma/2); level != FailureGreen {
+	if level := detector.Level(1 + 3*ewma/2); level != failureGreen {
 		t.Fatalf("green boundary = %d", level)
 	}
-	if level := detector.Level(1 + 3*ewma/2 + 1); level != FailureYellow {
+	if level := detector.Level(1 + 3*ewma/2 + 1); level != failureYellow {
 		t.Fatalf("yellow boundary = %d", level)
 	}
-	if level := detector.Level(1 + 3*ewma); level != FailureYellow {
+	if level := detector.Level(1 + 3*ewma); level != failureYellow {
 		t.Fatalf("yellow upper boundary = %d", level)
 	}
-	if level := detector.Level(1 + 3*ewma + 1); level != FailureRed {
+	if level := detector.Level(1 + 3*ewma + 1); level != failureRed {
 		t.Fatalf("red boundary = %d", level)
 	}
 }
 
 func TestFailureDetectorEWMAClampsSignals(t *testing.T) {
-	detector := NewFailureDetector(1)
+	detector := newLivenessDetector(1)
 	detector.Signal(2)
 	want := time.Duration((4*uint64(2*time.Second) + uint64(100*time.Millisecond)) / 5)
 	if detector.EWMA() != want {

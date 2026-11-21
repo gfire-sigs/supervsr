@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	SuperblockStateSize      = 2048
+	superblockStateSize      = 2048
 	SuperblockReservationEnd = 4096
-	SuperblockHeadersOffset  = 4096
-	SuperblockHeadersMax     = 16
+	superblockHeadersOffset  = 4096
+	superblockHeadersMax     = 16
 )
 
 var (
@@ -23,7 +23,7 @@ var (
 	ErrIncompatibleConfiguration          = errors.New("replication: durable configuration is incompatible")
 )
 
-type DurableReplicaState struct {
+type durableReplicaState struct {
 	Checkpoint   CheckpointState
 	LocalMember  protocol.MemberID
 	Members      [MembersMax]protocol.MemberID
@@ -36,39 +36,39 @@ type DurableReplicaState struct {
 	StandbyCount uint8
 }
 
-type Superblock struct {
+type superblockRecord struct {
 	Checksum              protocol.Checksum
 	FormatVersion         uint16
 	Release               protocol.Release
 	Sequence              uint64
 	Group                 protocol.GroupID
 	ParentChecksum        protocol.Checksum
-	State                 DurableReplicaState
+	State                 durableReplicaState
 	ViewHeaderCount       uint32
 	ConfigurationChecksum protocol.Checksum
 	ProtocolVersion       uint16
-	ViewHeaders           [SuperblockHeadersMax][protocol.HeaderSize]byte
+	ViewHeaders           [superblockHeadersMax][protocol.HeaderSize]byte
 }
 
-type SuperblockValidation struct {
+type superblockValidation struct {
 	Group                 protocol.GroupID
 	Membership            Membership
 	ConfigurationChecksum protocol.Checksum
 	Cluster               ClusterConfig
 }
 
-type SuperblockCandidate struct {
-	Superblock       Superblock
+type superblockCandidate struct {
+	superblockRecord superblockRecord
 	PhysicalIndex    uint16
 	MisdirectedIndex bool
 }
 
 type superblockLogicalValue struct {
-	candidate SuperblockCandidate
+	candidate superblockCandidate
 	count     uint8
 }
 
-func (superblock *Superblock) Encode(destination []byte, physicalIndex uint16, validation SuperblockValidation) error {
+func (superblock *superblockRecord) Encode(destination []byte, physicalIndex uint16, validation superblockValidation) error {
 	if len(destination) != SuperblockBytes || physicalIndex >= uint16(validation.Cluster.SuperblockCopies) {
 		return ErrInvalidSuperblock
 	}
@@ -89,10 +89,10 @@ func (superblock *Superblock) Encode(destination []byte, physicalIndex uint16, v
 	copy(destination[2156:2172], superblock.ConfigurationChecksum[:])
 	binary.LittleEndian.PutUint16(destination[2172:2174], superblock.ProtocolVersion)
 	for index := range int(superblock.ViewHeaderCount) {
-		start := SuperblockHeadersOffset + index*protocol.HeaderSize
+		start := superblockHeadersOffset + index*protocol.HeaderSize
 		copy(destination[start:start+protocol.HeaderSize], superblock.ViewHeaders[index][:])
 	}
-	checksum, err := protocol.ChecksumBytesWith(validation.Cluster.ChecksumAlgorithm, destination[34:])
+	checksum, err := protocol.ChecksumBytes(validation.Cluster.ChecksumAlgorithm, destination[34:])
 	if err != nil {
 		return ErrIncompatibleConfiguration
 	}
@@ -101,25 +101,25 @@ func (superblock *Superblock) Encode(destination []byte, physicalIndex uint16, v
 	return nil
 }
 
-func DecodeSuperblock(source []byte, physicalIndex uint16, validation SuperblockValidation) (SuperblockCandidate, error) {
+func decodeSuperblock(source []byte, physicalIndex uint16, validation superblockValidation) (superblockCandidate, error) {
 	if len(source) != SuperblockBytes || !allZeroBytes(source[16:32]) {
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	var checksum protocol.Checksum
 	copy(checksum[:], source[:16])
-	computed, err := protocol.ChecksumBytesWith(validation.Cluster.ChecksumAlgorithm, source[34:])
+	computed, err := protocol.ChecksumBytes(validation.Cluster.ChecksumAlgorithm, source[34:])
 	if err != nil {
-		return SuperblockCandidate{}, ErrIncompatibleConfiguration
+		return superblockCandidate{}, ErrIncompatibleConfiguration
 	}
 	if computed != checksum {
 		alternate := protocol.ChecksumWyhash128
 		if validation.Cluster.ChecksumAlgorithm == protocol.ChecksumWyhash128 {
 			alternate = protocol.ChecksumAEGIS128L
 		}
-		if altComputed, altErr := protocol.ChecksumBytesWith(alternate, source[34:]); altErr == nil && altComputed == checksum {
-			return SuperblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
+		if altComputed, altErr := protocol.ChecksumBytes(alternate, source[34:]); altErr == nil && altComputed == checksum {
+			return superblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
 		}
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	storedFormat := binary.LittleEndian.Uint16(source[34:36])
 	storedRelease := protocol.Release(binary.LittleEndian.Uint32(source[36:40]))
@@ -130,16 +130,16 @@ func DecodeSuperblock(source []byte, physicalIndex uint16, validation Superblock
 	copy(storedConfiguration[:], source[2156:2172])
 	storedProtocol := binary.LittleEndian.Uint16(source[2172:2174])
 	if storedRelease == 0 || storedSequence == 0 {
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	if storedFormat != protocol.FormatVersion ||
 		storedGroup != validation.Group ||
 		storedConfiguration != validation.ConfigurationChecksum ||
 		storedProtocol != protocol.ProtocolVersion {
-		return SuperblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
+		return superblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
 	}
 	storedIndex := binary.LittleEndian.Uint16(source[32:34])
-	var superblock Superblock
+	var superblock superblockRecord
 	superblock.Checksum = checksum
 	superblock.FormatVersion = binary.LittleEndian.Uint16(source[34:36])
 	superblock.Release = protocol.Release(binary.LittleEndian.Uint32(source[36:40]))
@@ -148,44 +148,44 @@ func DecodeSuperblock(source []byte, physicalIndex uint16, validation Superblock
 	copy(superblock.ParentChecksum[:], source[64:80])
 	state, err := decodeDurableReplicaState(source[96:2144], validation)
 	if err != nil {
-		return SuperblockCandidate{}, err
+		return superblockCandidate{}, err
 	}
 	superblock.State = state
 	if !allZeroBytes(source[80:96]) || binary.LittleEndian.Uint64(source[2144:2152]) != 0 || !allZeroBytes(source[2174:4096]) {
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	superblock.ViewHeaderCount = binary.LittleEndian.Uint32(source[2152:2156])
 	copy(superblock.ConfigurationChecksum[:], source[2156:2172])
 	superblock.ProtocolVersion = binary.LittleEndian.Uint16(source[2172:2174])
-	if superblock.ViewHeaderCount > SuperblockHeadersMax || superblock.ViewHeaderCount > uint32(validation.Cluster.PipelineMax+1) {
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+	if superblock.ViewHeaderCount > superblockHeadersMax || superblock.ViewHeaderCount > uint32(validation.Cluster.PipelineMax+1) {
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	for index := range int(superblock.ViewHeaderCount) {
-		start := SuperblockHeadersOffset + index*protocol.HeaderSize
+		start := superblockHeadersOffset + index*protocol.HeaderSize
 		copy(superblock.ViewHeaders[index][:], source[start:start+protocol.HeaderSize])
 	}
-	unusedStart := SuperblockHeadersOffset + int(superblock.ViewHeaderCount)*protocol.HeaderSize
+	unusedStart := superblockHeadersOffset + int(superblock.ViewHeaderCount)*protocol.HeaderSize
 	if !allZeroBytes(source[unusedStart:]) {
-		return SuperblockCandidate{}, ErrInvalidSuperblock
+		return superblockCandidate{}, ErrInvalidSuperblock
 	}
 	if err := superblock.Validate(validation); err != nil {
-		return SuperblockCandidate{}, err
+		return superblockCandidate{}, err
 	}
-	return SuperblockCandidate{
-		Superblock:       superblock,
+	return superblockCandidate{
+		superblockRecord: superblock,
 		PhysicalIndex:    physicalIndex,
 		MisdirectedIndex: storedIndex != physicalIndex,
 	}, nil
 }
 
-func (superblock *Superblock) Validate(validation SuperblockValidation) error {
+func (superblock *superblockRecord) Validate(validation superblockValidation) error {
 	if !superblock.validIdentity(validation) {
 		return ErrInvalidSuperblock
 	}
 	if superblock.State.LocalMember != validation.Membership.LocalMember || superblock.State.Members != validation.Membership.Members || superblock.State.ActiveCount != validation.Membership.ActiveCount || superblock.State.StandbyCount != validation.Membership.StandbyCount {
 		return errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
 	}
-	checkpointValidation := CheckpointValidation{
+	checkpointValidation := checkpointRules{
 		Group:             validation.Group,
 		MessageSizeMax:    uint32(validation.Cluster.MessageSizeMax),
 		MemberCount:       validation.Membership.ActiveCount + validation.Membership.StandbyCount,
@@ -194,18 +194,18 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 	}
 	checkpointValidation.BlockBase, _ = validation.Cluster.BlockBase()
 	checkpointValidation.BlockSize = validation.Cluster.BlockSize
-	if err := superblock.State.Checkpoint.Validate(checkpointValidation); err != nil {
+	if err := superblock.State.Checkpoint.validate(checkpointValidation); err != nil {
 		return err
 	}
 	checkpointOp := superblock.State.Checkpoint.PrepareOp()
 	if superblock.State.CommitMax < checkpointOp || superblock.State.SyncMax < superblock.State.SyncMin || (superblock.State.SyncMax == 0) != (superblock.State.SyncMin == 0) || superblock.State.View < superblock.State.LogView {
 		return ErrInvalidSuperblock
 	}
-	if superblock.ViewHeaderCount > uint32(validation.Cluster.PipelineMax+1) || superblock.ViewHeaderCount > SuperblockHeadersMax {
+	if superblock.ViewHeaderCount > uint32(validation.Cluster.PipelineMax+1) || superblock.ViewHeaderCount > superblockHeadersMax {
 		return ErrInvalidSuperblock
 	}
 	for index := range int(superblock.ViewHeaderCount) {
-		header, reason := protocol.DecodeHeaderWith(superblock.ViewHeaders[index][:], validation.Group, uint32(validation.Cluster.MessageSizeMax), validation.Membership.ActiveCount+validation.Membership.StandbyCount, validation.Cluster.ChecksumAlgorithm)
+		header, reason := protocol.DecodeHeader(superblock.ViewHeaders[index][:], validation.Group, uint32(validation.Cluster.MessageSizeMax), validation.Membership.ActiveCount+validation.Membership.StandbyCount, validation.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 			return ErrInvalidSuperblock
 		}
@@ -213,7 +213,7 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 	return nil
 }
 
-func (superblock *Superblock) validIdentity(validation SuperblockValidation) bool {
+func (superblock *superblockRecord) validIdentity(validation superblockValidation) bool {
 	return superblock.FormatVersion == protocol.FormatVersion &&
 		superblock.Release != 0 &&
 		superblock.Sequence != 0 &&
@@ -222,12 +222,12 @@ func (superblock *Superblock) validIdentity(validation SuperblockValidation) boo
 		superblock.ProtocolVersion == protocol.ProtocolVersion
 }
 
-func (state *DurableReplicaState) encode(destination []byte) error {
-	if len(destination) != SuperblockStateSize {
+func (state *durableReplicaState) encode(destination []byte) error {
+	if len(destination) != superblockStateSize {
 		return ErrInvalidSuperblock
 	}
 	clear(destination)
-	if err := state.Checkpoint.Encode(destination[:CheckpointStateSize]); err != nil {
+	if err := state.Checkpoint.encode(destination[:CheckpointStateSize]); err != nil {
 		return err
 	}
 	copy(destination[1024:1040], state.LocalMember[:])
@@ -244,15 +244,15 @@ func (state *DurableReplicaState) encode(destination []byte) error {
 	return nil
 }
 
-func decodeDurableReplicaState(source []byte, validation SuperblockValidation) (DurableReplicaState, error) {
-	if len(source) != SuperblockStateSize || !allZeroBytes(source[1256:1260]) || !allZeroBytes(source[1270:]) {
-		return DurableReplicaState{}, ErrInvalidSuperblock
+func decodeDurableReplicaState(source []byte, validation superblockValidation) (durableReplicaState, error) {
+	if len(source) != superblockStateSize || !allZeroBytes(source[1256:1260]) || !allZeroBytes(source[1270:]) {
+		return durableReplicaState{}, ErrInvalidSuperblock
 	}
 	blockBase, ok := validation.Cluster.BlockBase()
 	if !ok {
-		return DurableReplicaState{}, ErrInvalidSuperblock
+		return durableReplicaState{}, ErrInvalidSuperblock
 	}
-	checkpoint, err := DecodeCheckpointState(source[:1024], CheckpointValidation{
+	checkpoint, err := decodeCheckpointState(source[:1024], checkpointRules{
 		Group:             validation.Group,
 		MessageSizeMax:    uint32(validation.Cluster.MessageSizeMax),
 		MemberCount:       validation.Membership.ActiveCount + validation.Membership.StandbyCount,
@@ -262,9 +262,9 @@ func decodeDurableReplicaState(source []byte, validation SuperblockValidation) (
 		ChecksumAlgorithm: validation.Cluster.ChecksumAlgorithm,
 	})
 	if err != nil {
-		return DurableReplicaState{}, err
+		return durableReplicaState{}, err
 	}
-	state := DurableReplicaState{Checkpoint: checkpoint}
+	state := durableReplicaState{Checkpoint: checkpoint}
 	copy(state.LocalMember[:], source[1024:1040])
 	for index := range state.Members {
 		copy(state.Members[index][:], source[1040+index*16:1056+index*16])
@@ -279,10 +279,10 @@ func decodeDurableReplicaState(source []byte, validation SuperblockValidation) (
 	return state, nil
 }
 
-func SelectSuperblock(candidates []SuperblockCandidate, copies uint64) (SuperblockCandidate, error) {
+func selectSuperblock(candidates []superblockCandidate, copies uint64) (superblockCandidate, error) {
 	openQuorum, ok := superblockOpenQuorum(copies)
 	if !ok || len(candidates) == 0 || len(candidates) > int(copies) {
-		return SuperblockCandidate{}, ErrSuperblockQuorum
+		return superblockCandidate{}, ErrSuperblockQuorum
 	}
 	var values [8]superblockLogicalValue
 	valueCount := 0
@@ -290,9 +290,9 @@ func SelectSuperblock(candidates []SuperblockCandidate, copies uint64) (Superblo
 		matched := false
 		for index := range valueCount {
 			value := &values[index]
-			if value.candidate.Superblock.Sequence == candidate.Superblock.Sequence {
-				if value.candidate.Superblock.Checksum != candidate.Superblock.Checksum {
-					return SuperblockCandidate{}, ErrSuperblockFork
+			if value.candidate.superblockRecord.Sequence == candidate.superblockRecord.Sequence {
+				if value.candidate.superblockRecord.Checksum != candidate.superblockRecord.Checksum {
+					return superblockCandidate{}, ErrSuperblockFork
 				}
 				value.count++
 				matched = true
@@ -306,22 +306,22 @@ func SelectSuperblock(candidates []SuperblockCandidate, copies uint64) (Superblo
 	}
 	for left := range valueCount {
 		for right := left + 1; right < valueCount; right++ {
-			if values[right].candidate.Superblock.Sequence < values[left].candidate.Superblock.Sequence {
+			if values[right].candidate.superblockRecord.Sequence < values[left].candidate.superblockRecord.Sequence {
 				values[left], values[right] = values[right], values[left]
 			}
 		}
 	}
 	for index := 1; index < valueCount; index++ {
-		previous := &values[index-1].candidate.Superblock
-		current := &values[index].candidate.Superblock
+		previous := &values[index-1].candidate.superblockRecord
+		current := &values[index].candidate.superblockRecord
 		if current.Sequence != previous.Sequence+1 || current.ParentChecksum != previous.Checksum || durableStateRegressed(&previous.State, &current.State) {
-			return SuperblockCandidate{}, ErrInvalidSuperblock
+			return superblockCandidate{}, ErrInvalidSuperblock
 		}
 	}
 	selected := -1
 	for index := range valueCount {
 		requiredQuorum := openQuorum
-		block := &values[index].candidate.Superblock
+		block := &values[index].candidate.superblockRecord
 		if block.Sequence == 1 && block.ParentChecksum.IsZero() {
 			requiredQuorum, _ = superblockWriteCopies(copies)
 		}
@@ -334,19 +334,19 @@ func SelectSuperblock(candidates []SuperblockCandidate, copies uint64) (Superblo
 	}
 	if selected == -1 {
 		for index := range valueCount {
-			block := &values[index].candidate.Superblock
+			block := &values[index].candidate.superblockRecord
 			if block.Sequence == 1 && block.ParentChecksum.IsZero() {
-				return SuperblockCandidate{}, ErrSuperblockInitializationIncomplete
+				return superblockCandidate{}, ErrSuperblockInitializationIncomplete
 			}
 		}
-		return SuperblockCandidate{}, ErrSuperblockQuorum
+		return superblockCandidate{}, ErrSuperblockQuorum
 	}
 	return values[selected].candidate, nil
 }
 
 func betterSuperblock(left, right superblockLogicalValue) bool {
-	leftBlock := &left.candidate.Superblock
-	rightBlock := &right.candidate.Superblock
+	leftBlock := &left.candidate.superblockRecord
+	rightBlock := &right.candidate.superblockRecord
 	if leftBlock.Sequence != rightBlock.Sequence {
 		return leftBlock.Sequence > rightBlock.Sequence
 	}
@@ -356,7 +356,7 @@ func betterSuperblock(left, right superblockLogicalValue) bool {
 	return compareChecksum(leftBlock.Checksum, rightBlock.Checksum) < 0
 }
 
-func durableStateRegressed(previous, current *DurableReplicaState) bool {
+func durableStateRegressed(previous, current *durableReplicaState) bool {
 	return current.Checkpoint.PrepareOp() < previous.Checkpoint.PrepareOp() || current.CommitMax < previous.CommitMax || current.LogView < previous.LogView || current.View < previous.View
 }
 

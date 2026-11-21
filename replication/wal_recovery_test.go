@@ -10,11 +10,11 @@ import (
 
 func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 	config, storage, checkpoint := formattedWALFixture(t)
-	wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reserved, err := ReservedPrepareHeader(protocol.GroupID{1}, 1, 1, uint32(config.MessageSizeMax))
+	reserved, err := reservedPrepareHeader(protocol.GroupID{1}, 1, 1, uint32(config.MessageSizeMax), ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,11 +34,11 @@ func TestWALRecoverRepairsPrepareBeforeRedundantHeader(t *testing.T) {
 	}
 	storage.Crash()
 
-	recovered, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+	recovered, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = recovered.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err = recovered.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,11 +65,11 @@ func TestWALRecoverSoloRejectsUncertainBody(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config, storage, checkpoint := formattedWALFixture(t)
-			wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+			wal, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
-			report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+			report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -80,7 +80,7 @@ func TestWALRecoverSoloRejectsUncertainBody(t *testing.T) {
 					t.Fatal(err)
 				}
 				var reason protocol.RejectReason
-				parent, _, reason = protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1)
+				parent, _, reason = protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 				if reason != protocol.RejectNone {
 					t.Fatal(reason)
 				}
@@ -97,11 +97,11 @@ func TestWALRecoverSoloRejectsUncertainBody(t *testing.T) {
 			}
 			storage.Crash()
 
-			recovered, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+			recovered, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := recovered.Recover(checkpoint, 0, WALRecoveryView{}); !errors.Is(err, ErrWALUncertainSolo) {
+			if _, err := recovered.Recover(checkpoint, 0, walRecoveryView{}); !errors.Is(err, ErrWALUncertainSolo) {
 				t.Fatalf("error = %v, want %v", err, ErrWALUncertainSolo)
 			}
 		})
@@ -116,11 +116,11 @@ func TestWALRecoverLatestBodyNeedsRemoteRepair(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			config, storage, checkpoint := formattedWALFixture(t)
-			wal, err := NewWAL(storage, config, protocol.GroupID{1}, 3)
+			wal, err := newWAL(storage, config, protocol.GroupID{1}, 3)
 			if err != nil {
 				t.Fatal(err)
 			}
-			report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+			report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -141,11 +141,11 @@ func TestWALRecoverLatestBodyNeedsRemoteRepair(t *testing.T) {
 			storage.Crash()
 
 			for reopen := range 2 {
-				wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+				wal, err = newWAL(storage, config, protocol.GroupID{1}, 3)
 				if err != nil {
 					t.Fatal(err)
 				}
-				report, err = wal.Recover(checkpoint, 1, WALRecoveryView{})
+				report, err = wal.Recover(checkpoint, 1, walRecoveryView{})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -169,11 +169,11 @@ func TestWALRecoverLatestBodyNeedsRemoteRepair(t *testing.T) {
 				t.Fatal(err)
 			}
 			storage.Crash()
-			wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+			wal, err = newWAL(storage, config, protocol.GroupID{1}, 3)
 			if err != nil {
 				t.Fatal(err)
 			}
-			report, err = wal.Recover(checkpoint, 1, WALRecoveryView{})
+			report, err = wal.Recover(checkpoint, 1, walRecoveryView{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -189,11 +189,11 @@ func TestWALRecoverLatestBodyNeedsRemoteRepair(t *testing.T) {
 
 func TestWALRecoverTruncatesProvenFutureHeader(t *testing.T) {
 	config, storage, checkpoint := formattedWALFixture(t)
-	wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,11 +214,11 @@ func TestWALRecoverTruncatesProvenFutureHeader(t *testing.T) {
 	}
 	storage.Crash()
 
-	wal, err = NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err = newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = wal.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err = wal.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,8 +235,8 @@ func TestRecoveredCommitTargetRetainsBoundedSuffix(t *testing.T) {
 	head := protocol.Header{}
 	putUint64(head.Fields[96:104], 10)
 	putUint64(head.Fields[104:112], 3)
-	recovery := WALRecoveryReport{HeadOp: 10, HeadHeader: head}
-	durable := Superblock{}
+	recovery := walRecoveryReport{HeadOp: 10, HeadHeader: head}
+	durable := superblockRecord{}
 
 	target, err := recoveredCommitTarget(config, durable, recovery)
 	if err != nil {
@@ -275,7 +275,7 @@ func formattedWALFixture(t testing.TB) (ClusterConfig, *crashStorage, Checkpoint
 		t.Fatal(err)
 	}
 	storage.Crash()
-	store, err := OpenSuperblockStore(storage, SuperblockValidation{Group: format.Group, Membership: membership, ConfigurationChecksum: config.Fingerprint(), Cluster: config})
+	store, err := openSuperblockStore(storage, superblockValidation{Group: format.Group, Membership: membership, ConfigurationChecksum: config.Fingerprint(), Cluster: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func connectedPrepareFrame(t testing.TB, config ClusterConfig, parent protocol.H
 	putUint64(header.Fields[112:120], uint64(op))
 	putUint32(header.Fields[120:124], uint32(op))
 	header.Fields[124] = byte(protocol.OperationApplicationMin)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame

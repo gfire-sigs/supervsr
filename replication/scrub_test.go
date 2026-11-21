@@ -27,8 +27,8 @@ func TestScrubDelayTracksAllocatedBlocksAndClamps(t *testing.T) {
 			ScrubCycle: 10 * time.Second, ScrubReadConcurrency: 2,
 			ScrubIntervalMin: 250 * time.Millisecond, ScrubIntervalMax: 20 * time.Second,
 		}},
-		io:             &IOEngine{freeLen: 1},
-		blockAllocator: &BlockAllocator{blockCount: 4, acquired: acquired, released: released},
+		io:             &storageIOEngine{freeLen: 1},
+		blockAllocator: &blockSpaceAllocator{blockCount: 4, acquired: acquired, released: released},
 	}
 	if got, want := replica.scrubDelay(), 20*time.Second/3; got != want {
 		t.Fatalf("scrub delay=%s, want %s", got, want)
@@ -53,7 +53,7 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 	wrongFrame := make([]byte, config.Cluster.BlockSize)
 	body := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	copy(wrongFrame[protocol.HeaderSize:], body)
-	if err := protocol.EncodeHeader(wrongFrame[:protocol.HeaderSize], &wrongHeader); err != nil {
+	if err := protocol.EncodeHeader(wrongFrame[:protocol.HeaderSize], &wrongHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	expected := BlockRequirement{
@@ -69,7 +69,7 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 		metrics: metrics,
 	}
 	operation := blockRepairIO{buffer: wrongFrame, address: 1, busy: true, stage: blockRepairIOScrub}
-	replica.finishScrubRead(&operation, IOCompletion{})
+	replica.finishScrubRead(&operation, ioCompletion{})
 	if validator.resolveCalls != 1 {
 		t.Fatalf("resolve calls=%d, want 1", validator.resolveCalls)
 	}
@@ -88,9 +88,9 @@ func TestScrubResolvesUncachedExpectationBeforeValidation(t *testing.T) {
 	}
 }
 
-func mustFixedBitSet(t testing.TB, length uint64, indexes ...uint64) FixedBitSet {
+func mustFixedBitSet(t testing.TB, length uint64, indexes ...uint64) fixedBitSet {
 	t.Helper()
-	set, err := NewFixedBitSet(length)
+	set, err := newFixedBitSet(length)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,14 +3,14 @@ package replication
 import "time"
 
 type replicaTimers struct {
-	ping       Timeout
-	prepare    Timeout
-	abdication Timeout
-	commit     Timeout
-	exit       Timeout
-	join       Timeout
-	pulse      Timeout
-	repair     Timeout
+	ping       tickTimeout
+	prepare    tickTimeout
+	abdication tickTimeout
+	commit     tickTimeout
+	exit       tickTimeout
+	join       tickTimeout
+	pulse      tickTimeout
+	repair     tickTimeout
 }
 
 func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
@@ -25,7 +25,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		100 * time.Millisecond,
 	}
 	timers := replicaTimers{}
-	destinations := [...]*Timeout{
+	destinations := [...]*tickTimeout{
 		&timers.ping,
 		&timers.prepare,
 		&timers.abdication,
@@ -36,7 +36,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		&timers.repair,
 	}
 	for index := range periods {
-		timeout, err := NewTimeout(periods[index], process.Tick, 0)
+		timeout, err := newTimeout(periods[index], process.Tick, 0)
 		if err != nil {
 			return replicaTimers{}, err
 		}

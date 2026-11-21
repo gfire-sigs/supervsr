@@ -135,14 +135,14 @@ func FuzzDecodeFrameDoesNotPanic(f *testing.F) {
 		if len(frame) > int(context.MessageSizeMax)+1 {
 			t.Skip()
 		}
-		_, _, _ = DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount)
+		_, _, _ = DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L)
 	})
 }
 
 func makeValidFuzzSeed(context ValidationContext) []byte {
 	frame := make([]byte, HeaderSize)
 	header := Header{Group: context.Group, Protocol: ProtocolVersion, Command: CommandExitView, Author: context.Sender}
-	if err := SealFrame(frame, &header); err != nil {
+	if err := SealFrame(frame, &header, ChecksumAEGIS128L); err != nil {
 		panic(err)
 	}
 	return frame

@@ -100,11 +100,11 @@ func TestControlledReplacementPreservesCheckpointHistory(t *testing.T) {
 	victim := world.primary()
 	world.check(world.cluster.Crash(t.Context(), victim))
 	old := world.cluster.Storage(victim)
-	oldChecksum := protocol.ChecksumBytes(old.DurableBytes())
+	oldChecksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, old.DurableBytes())
+	world.check(err)
 	fence := &controlledReplacementFence{cluster: world.cluster, member: victim, old: old}
 	fresh := &fencedReplacementStorage{Storage: NewStorage(), fence: fence}
 	adapter := &controlledReplacementClient{world: world}
-	var err error
 	adapter.client, err = world.cluster.AddClient(protocol.ClientID{2}, adapter)
 	world.check(err)
 	config := world.cluster.nodes[victim].config
@@ -112,7 +112,9 @@ func TestControlledReplacementPreservesCheckpointHistory(t *testing.T) {
 		Group: config.Group, Membership: config.Membership, Cluster: config.Cluster,
 		CurrentRelease: config.CurrentRelease, ConfigurationChecksum: config.Cluster.Fingerprint(),
 	}, replication.ReplacementDependencies{Storage: fresh, Client: adapter, Fence: fence}))
-	if !fence.verified || protocol.ChecksumBytes(old.DurableBytes()) != oldChecksum {
+	afterChecksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, old.DurableBytes())
+	world.check(err)
+	if !fence.verified || afterChecksum != oldChecksum {
 		world.fail("replacement bypassed fencing or rewrote the lost image")
 	}
 	world.cluster.stores[victim] = fresh.Storage

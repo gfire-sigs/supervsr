@@ -18,6 +18,7 @@ type (
 	Release           = protocol.Release
 	Operation         = protocol.Operation
 	Command           = protocol.Command
+	EvictionReason    = protocol.EvictionReason
 	BlockType         = protocol.BlockType
 	ChecksumAlgorithm = protocol.ChecksumAlgorithm
 )
@@ -46,6 +47,18 @@ const (
 	BlockManifest       = protocol.BlockManifest
 	BlockIndex          = protocol.BlockIndex
 	BlockValue          = protocol.BlockValue
+)
+
+const (
+	EvictionReserved               = protocol.EvictionReserved
+	EvictionNoSession              = protocol.EvictionNoSession
+	EvictionClientReleaseTooLow    = protocol.EvictionClientReleaseTooLow
+	EvictionClientReleaseTooHigh   = protocol.EvictionClientReleaseTooHigh
+	EvictionInvalidOperation       = protocol.EvictionInvalidOperation
+	EvictionInvalidBody            = protocol.EvictionInvalidBody
+	EvictionInvalidBodySize        = protocol.EvictionInvalidBodySize
+	EvictionSessionTooLow          = protocol.EvictionSessionTooLow
+	EvictionSessionReleaseMismatch = protocol.EvictionSessionReleaseMismatch
 )
 
 const (

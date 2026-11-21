@@ -22,6 +22,7 @@ const (
 	FrameSourceReplica
 )
 
+// FramePool manages a lock-free fixed pool of preallocated message buffers.
 type FramePool struct {
 	head           atomic.Uint64
 	available      atomic.Uint32
@@ -30,6 +31,8 @@ type FramePool struct {
 	storage        []byte
 }
 
+// Frame represents a single preallocated wire buffer with explicit reference
+// counting and immutable post-Seal payloads.
 type Frame struct {
 	pool   *FramePool
 	buffer []byte
@@ -42,6 +45,8 @@ type Frame struct {
 	size   uint32
 }
 
+// NewFramePool allocates a pool of count frames each supporting up to messageSizeMax
+// total bytes including HeaderSize.
 func NewFramePool(count, messageSizeMax uint32) (*FramePool, error) {
 	if count == 0 || count == math.MaxUint32 || messageSizeMax < HeaderSize {
 		return nil, ErrInvalidFramePool
@@ -71,6 +76,7 @@ func NewFramePool(count, messageSizeMax uint32) (*FramePool, error) {
 	return pool, nil
 }
 
+// Acquire borrows a writable frame sized for bodySize payload bytes with refcount 1.
 func (pool *FramePool) Acquire(bodySize uint32) (*Frame, error) {
 	if uint64(bodySize)+HeaderSize > uint64(pool.messageSizeMax) {
 		return nil, ErrFrameTooLarge
@@ -86,6 +92,7 @@ func (pool *FramePool) Acquire(bodySize uint32) (*Frame, error) {
 	return frame, nil
 }
 
+// AcquireEncoded borrows a sealed read-only frame initialized with encoded datagram bytes.
 func (pool *FramePool) AcquireEncoded(encoded []byte) (*Frame, error) {
 	if len(encoded) < HeaderSize {
 		return nil, ErrFrameEncoding
@@ -103,10 +110,13 @@ func (pool *FramePool) AcquireEncoded(encoded []byte) (*Frame, error) {
 	frame.refs.Store(1)
 	return frame, nil
 }
+
+// BindClient marks an unauthenticated sealed frame as originating from a client.
 func (frame *Frame) BindClient() error {
 	return frame.bindSource(1)
 }
 
+// BindReplica binds an authenticated sealed frame to a cluster member identity and index.
 func (frame *Frame) BindReplica(member MemberID, sender ReplicaIndex) error {
 	if member.IsZero() || !frame.sealed.Load() || frame.refs.Load() != 1 || !frame.source.CompareAndSwap(0, math.MaxUint32) {
 		return ErrFrameSource
@@ -150,6 +160,7 @@ func (pool *FramePool) MessageSizeMax() uint32 {
 	return pool.messageSizeMax
 }
 
+// Body returns the writable payload slice prior to Seal.
 func (frame *Frame) Body() ([]byte, error) {
 	if frame.sealed.Load() || frame.refs.Load() <= 0 {
 		return nil, ErrFrameSealed
@@ -157,6 +168,7 @@ func (frame *Frame) Body() ([]byte, error) {
 	return frame.buffer[HeaderSize:frame.size:frame.size], nil
 }
 
+// ResizeBody adjusts the frame payload length prior to Seal.
 func (frame *Frame) ResizeBody(bodySize uint32) error {
 	if frame.sealed.Load() || frame.refs.Load() != 1 {
 		return ErrFrameSealed
@@ -168,21 +180,20 @@ func (frame *Frame) ResizeBody(bodySize uint32) error {
 	return nil
 }
 
-func (frame *Frame) Seal(header *Header) error {
-	return frame.SealWith(header, ChecksumAEGIS128L)
-}
-
-func (frame *Frame) SealWith(header *Header, algorithm ChecksumAlgorithm) error {
+// Seal computes body and header checksums using algorithm, encodes header into
+// the frame prefix, and marks the frame immutable.
+func (frame *Frame) Seal(header *Header, algorithm ChecksumAlgorithm) error {
 	if frame.sealed.Load() || frame.refs.Load() != 1 {
 		return ErrFrameSealed
 	}
-	if err := SealFrameWith(frame.buffer[:frame.size], header, algorithm); err != nil {
+	if err := SealFrame(frame.buffer[:frame.size], header, algorithm); err != nil {
 		return err
 	}
 	frame.sealed.Store(true)
 	return nil
 }
 
+// Bytes returns the sealed frame bytes ready for network transmission or storage.
 func (frame *Frame) Bytes() ([]byte, error) {
 	if !frame.sealed.Load() || frame.refs.Load() <= 0 {
 		return nil, ErrFrameEncoding
@@ -190,6 +201,8 @@ func (frame *Frame) Bytes() ([]byte, error) {
 	return frame.buffer[:frame.size:frame.size], nil
 }
 
+// Retain increments the reference count of a sealed frame and returns false if
+// already unsealed, released, or saturated.
 func (frame *Frame) Retain() bool {
 	if !frame.sealed.Load() {
 		return false
@@ -205,6 +218,8 @@ func (frame *Frame) Retain() bool {
 	}
 }
 
+// Release decrements the frame reference count and returns the buffer to its
+// FramePool when the count reaches zero.
 func (frame *Frame) Release() {
 	remaining := frame.refs.Add(-1)
 	if remaining > 0 {

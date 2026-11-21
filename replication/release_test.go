@@ -322,12 +322,12 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	}
 	cancel()
 	blocked := newBlockingStorage()
-	ioEngine, err := NewIOEngine(blocked, 1, 1)
+	ioEngine, err := newDefaultIOEngine(blocked, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	replica.io = ioEngine
-	if _, err := ioEngine.Submit(IOOperation{Kind: IOWrite, Buffer: []byte{1}}); err != nil {
+	if _, err := ioEngine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{1}}); err != nil {
 		t.Fatal(err)
 	}
 	select {

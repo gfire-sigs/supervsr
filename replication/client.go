@@ -30,11 +30,15 @@ type ClientReply struct {
 	Body      []byte
 }
 
+// ClientEvents receives asynchronous replies and eviction notices emitted from
+// Client.HandleFrame on the caller's thread.
 type ClientEvents interface {
 	Reply(reply ClientReply)
 	Evicted(reason protocol.EvictionReason)
 }
 
+// ClientConfig fixes group identity, session release bounds, frame limits, and
+// retransmission settings for a VSR Client or ManagedClient.
 type ClientConfig struct {
 	Group             protocol.GroupID
 	ID                protocol.ClientID
@@ -53,13 +57,15 @@ type clientInflight struct {
 	operation protocol.Operation
 }
 
+// Client implements the single-threaded, event-driven VSR client session state
+// machine. For concurrent goroutine callers, use ManagedClient instead.
 type Client struct {
 	config ClientConfig
 	bus    MessageBus
 	clock  Clock
 	events ClientEvents
 	frames *protocol.FramePool
-	random DeterministicRandom
+	random deterministicRandom
 
 	state      ClientState
 	view       protocol.View
@@ -68,13 +74,14 @@ type Client struct {
 	parent     protocol.Checksum
 	batchLimit uint32
 	inflight   clientInflight
-	request    Timeout
-	ping       Timeout
+	request    tickTimeout
+	ping       tickTimeout
 	lastPing   uint64
 	rtt        [ActiveMax]time.Duration
 	rttValid   uint8
 }
 
+// NewClient constructs a single-threaded event-driven VSR Client.
 func NewClient(config ClientConfig, bus MessageBus, clock Clock, entropy io.Reader, events ClientEvents) (*Client, error) {
 	if config.Group.IsZero() || config.ID.IsZero() || config.Release == 0 || config.ActiveCount == 0 || config.ActiveCount > ActiveMax {
 		return nil, ErrInvalidConfiguration
@@ -97,18 +104,18 @@ func NewClient(config ClientConfig, bus MessageBus, clock Clock, entropy io.Read
 		return nil, err
 	}
 	requestPeriod := time.Duration(config.Process.RTTMultiplier) * config.Process.InitialRTT
-	request, err := NewTimeout(requestPeriod, config.Process.Tick, 0)
+	request, err := newTimeout(requestPeriod, config.Process.Tick, 0)
 	if err != nil {
 		return nil, err
 	}
-	ping, err := NewTimeout(30*time.Second, config.Process.Tick, 0)
+	ping, err := newTimeout(30*time.Second, config.Process.Tick, 0)
 	if err != nil {
 		return nil, err
 	}
 	ping.Start()
 	return &Client{
 		config: config, bus: bus, clock: clock, events: events, frames: frames,
-		random: NewDeterministicRandom(binary.LittleEndian.Uint64(seedBytes[:])), state: ClientUnregistered,
+		random: newDeterministicRandom(binary.LittleEndian.Uint64(seedBytes[:])), state: ClientUnregistered,
 		request: request, ping: ping,
 	}, nil
 }
@@ -129,6 +136,8 @@ func validateClientProcess(config ProcessConfig) error {
 	return nil
 }
 
+// Register initiates client session registration (request 0). Call Tick until
+// ClientEvents.Reply receives the registration response.
 func (client *Client) Register() error {
 	if client.state != ClientUnregistered || client.inflight.frame != nil {
 		return ErrClientState
@@ -137,6 +146,8 @@ func (client *Client) Register() error {
 	return client.send(protocol.OperationRegister, 0, body[:])
 }
 
+// Submit begins sending an application request (at most one request may be in
+// flight per client session). Returns ErrRequestInFlight if busy.
 func (client *Client) Submit(operation protocol.Operation, body []byte) error {
 	if client.state != ClientRegistered {
 		return ErrClientState
@@ -178,7 +189,7 @@ func (client *Client) send(operation protocol.Operation, request protocol.Reques
 	binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(client.session))
 	binary.LittleEndian.PutUint32(header.Fields[64:68], uint32(request))
 	header.Fields[68] = byte(operation)
-	if err := message.SealWith(&header, client.config.ChecksumAlgorithm); err != nil {
+	if err := message.Seal(&header, client.config.ChecksumAlgorithm); err != nil {
 		message.Release()
 		return err
 	}
@@ -202,11 +213,12 @@ func (client *Client) routeRequest(message *Message) {
 	client.bus.SendReplica(protocol.ReplicaIndex(backup), message)
 }
 
+// HandleFrame validates and applies a reply or eviction frame from replica sender.
 func (client *Client) HandleFrame(sender protocol.ReplicaIndex, frame []byte) {
 	if client.state == ClientClosed || uint8(sender) >= client.config.ActiveCount {
 		return
 	}
-	header, body, reason := protocol.DecodeFrameWith(frame, client.config.Group, client.config.MessageSizeMax, client.config.ActiveCount, client.config.ChecksumAlgorithm)
+	header, body, reason := protocol.DecodeFrame(frame, client.config.Group, client.config.MessageSizeMax, client.config.ActiveCount, client.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return
 	}
@@ -282,6 +294,7 @@ func (client *Client) handlePong(sender protocol.ReplicaIndex, header protocol.H
 	client.rttValid |= 1 << uint8(sender)
 }
 
+// Tick advances keepalive pings and request retransmission timers by one Process.Tick.
 func (client *Client) Tick() error {
 	if client.state == ClientClosed {
 		return ErrClientState
@@ -321,7 +334,7 @@ func (client *Client) sendPing() {
 	copy(header.Fields[:16], client.config.ID[:])
 	binary.LittleEndian.PutUint64(header.Fields[16:24], client.lastPing)
 	binary.LittleEndian.PutUint64(header.Fields[24:32], uint64(client.session))
-	if message.SealWith(&header, client.config.ChecksumAlgorithm) == nil {
+	if message.Seal(&header, client.config.ChecksumAlgorithm) == nil {
 		for member := range client.config.ActiveCount {
 			client.bus.SendReplica(protocol.ReplicaIndex(member), message)
 		}
@@ -361,6 +374,9 @@ func (client *Client) clearInflight() {
 	}
 	client.inflight = clientInflight{}
 }
+
+// Close transitions an idle client session to ClientClosed, returning
+// ErrRequestInFlight if a request is still in flight.
 func (client *Client) Close() error {
 	if client.state == ClientClosed {
 		return nil

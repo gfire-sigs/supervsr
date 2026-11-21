@@ -33,21 +33,21 @@ type IOHandle struct {
 	Generation uint64
 }
 
-type IOOperation struct {
-	Kind            IOKind
-	Offset          uint64
-	Buffer          []byte
-	Size            uint64
-	Context         uint64
-	WAL             *WAL
-	ReplyStore      *ReplyStore
-	ExpectedHeader  protocol.Header
-	SuperblockStore *SuperblockStore
-	Superblock      Superblock
-	ReusableThrough protocol.Op
+type ioOperation struct {
+	Kind              IOKind
+	Offset            uint64
+	Buffer            []byte
+	Size              uint64
+	Context           uint64
+	walJournal        *walJournal
+	durableReplyStore *durableReplyStore
+	ExpectedHeader    protocol.Header
+	superblockStore   *superblockStore
+	superblockRecord  superblockRecord
+	ReusableThrough   protocol.Op
 }
 
-type IOCompletion struct {
+type ioCompletion struct {
 	Handle  IOHandle
 	Kind    IOKind
 	Offset  uint64
@@ -68,12 +68,12 @@ const (
 type ioSlot struct {
 	state      atomic.Uint32
 	generation atomic.Uint64
-	operation  IOOperation
+	operation  ioOperation
 	err        error
 	sequence   ioSequence
 }
 
-type IOEngine struct {
+type storageIOEngine struct {
 	storage   Storage
 	work      chan uint32
 	done      chan struct{}
@@ -85,16 +85,16 @@ type IOEngine struct {
 	slots       []ioSlot
 	free        []uint32
 	freeLen     int
-	ready       *MPSCRing[uint32]
+	ready       *mpscRing[uint32]
 	synchronous bool
 	controller  *IOController
 }
 
-func NewIOEngine(storage Storage, requestCount, workerCount uint32) (*IOEngine, error) {
+func newDefaultIOEngine(storage Storage, requestCount, workerCount uint32) (*storageIOEngine, error) {
 	return newIOEngine(storage, requestCount, workerCount, false, nil)
 }
 
-func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool, controller *IOController) (*IOEngine, error) {
+func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool, controller *IOController) (*storageIOEngine, error) {
 	if storage == nil || requestCount == 0 {
 		return nil, ErrInvalidConfiguration
 	}
@@ -114,11 +114,11 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 	for ringCapacity < uint64(requestCount) {
 		ringCapacity <<= 1
 	}
-	ready, err := NewMPSCRing[uint32](ringCapacity)
+	ready, err := newMPSCRing[uint32](ringCapacity)
 	if err != nil {
 		return nil, err
 	}
-	engine := &IOEngine{
+	engine := &storageIOEngine{
 		storage: storage, synchronous: synchronous,
 		work: make(chan uint32, requestCount), done: make(chan struct{}), notify: make(chan struct{}, 1),
 		slots: make([]ioSlot, int(requestCount)), free: make([]uint32, int(requestCount)),
@@ -147,7 +147,7 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 }
 
 // Submit is single-consumer owned by the replica event loop.
-func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
+func (engine *storageIOEngine) Submit(operation ioOperation) (IOHandle, error) {
 	engine.lifecycle.Lock()
 	defer engine.lifecycle.Unlock()
 	if engine.closed.Load() {
@@ -162,16 +162,16 @@ func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
 	if (operation.Kind == IORead || operation.Kind == IOWrite) && len(operation.Buffer) == 0 {
 		return IOHandle{}, ErrIOHandle
 	}
-	if operation.Kind == IOWALAppend && (operation.WAL == nil || len(operation.Buffer) == 0) {
+	if operation.Kind == IOWALAppend && (operation.walJournal == nil || len(operation.Buffer) == 0) {
 		return IOHandle{}, ErrIOHandle
 	}
 	replyOperation := operation.Kind == IOReplyWrite || operation.Kind == IOReplyRead
 	if replyOperation {
-		if operation.ReplyStore == nil || len(operation.Buffer) == 0 {
+		if operation.durableReplyStore == nil || len(operation.Buffer) == 0 {
 			return IOHandle{}, ErrIOHandle
 		}
 	}
-	if operation.Kind == IOSuperblockPersist && operation.SuperblockStore == nil {
+	if operation.Kind == IOSuperblockPersist && operation.superblockStore == nil {
 		return IOHandle{}, ErrIOHandle
 	}
 	engine.freeLen--
@@ -193,7 +193,7 @@ func (engine *IOEngine) Submit(operation IOOperation) (IOHandle, error) {
 	return handle, nil
 }
 
-func (engine *IOEngine) Cancel(handle IOHandle) bool {
+func (engine *storageIOEngine) Cancel(handle IOHandle) bool {
 	if int(handle.Index) >= len(engine.slots) {
 		return false
 	}
@@ -205,7 +205,7 @@ func (engine *IOEngine) Cancel(handle IOHandle) bool {
 }
 
 // Poll is single-consumer owned by the replica event loop.
-func (engine *IOEngine) Poll(completion *IOCompletion) bool {
+func (engine *storageIOEngine) Poll(completion *ioCompletion) bool {
 	var index uint32
 	if !engine.ready.TryPop(&index) {
 		return false
@@ -214,7 +214,7 @@ func (engine *IOEngine) Poll(completion *IOCompletion) bool {
 	if slot.state.Load() != ioSlotComplete {
 		panic("replication: incomplete storage request reached event loop")
 	}
-	*completion = IOCompletion{
+	*completion = ioCompletion{
 		Handle: IOHandle{
 			Index:      index,
 			Generation: slot.generation.Load(),
@@ -226,7 +226,7 @@ func (engine *IOEngine) Poll(completion *IOCompletion) bool {
 		Context: slot.operation.Context,
 		Err:     slot.err,
 	}
-	slot.operation = IOOperation{}
+	slot.operation = ioOperation{}
 	slot.err = nil
 	slot.sequence = ioSequence{}
 	slot.state.Store(ioSlotFree)
@@ -235,19 +235,19 @@ func (engine *IOEngine) Poll(completion *IOCompletion) bool {
 	return true
 }
 
-func (engine *IOEngine) Available() int {
+func (engine *storageIOEngine) Available() int {
 	return engine.freeLen
 }
 
-func (engine *IOEngine) Drained() bool {
+func (engine *storageIOEngine) Drained() bool {
 	return engine.freeLen == len(engine.free)
 }
 
-func (engine *IOEngine) Ready() <-chan struct{} {
+func (engine *storageIOEngine) Ready() <-chan struct{} {
 	return engine.notify
 }
 
-func (engine *IOEngine) Close(ctx context.Context) error {
+func (engine *storageIOEngine) Close(ctx context.Context) error {
 	engine.lifecycle.Lock()
 	if !engine.closed.Swap(true) {
 		close(engine.work)
@@ -266,7 +266,7 @@ func (engine *IOEngine) Close(ctx context.Context) error {
 	}
 }
 
-func (engine *IOEngine) runWorker() {
+func (engine *storageIOEngine) runWorker() {
 	defer engine.workers.Done()
 	for index := range engine.work {
 		slot := &engine.slots[index]
@@ -281,7 +281,7 @@ func (engine *IOEngine) runWorker() {
 	}
 }
 
-func (engine *IOEngine) complete(index uint32, slot *ioSlot) {
+func (engine *storageIOEngine) complete(index uint32, slot *ioSlot) {
 	slot.state.Store(ioSlotComplete)
 	if !engine.ready.TryPush(index) {
 		panic("replication: storage completion ring exhausted")
@@ -292,7 +292,7 @@ func (engine *IOEngine) complete(index uint32, slot *ioSlot) {
 	}
 }
 
-func (engine *IOEngine) execute(operation *IOOperation) error {
+func (engine *storageIOEngine) execute(operation *ioOperation) error {
 	switch operation.Kind {
 	case IORead:
 		return engine.storage.ReadAt(operation.Buffer, operation.Offset)
@@ -303,15 +303,15 @@ func (engine *IOEngine) execute(operation *IOOperation) error {
 	case IOResize:
 		return engine.storage.Resize(operation.Size)
 	case IOWALAppend:
-		return operation.WAL.Append(operation.Buffer, operation.ReusableThrough)
+		return operation.walJournal.Append(operation.Buffer, operation.ReusableThrough)
 	case IOReplyWrite:
-		return operation.ReplyStore.Write(uint32(operation.Offset), operation.Buffer)
+		return operation.durableReplyStore.Write(uint32(operation.Offset), operation.Buffer)
 	case IOReplyRead:
-		frame, err := operation.ReplyStore.Read(uint32(operation.Offset), operation.ExpectedHeader, operation.Buffer)
+		frame, err := operation.durableReplyStore.Read(uint32(operation.Offset), operation.ExpectedHeader, operation.Buffer)
 		operation.Size = uint64(len(frame))
 		return err
 	case IOSuperblockPersist:
-		return operation.SuperblockStore.Persist(operation.Superblock)
+		return operation.superblockStore.Persist(operation.superblockRecord)
 	default:
 		return ErrIOHandle
 	}

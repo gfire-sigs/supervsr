@@ -120,7 +120,11 @@ func (world *ledgerWorld) advance(event ScheduledIO) {
 	binary.LittleEndian.PutUint64(record[48:56], event.Operation.Handle.Generation)
 	binary.LittleEndian.PutUint64(record[56:64], event.Operation.Offset)
 	binary.LittleEndian.PutUint64(record[64:72], event.Operation.Size)
-	world.trace = protocol.ChecksumBytes(record[:])
+	checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, record[:])
+	if err != nil {
+		panic(err)
+	}
+	world.trace = checksum
 }
 
 func (world *ledgerWorld) step() {

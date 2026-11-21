@@ -2,12 +2,12 @@ package replication
 
 import "time"
 
-type FailureLevel uint8
+type failureLevel uint8
 
 const (
-	FailureGreen FailureLevel = iota
-	FailureYellow
-	FailureRed
+	failureGreen failureLevel = iota
+	failureYellow
+	failureRed
 )
 
 const (
@@ -15,16 +15,16 @@ const (
 	failureIntervalMax = uint64(2 * time.Second)
 )
 
-type FailureDetector struct {
+type livenessDetector struct {
 	last uint64
 	ewma uint64
 }
 
-func NewFailureDetector(monotonic uint64) FailureDetector {
-	return FailureDetector{last: monotonic, ewma: failureIntervalMax}
+func newLivenessDetector(monotonic uint64) livenessDetector {
+	return livenessDetector{last: monotonic, ewma: failureIntervalMax}
 }
 
-func (detector *FailureDetector) Signal(monotonic uint64) {
+func (detector *livenessDetector) Signal(monotonic uint64) {
 	if monotonic <= detector.last {
 		return
 	}
@@ -33,19 +33,19 @@ func (detector *FailureDetector) Signal(monotonic uint64) {
 	detector.last = monotonic
 }
 
-func (detector FailureDetector) Level(monotonic uint64) FailureLevel {
+func (detector livenessDetector) Level(monotonic uint64) failureLevel {
 	if monotonic <= detector.last {
-		return FailureGreen
+		return failureGreen
 	}
 	twiceElapsed := saturatingMultiply(2, monotonic-detector.last)
 	threeEWMA := saturatingMultiply(3, detector.ewma)
 	if twiceElapsed <= threeEWMA {
-		return FailureGreen
+		return failureGreen
 	}
 	if twiceElapsed <= saturatingMultiply(6, detector.ewma) {
-		return FailureYellow
+		return failureYellow
 	}
-	return FailureRed
+	return failureRed
 }
 
-func (detector FailureDetector) EWMA() time.Duration { return time.Duration(detector.ewma) }
+func (detector livenessDetector) EWMA() time.Duration { return time.Duration(detector.ewma) }

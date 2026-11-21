@@ -8,6 +8,8 @@ import (
 
 var ErrInvalidMembership = errors.New("replication: invalid immutable membership")
 
+// Membership defines the fixed replica roster and local member identity within
+// a VSR consensus group.
 type Membership struct {
 	Members      [MembersMax]protocol.MemberID
 	ActiveCount  uint8
@@ -64,6 +66,8 @@ func (membership Membership) Primary(view protocol.View) protocol.ReplicaIndex {
 	return protocol.ReplicaIndex(uint32(view) % uint32(membership.ActiveCount))
 }
 
+// Config specifies immutable group, cluster, process, and release parameters
+// for opening a Replica.
 type Config struct {
 	Group            protocol.GroupID
 	Membership       Membership

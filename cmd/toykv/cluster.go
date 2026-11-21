@@ -24,7 +24,6 @@ const metadataVersion = 1
 var (
 	errClusterMetadata = errors.New("toykv: invalid cluster metadata")
 	errInvalidTimeout  = errors.New("timeout must be positive")
-	errClientEvicted   = errors.New("toykv: client evicted")
 )
 
 type diskMetadata struct {
@@ -53,45 +52,12 @@ func (clock realClock) Now() replication.TimeSample {
 	}
 }
 
-type clientEvents struct {
-	mu       sync.Mutex
-	notify   chan struct{}
-	reply    replication.ClientReply
-	hasReply bool
-	evicted  bool
-	reason   protocol.EvictionReason
-}
-
-func (events *clientEvents) Reply(reply replication.ClientReply) {
-	reply.Body = append([]byte(nil), reply.Body...)
-	events.mu.Lock()
-	events.reply = reply
-	events.hasReply = true
-	events.mu.Unlock()
-	select {
-	case events.notify <- struct{}{}:
-	default:
-	}
-}
-
-func (events *clientEvents) Evicted(reason protocol.EvictionReason) {
-	events.mu.Lock()
-	events.evicted = true
-	events.reason = reason
-	events.mu.Unlock()
-	select {
-	case events.notify <- struct{}{}:
-	default:
-	}
-}
-
 type localTransport struct {
 	mu          sync.RWMutex
-	clientMu    sync.Mutex
 	pool        *protocol.FramePool
 	replicas    [replication.MembersMax]*replication.Replica
 	memberCount uint8
-	client      *replication.Client
+	client      *replication.ManagedClient
 	clientID    protocol.ClientID
 	logger      zerolog.Logger
 }
@@ -174,8 +140,6 @@ func (transport *localTransport) sendClient(from protocol.ReplicaIndex, to proto
 	if err != nil {
 		return
 	}
-	transport.clientMu.Lock()
-	defer transport.clientMu.Unlock()
 	transport.mu.RLock()
 	client := transport.client
 	clientID := transport.clientID
@@ -186,16 +150,15 @@ func (transport *localTransport) sendClient(from protocol.ReplicaIndex, to proto
 }
 
 type localCluster struct {
-	group        protocol.GroupID
-	config       replication.ClusterConfig
-	process      replication.ProcessConfig
-	transport    *localTransport
-	replicas     []*replication.Replica
-	runResults   chan error
-	runs         int
-	clientEvents *clientEvents
-	client       *replication.Client
-	logger       zerolog.Logger
+	group      protocol.GroupID
+	config     replication.ClusterConfig
+	process    replication.ProcessConfig
+	transport  *localTransport
+	replicas   []*replication.Replica
+	runResults chan error
+	runs       int
+	client     *replication.ManagedClient
+	logger     zerolog.Logger
 }
 
 func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*localCluster, error) {
@@ -270,7 +233,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 			Group: identity.group, Membership: membership, Cluster: cluster.config, Process: cluster.process,
 			CurrentRelease: 1, ClientReleaseMin: 1,
 		}
-		storage, err := replication.OpenFileStorage(replicaPath(opts.dataDir, index), false, opts.directIO)
+		storage, err := replication.OpenFileStorage(replicaPath(opts.dataDir, index), replication.FileStorageOptions{DirectIO: opts.directIO})
 		if err != nil {
 			return fmt.Errorf("open replica %d storage: %w", index, err)
 		}
@@ -339,7 +302,7 @@ func initializeReplicaFiles(ctx context.Context, opts options, identity clusterI
 		}
 	}
 	for index := range identity.members {
-		storage, err := replication.OpenFileStorage(replicaPath(opts.dataDir, index), true, opts.directIO)
+		storage, err := replication.OpenFileStorage(replicaPath(opts.dataDir, index), replication.FileStorageOptions{Create: true, DirectIO: opts.directIO})
 		if err != nil {
 			return err
 		}
@@ -371,28 +334,21 @@ func (cluster *localCluster) RegisterClient(ctx context.Context, timeout time.Du
 			return err
 		}
 	}
-	events := &clientEvents{notify: make(chan struct{}, 1)}
-	client, err := replication.NewClient(replication.ClientConfig{
+	client, err := replication.NewManagedClient(replication.ClientConfig{
 		Group: cluster.group, ID: id, Release: 1, ActiveCount: uint8(len(cluster.replicas)),
 		MessageSizeMax: uint32(cluster.config.MessageSizeMax), ChecksumAlgorithm: cluster.config.ChecksumAlgorithm, Process: cluster.process,
-	}, localBus{transport: cluster.transport}, realClock{start: time.Now()}, rand.Reader, events)
+	}, localBus{transport: cluster.transport}, realClock{start: time.Now()}, rand.Reader)
 	if err != nil {
 		return err
 	}
 	cluster.client = client
-	cluster.clientEvents = events
 	cluster.transport.mu.Lock()
 	cluster.transport.client = client
 	cluster.transport.clientID = id
 	cluster.transport.mu.Unlock()
-	cluster.transport.clientMu.Lock()
-	err = client.Register()
-	cluster.transport.clientMu.Unlock()
-	if err != nil {
-		return err
-	}
-	_, err = cluster.awaitReply(ctx, timeout, 0)
-	return err
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return client.Register(reqCtx)
 }
 
 func (cluster *localCluster) Put(ctx context.Context, timeout time.Duration, key, value string) (string, error) {
@@ -458,56 +414,9 @@ func statusResult(body []byte, success string) (string, error) {
 }
 
 func (cluster *localCluster) request(ctx context.Context, timeout time.Duration, operation protocol.Operation, body []byte) (replication.ClientReply, error) {
-	cluster.transport.clientMu.Lock()
-	err := cluster.client.Submit(operation, body)
-	var expected protocol.RequestNo
-	if err == nil {
-		expected = cluster.client.RequestNo()
-	}
-	cluster.transport.clientMu.Unlock()
-	if err != nil {
-		return replication.ClientReply{}, err
-	}
-	return cluster.awaitReply(ctx, timeout, expected)
-}
-
-func (cluster *localCluster) awaitReply(ctx context.Context, timeout time.Duration, expected protocol.RequestNo) (replication.ClientReply, error) {
-	deadline := time.NewTimer(timeout)
-	ticker := time.NewTicker(cluster.process.Tick)
-	defer deadline.Stop()
-	defer ticker.Stop()
-	for {
-		cluster.clientEvents.mu.Lock()
-		if cluster.clientEvents.evicted {
-			reason := cluster.clientEvents.reason
-			cluster.clientEvents.mu.Unlock()
-			return replication.ClientReply{}, fmt.Errorf("%w: %d", errClientEvicted, reason)
-		}
-		if cluster.clientEvents.hasReply && cluster.clientEvents.reply.Request == expected {
-			reply := cluster.clientEvents.reply
-			cluster.clientEvents.hasReply = false
-			cluster.clientEvents.mu.Unlock()
-			return reply, nil
-		}
-		cluster.clientEvents.mu.Unlock()
-		select {
-		case <-cluster.clientEvents.notify:
-		case <-ticker.C:
-			if cluster.client == nil {
-				continue
-			}
-			cluster.transport.clientMu.Lock()
-			err := cluster.client.Tick()
-			cluster.transport.clientMu.Unlock()
-			if err != nil {
-				return replication.ClientReply{}, err
-			}
-		case <-deadline.C:
-			return replication.ClientReply{}, context.DeadlineExceeded
-		case <-ctx.Done():
-			return replication.ClientReply{}, ctx.Err()
-		}
-	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return cluster.client.Submit(reqCtx, operation, body)
 }
 
 func (cluster *localCluster) Close(ctx context.Context) error {
@@ -517,10 +426,7 @@ func (cluster *localCluster) Close(ctx context.Context) error {
 	cluster.transport.mu.Unlock()
 	var first error
 	if cluster.client != nil {
-		cluster.transport.clientMu.Lock()
-		err := cluster.client.Close()
-		cluster.transport.clientMu.Unlock()
-		if err != nil && first == nil {
+		if err := cluster.client.Close(); err != nil && first == nil {
 			first = err
 		}
 	}

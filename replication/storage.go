@@ -17,6 +17,9 @@ var (
 	ErrShortIO          = errors.New("replication: short storage I/O")
 )
 
+// Storage defines the sector-aligned durable storage contract required by a replica.
+// Implementations must persist written bytes across ReadAt/WriteAt and Sync before
+// returning nil from Sync.
 type Storage interface {
 	ReadAt(buffer []byte, offset uint64) error
 	WriteAt(buffer []byte, offset uint64) error
@@ -27,6 +30,8 @@ type Storage interface {
 	Close() error
 }
 
+// FileStorage implements Storage over an OS file with optional direct I/O and
+// platform-native preallocation and barrier synchronization.
 type FileStorage struct {
 	mu     sync.RWMutex
 	file   *os.File
@@ -37,12 +42,19 @@ type FileStorage struct {
 	closeErr  error
 }
 
-func OpenFileStorage(path string, create, direct bool) (*FileStorage, error) {
-	file, err := openStorageFile(path, create, direct)
+// FileStorageOptions configures how OpenFileStorage opens or creates a replica file.
+type FileStorageOptions struct {
+	Create   bool
+	DirectIO bool
+}
+
+// OpenFileStorage opens a sector-aligned replica storage file.
+func OpenFileStorage(path string, opts FileStorageOptions) (*FileStorage, error) {
+	file, err := openStorageFile(path, opts.Create, opts.DirectIO)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open %s: %w", ErrStorage, path, err)
 	}
-	return &FileStorage{file: file, path: path, direct: direct}, nil
+	return &FileStorage{file: file, path: path, direct: opts.DirectIO}, nil
 }
 
 func openStandardStorageFile(path string, create bool, extraFlags int) (*os.File, error) {
@@ -168,6 +180,8 @@ func zeroExtendFile(file *os.File, size int64) error {
 	return nil
 }
 
+// Close closes the underlying file handle. It is idempotent and safe to call
+// concurrently; subsequent I/O operations fail with ErrStorageClosed.
 func (storage *FileStorage) Close() error {
 	storage.closeOnce.Do(func() {
 		storage.mu.Lock()
@@ -201,6 +215,8 @@ func (storage *FileStorage) validateIO(buffer []byte, offset uint64) error {
 	return nil
 }
 
+// NewAlignedBuffer allocates a byte slice of length size whose starting virtual
+// address is aligned to alignment (a power of two).
 func NewAlignedBuffer(size, alignment uint64) ([]byte, error) {
 	if size == 0 || alignment == 0 || alignment&(alignment-1) != 0 || size > uint64(int(^uint(0)>>1))-alignment {
 		return nil, ErrStorageAlignment

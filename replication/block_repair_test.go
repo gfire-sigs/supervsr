@@ -46,7 +46,7 @@ func TestBlockRepairRejectsDuplicateResponsesAndRecyclesTargets(t *testing.T) {
 		Membership: Membership{Members: [MembersMax]protocol.MemberID{{1}, {2}}, ActiveCount: 2, LocalMember: protocol.MemberID{1}},
 	}
 	storage := newBlockingStorage()
-	engine, err := NewIOEngine(storage, 2, 1)
+	engine, err := newDefaultIOEngine(storage, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestBlockRepairPublishesOnlyAfterDurableSync(t *testing.T) {
 			}
 			storage.operation = 0
 			storage.failAt = test.failAt
-			engine, err := NewIOEngine(storage, 2, 1)
+			engine, err := newDefaultIOEngine(storage, 2, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -195,7 +195,7 @@ func TestStalledBlockRepairDoesNotStarveJournalRepair(t *testing.T) {
 	replica := Replica{
 		config:     Config{Cluster: compactTestClusterConfig(), Process: DefaultProcessConfig(), Group: protocol.GroupID{1}},
 		membership: membership, local: 0, deps: Dependencies{MessageBus: bus}, frames: frames,
-		random: NewDeterministicRandom(1), repairBudget: journalBudget, repairHeader: repairHeader, repairHeaderValid: true,
+		random: newDeterministicRandom(1), repairBudget: journalBudget, repairHeader: repairHeader, repairHeaderValid: true,
 		blockRepairBudget: blockBudget, blockRepairTargets: []blockRepairTarget{{reference: reference, state: blockRepairMissing}},
 		peerCheckpointOps: make([]protocol.Op, 2),
 	}
@@ -203,7 +203,7 @@ func TestStalledBlockRepairDoesNotStarveJournalRepair(t *testing.T) {
 	if bus.replicaCount() != 1 {
 		t.Fatalf("journal repair messages = %d, want 1", bus.replicaCount())
 	}
-	header, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, 4096, 2)
+	header, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, 4096, 2, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandGetPrepare {
 		t.Fatalf("journal repair frame command=%d reason=%d", header.Command, reason)
 	}
@@ -277,7 +277,7 @@ func makeValueRepairBlock(t testing.TB, config Config, address, marker uint64) (
 	binary.LittleEndian.PutUint64(header.Fields[96:104], address)
 	header.Fields[112] = byte(protocol.BlockValue)
 	frame := physical[:protocol.HeaderSize+len(body)]
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return header, body, physical
@@ -291,7 +291,7 @@ func makeRepairBlock(t testing.TB, config Config, address, snapshot uint64) (pro
 	binary.LittleEndian.PutUint64(header.Fields[96:104], address)
 	binary.LittleEndian.PutUint64(header.Fields[104:112], snapshot)
 	header.Fields[112] = byte(protocol.BlockFreeSet)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return header, body
@@ -305,7 +305,7 @@ func drainBlockRepairIO(t testing.TB, replica *Replica) {
 		select {
 		case <-replica.io.Ready():
 			for {
-				var completion IOCompletion
+				var completion ioCompletion
 				if !replica.io.Poll(&completion) {
 					break
 				}

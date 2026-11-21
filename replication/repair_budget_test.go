@@ -12,7 +12,7 @@ func TestJournalRepairBudgetCapsPeersAndReleasesOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	random := NewDeterministicRandom(7)
+	random := newDeterministicRandom(7)
 	first, ok := budget.Reserve(8, 10, &random)
 	if !ok {
 		t.Fatal("first reservation rejected")
@@ -43,7 +43,7 @@ func TestJournalRepairBudgetExpiryUpdatesEWMA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	random := NewDeterministicRandom(1)
+	random := newDeterministicRandom(1)
 	peer, ok := budget.Reserve(protocol.Op(4), 1, &random)
 	if !ok {
 		t.Fatal("reservation rejected")
@@ -64,7 +64,7 @@ func BenchmarkJournalRepairBudget(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	random := NewDeterministicRandom(9)
+	random := newDeterministicRandom(9)
 	b.ReportAllocs()
 	for index := range b.N {
 		op := protocol.Op(index + 1)

@@ -8,14 +8,14 @@ import (
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
-type SyncStage uint8
+type syncStage uint8
 
 const (
-	SyncStageIdle SyncStage = iota
-	SyncStageCancelingCommit
-	SyncStageCancelingGrid
-	SyncStageUpdatingCheckpoint
-	SyncStageResizingStorage
+	syncStageIdle syncStage = iota
+	syncStageCancelingCommit
+	syncStageCancelingGrid
+	syncStageUpdatingCheckpoint
+	syncStageResizingStorage
 )
 
 type stateSyncRuntime struct {
@@ -32,16 +32,16 @@ type stateSyncRuntime struct {
 	count               int
 	persistPhase        uint8
 	completionKind      SMCompletionKind
-	stage               SyncStage
+	stage               syncStage
 	cancelStarted       bool
 	resetStarted        bool
 	resetDone           bool
 	persistDone         bool
 	repairing           bool
 	resumeRecovery      bool
-	recovery            WALRecoveryReport
+	recovery            walRecoveryReport
 	replayRunning       bool
-	recoveryState       Superblock
+	recoveryState       superblockRecord
 	opening             bool
 	repliesPending      bool
 }
@@ -51,7 +51,7 @@ func (replica *Replica) stateSyncAwaitingOpen() bool {
 }
 
 func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol.View, commit, head protocol.Op, headers []protocol.Header) {
-	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.opening || replica.stateSync.replayRunning || checkpoint.PrepareOp() <= replica.checkpoint.PrepareOp() {
+	if replica.stateSync.stage != syncStageIdle || replica.stateSync.opening || replica.stateSync.replayRunning || checkpoint.PrepareOp() <= replica.checkpoint.PrepareOp() {
 		return
 	}
 	if len(headers) == 0 || len(headers) > len(replica.stateSync.headers) || head < checkpoint.PrepareOp() || commit < checkpoint.PrepareOp() || head < commit {
@@ -76,25 +76,25 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	replica.status = StatusRecovering
 	replica.releaseQueuedRequests()
 	if replica.stage == CommitStageIdle {
-		replica.stateSync.stage = SyncStageCancelingGrid
+		replica.stateSync.stage = syncStageCancelingGrid
 	} else {
-		replica.stateSync.stage = SyncStageCancelingCommit
+		replica.stateSync.stage = syncStageCancelingCommit
 	}
 }
 
 func (replica *Replica) dispatchStateSync() {
 	switch replica.stateSync.stage {
-	case SyncStageIdle:
+	case syncStageIdle:
 		return
-	case SyncStageCancelingCommit:
+	case syncStageCancelingCommit:
 		if replica.stage == CommitStageIdle {
-			replica.stateSync.stage = SyncStageCancelingGrid
+			replica.stateSync.stage = syncStageCancelingGrid
 		}
-	case SyncStageCancelingGrid:
+	case syncStageCancelingGrid:
 		replica.dispatchStateSyncCancelingGrid()
-	case SyncStageUpdatingCheckpoint:
+	case syncStageUpdatingCheckpoint:
 		replica.dispatchStateSyncCheckpoint()
-	case SyncStageResizingStorage:
+	case syncStageResizingStorage:
 		replica.dispatchStateSyncResize()
 	default:
 		replica.fail(ErrReplicaInvariant)
@@ -110,7 +110,7 @@ func (replica *Replica) dispatchStateSyncCancelingGrid() {
 	if !replica.io.Drained() {
 		return
 	}
-	replica.stateSync.stage = SyncStageUpdatingCheckpoint
+	replica.stateSync.stage = syncStageUpdatingCheckpoint
 }
 
 func (replica *Replica) cancelStateSyncReads() {
@@ -137,7 +137,7 @@ func (replica *Replica) cancelStateSyncReads() {
 	}
 }
 
-func (replica *Replica) handleStateSyncDrainIO(completion IOCompletion) {
+func (replica *Replica) handleStateSyncDrainIO(completion ioCompletion) {
 	if replica.handleReplyRepairIO(completion) {
 		return
 	}
@@ -273,7 +273,7 @@ func (replica *Replica) dispatchStateSyncResize() {
 			return
 		}
 		replica.stateSync.persistDone = false
-		replica.stateSync.stage = SyncStageIdle
+		replica.stateSync.stage = syncStageIdle
 		if !replica.queueStateSyncRoots() {
 			replica.fail(ErrReplicaBackpressure)
 			return
@@ -287,7 +287,7 @@ func (replica *Replica) dispatchStateSyncResize() {
 }
 
 func (replica *Replica) startStateSyncIO(kind IOKind, size uint64, phase uint8) {
-	handle, err := replica.io.Submit(IOOperation{Kind: kind, Size: size})
+	handle, err := replica.io.Submit(ioOperation{Kind: kind, Size: size})
 	if err != nil {
 		if !errors.Is(err, ErrIOBackpressure) {
 			replica.fail(err)
@@ -320,8 +320,8 @@ func (replica *Replica) startStateSyncReset() bool {
 	return false
 }
 
-func (replica *Replica) startStateSyncPersistence(next Superblock, phase uint8) {
-	handle, err := replica.io.Submit(IOOperation{Kind: IOSuperblockPersist, SuperblockStore: replica.superblocks, Superblock: next})
+func (replica *Replica) startStateSyncPersistence(next superblockRecord, phase uint8) {
+	handle, err := replica.io.Submit(ioOperation{Kind: IOSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
 	if err != nil {
 		if !errors.Is(err, ErrIOBackpressure) {
 			replica.fail(err)
@@ -333,7 +333,7 @@ func (replica *Replica) startStateSyncPersistence(next Superblock, phase uint8) 
 	replica.stateSync.persistPhase = phase
 }
 
-func (replica *Replica) stateSyncSuperblock() (Superblock, error) {
+func (replica *Replica) stateSyncSuperblock() (superblockRecord, error) {
 	next := replica.superblocks.Current()
 	next.ParentChecksum = next.Checksum
 	next.Sequence++
@@ -345,14 +345,14 @@ func (replica *Replica) stateSyncSuperblock() (Superblock, error) {
 	clear(next.ViewHeaders[:])
 	for index := range replica.stateSync.count {
 		header := replica.stateSync.headers[index]
-		if err := protocol.EncodeHeaderWith(next.ViewHeaders[index][:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
-			return Superblock{}, err
+		if err := protocol.EncodeHeader(next.ViewHeaders[index][:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
+			return superblockRecord{}, err
 		}
 	}
 	return next, nil
 }
 
-func (replica *Replica) handleStateSyncPersistence(completion IOCompletion) bool {
+func (replica *Replica) handleStateSyncPersistence(completion ioCompletion) bool {
 	if replica.stateSync.io == (IOHandle{}) || completion.Handle != replica.stateSync.io || completion.Kind != replica.stateSync.ioKind {
 		return false
 	}
@@ -371,7 +371,7 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.stateSync.repliesPending = false
 	replica.syncRangeRepaired = false
 	target := replica.stateSync.checkpoint
-	checkpointID, err := target.IDWith(replica.config.Cluster.ChecksumAlgorithm)
+	checkpointID, err := target.ID(replica.config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		replica.fail(err)
 		return
@@ -383,7 +383,7 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.commitMin = target.PrepareOp()
 	replica.commitMax = replica.stateSync.commit
 	replica.headOp = target.PrepareOp()
-	header, reason := protocol.DecodeHeaderWith(target.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+	header, reason := protocol.DecodeHeader(target.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		replica.fail(ErrInvalidCheckpoint)
 		return
@@ -392,7 +392,7 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.view = replica.stateSync.view
 	replica.durableView = replica.stateSync.view
 	replica.logView = replica.stateSync.view
-	replica.stateSync.stage = SyncStageResizingStorage
+	replica.stateSync.stage = syncStageResizingStorage
 	replica.stateSync.persistPhase = 0
 	replica.stateSync.persistDone = false
 	replica.stateSync.repairing = true
@@ -459,7 +459,7 @@ func (replica *Replica) queueStateSyncTrailer(reference BlockReference, blockTyp
 }
 
 func (replica *Replica) continueStateSyncBlocks(completed *blockRepairTarget, physical []byte) {
-	frame, header, ok := decodeRepairFrameWith(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+	frame, header, ok := decodeRepairFrame(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok {
 		replica.fail(ErrInvalidBlock)
 		return
@@ -535,7 +535,7 @@ func (replica *Replica) finishStateSyncBlocks() {
 		replica.fail(err)
 		return
 	}
-	sessions, err := NewSessionTable(SessionTableConfig{
+	sessions, err := newSessionTable(sessionTableConfig{
 		ClientsMax:              uint32(replica.config.Cluster.ClientsMax),
 		Group:                   replica.config.Group,
 		ActiveCount:             replica.membership.ActiveCount,
@@ -741,8 +741,8 @@ func (replica *Replica) finishInterruptedReplay(result recoveryReplayResult) {
 		return
 	}
 	replica.stateSync.resumeRecovery = false
-	replica.stateSync.recovery = WALRecoveryReport{}
-	replica.stateSync.recoveryState = Superblock{}
+	replica.stateSync.recovery = walRecoveryReport{}
+	replica.stateSync.recoveryState = superblockRecord{}
 	replica.continueReplyRepair(replica.deps.Clock.Now().Monotonic)
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()

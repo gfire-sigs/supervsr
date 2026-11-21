@@ -30,7 +30,7 @@ func TestWALAppendPersistsBodyBeforeRedundantHeader(t *testing.T) {
 	cfg := compactTestClusterConfig()
 	layout, _ := DeriveWALLayout(cfg)
 	storage := newScriptedStorage(t, layout.BlockBase)
-	wal, err := NewWAL(storage, cfg, protocol.GroupID{1}, 3)
+	wal, err := newWAL(storage, cfg, protocol.GroupID{1}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestWALAppendFailureNeverClearsDirty(t *testing.T) {
 		t.Run(fmt.Sprintf("operation_%d", failAt), func(t *testing.T) {
 			storage := newScriptedStorage(t, layout.BlockBase)
 			storage.failAt = failAt
-			wal, err := NewWAL(storage, cfg, protocol.GroupID{1}, 3)
+			wal, err := newWAL(storage, cfg, protocol.GroupID{1}, 3)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -81,7 +81,7 @@ func TestWALRefusesUnsafeSlotReuse(t *testing.T) {
 	cfg := compactTestClusterConfig()
 	layout, _ := DeriveWALLayout(cfg)
 	storage := newScriptedStorage(t, layout.BlockBase)
-	wal, err := NewWAL(storage, cfg, protocol.GroupID{1}, 3)
+	wal, err := newWAL(storage, cfg, protocol.GroupID{1}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,41 +98,41 @@ func TestWALRefusesUnsafeSlotReuse(t *testing.T) {
 }
 
 func TestWALRecoveryDecisionMatrix(t *testing.T) {
-	context := WALRecoveryContext{
+	context := walRecoveryContext{
 		PhysicalSlot: 1,
 		JournalSlots: 8,
 		RetainedMin:  1,
 		PrepareMax:   20,
 		UntrustedMax: 17,
 	}
-	ordinary := func(op protocol.Op, checksum byte) WALCandidate {
-		return WALCandidate{Kind: WALCandidateOrdinary, Op: op, View: 1, HeaderChecksum: protocol.Checksum{checksum}, BodyChecksum: protocol.Checksum{checksum + 1}}
+	ordinary := func(op protocol.Op, checksum byte) walCandidate {
+		return walCandidate{Kind: walCandidateOrdinary, Op: op, View: 1, HeaderChecksum: protocol.Checksum{checksum}, BodyChecksum: protocol.Checksum{checksum + 1}}
 	}
-	invalid := WALCandidate{Kind: WALCandidateInvalid}
-	reserved := WALCandidate{Kind: WALCandidateReserved}
+	invalid := walCandidate{Kind: walCandidateInvalid}
+	reserved := walCandidate{Kind: walCandidateReserved}
 	tests := []struct {
 		name    string
-		header  WALCandidate
-		prepare WALCandidate
-		want    WALRecoveryDecision
+		header  walCandidate
+		prepare walCandidate
+		want    walRecoveryDecision
 	}{
-		{name: "clean equal", header: ordinary(9, 1), prepare: ordinary(9, 1), want: WALRecoveryClean},
-		{name: "clean empty", header: reserved, prepare: reserved, want: WALRecoveryCleanEmpty},
-		{name: "reserved header full prepare", header: reserved, prepare: ordinary(9, 1), want: WALRecoveryLocalRepair},
-		{name: "invalid header unique maximum", header: invalid, prepare: ordinary(17, 1), want: WALRecoveryLocalRepair},
-		{name: "newer prepare same slot", header: ordinary(9, 1), prepare: ordinary(17, 2), want: WALRecoveryLocalRepair},
-		{name: "old header missing body", header: ordinary(9, 1), prepare: invalid, want: WALRecoveryRemoteRepair},
-		{name: "latest header corrupt body", header: ordinary(17, 1), prepare: invalid, want: WALRecoveryRemoteRepair},
-		{name: "latest header missing body", header: ordinary(17, 1), prepare: reserved, want: WALRecoveryRemoteRepair},
-		{name: "invalid uncertainty", header: invalid, prepare: invalid, want: WALRecoveryRemoteRepair},
-		{name: "nonmaximum prepare uncertainty", header: invalid, prepare: ordinary(9, 1), want: WALRecoveryRemoteRepair},
-		{name: "conflicting checksum", header: ordinary(9, 1), prepare: ordinary(9, 2), want: WALRecoveryRemoteRepair},
-		{name: "future prepare", header: reserved, prepare: ordinary(25, 1), want: WALRecoveryTruncate},
-		{name: "impossible slot", header: ordinary(10, 1), prepare: invalid, want: WALRecoveryFail},
+		{name: "clean equal", header: ordinary(9, 1), prepare: ordinary(9, 1), want: walRecoveryClean},
+		{name: "clean empty", header: reserved, prepare: reserved, want: walRecoveryCleanEmpty},
+		{name: "reserved header full prepare", header: reserved, prepare: ordinary(9, 1), want: walRecoveryLocalRepair},
+		{name: "invalid header unique maximum", header: invalid, prepare: ordinary(17, 1), want: walRecoveryLocalRepair},
+		{name: "newer prepare same slot", header: ordinary(9, 1), prepare: ordinary(17, 2), want: walRecoveryLocalRepair},
+		{name: "old header missing body", header: ordinary(9, 1), prepare: invalid, want: walRecoveryRemoteRepair},
+		{name: "latest header corrupt body", header: ordinary(17, 1), prepare: invalid, want: walRecoveryRemoteRepair},
+		{name: "latest header missing body", header: ordinary(17, 1), prepare: reserved, want: walRecoveryRemoteRepair},
+		{name: "invalid uncertainty", header: invalid, prepare: invalid, want: walRecoveryRemoteRepair},
+		{name: "nonmaximum prepare uncertainty", header: invalid, prepare: ordinary(9, 1), want: walRecoveryRemoteRepair},
+		{name: "conflicting checksum", header: ordinary(9, 1), prepare: ordinary(9, 2), want: walRecoveryRemoteRepair},
+		{name: "future prepare", header: reserved, prepare: ordinary(25, 1), want: walRecoveryTruncate},
+		{name: "impossible slot", header: ordinary(10, 1), prepare: invalid, want: walRecoveryFail},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if actual := ClassifyWALSlot(test.header, test.prepare, context); actual != test.want {
+			if actual := classifyWALSlot(test.header, test.prepare, context); actual != test.want {
 				t.Fatalf("decision = %d, want %d", actual, test.want)
 			}
 		})
@@ -172,7 +172,7 @@ func validPrepareFrame(t testing.TB, cfg ClusterConfig, op protocol.Op) []byte {
 	putUint64(header.Fields[112:120], uint64(op))
 	putUint32(header.Fields[120:124], uint32(op))
 	header.Fields[124] = byte(protocol.OperationApplicationMin)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame

@@ -232,7 +232,7 @@ func (replica *Replica) startBlockRepairRead(targetIndex uint32) bool {
 		if !ok {
 			return false
 		}
-		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		handle, err := replica.io.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}
@@ -278,7 +278,7 @@ func (replica *Replica) sendGetBlocks(peer protocol.ReplicaIndex, references []B
 		binary.LittleEndian.PutUint64(body[offset+16:offset+24], reference.Address)
 	}
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetBlocks, Author: replica.local}
-	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
+	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	}
 	message.Release()
@@ -305,7 +305,7 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 			continue
 		}
 		clear(operation.buffer)
-		if err := protocol.EncodeHeaderWith(operation.buffer[:protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
+		if err := protocol.EncodeHeader(operation.buffer[:protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			return
 		}
 		copy(operation.buffer[protocol.HeaderSize:], body)
@@ -313,7 +313,7 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 		if !ok {
 			return
 		}
-		handle, err := replica.io.Submit(IOOperation{Kind: IOWrite, Offset: offset, Buffer: operation.buffer})
+		handle, err := replica.io.Submit(ioOperation{Kind: IOWrite, Offset: offset, Buffer: operation.buffer})
 		if err != nil {
 			return
 		}
@@ -366,7 +366,7 @@ func (replica *Replica) validRequestedBlock(target *blockRepairTarget, header pr
 	}
 	var metadata [96]byte
 	copy(metadata[:], header.Fields[:96])
-	if ValidateBlockMetadata(target.blockType, metadata, body) != nil {
+	if validateBlockMetadata(target.blockType, metadata, body) != nil {
 		return false
 	}
 	if target.blockType < protocol.BlockManifest {
@@ -381,7 +381,7 @@ func (replica *Replica) validRequestedBlock(target *blockRepairTarget, header pr
 	return err == nil && count >= 0 && count <= len(replica.blockRequirements)
 }
 
-func (replica *Replica) handleBlockRepairIO(completion IOCompletion) bool {
+func (replica *Replica) handleBlockRepairIO(completion ioCompletion) bool {
 	defer replica.finishCheckpointRepairDrain()
 	for index := range replica.blockRepairIO {
 		operation := &replica.blockRepairIO[index]
@@ -408,13 +408,13 @@ func (replica *Replica) handleBlockRepairIO(completion IOCompletion) bool {
 	return false
 }
 
-func (replica *Replica) finishBlockRepairRead(operation *blockRepairIO, target *blockRepairTarget, completion IOCompletion) {
+func (replica *Replica) finishBlockRepairRead(operation *blockRepairIO, target *blockRepairTarget, completion ioCompletion) {
 	operation.busy = false
 	if completion.Err != nil {
 		target.state = blockRepairMissing
 		return
 	}
-	frame, header, ok := decodeRepairFrameWith(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+	frame, header, ok := decodeRepairFrame(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok || !replica.validRequestedBlock(target, header, frame[protocol.HeaderSize:]) || !allZeroBytes(operation.buffer[len(frame):]) {
 		target.state = blockRepairMissing
 		return
@@ -425,14 +425,14 @@ func (replica *Replica) finishBlockRepairRead(operation *blockRepairIO, target *
 
 }
 
-func (replica *Replica) finishBlockRepairWrite(operation *blockRepairIO, target *blockRepairTarget, completion IOCompletion) {
+func (replica *Replica) finishBlockRepairWrite(operation *blockRepairIO, target *blockRepairTarget, completion ioCompletion) {
 	if completion.Err != nil {
 		operation.busy = false
 		target.state = blockRepairMissing
 		replica.fail(completion.Err)
 		return
 	}
-	handle, err := replica.io.Submit(IOOperation{Kind: IOSync})
+	handle, err := replica.io.Submit(ioOperation{Kind: IOSync})
 	if err != nil {
 		operation.busy = false
 		target.state = blockRepairMissing
@@ -443,7 +443,7 @@ func (replica *Replica) finishBlockRepairWrite(operation *blockRepairIO, target 
 	operation.stage = blockRepairIOSync
 }
 
-func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *blockRepairTarget, completion IOCompletion) {
+func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *blockRepairTarget, completion ioCompletion) {
 	operation.busy = false
 	if completion.Err != nil {
 		target.state = blockRepairMissing
@@ -458,7 +458,7 @@ func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *
 func (replica *Replica) blockRepairCompleted(target *blockRepairTarget, physical []byte) {
 	completed := *target
 	*target = blockRepairTarget{}
-	frame, header, ok := decodeRepairFrameWith(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+	frame, header, ok := decodeRepairFrame(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok {
 		replica.fail(ErrInvalidBlock)
 		return

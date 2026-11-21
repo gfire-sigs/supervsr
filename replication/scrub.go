@@ -106,7 +106,7 @@ func (replica *Replica) seedScrubCatalog(checkpoint CheckpointState) {
 }
 
 func (replica *Replica) continueScrub(now uint64) bool {
-	if replica.stateSync.stage != SyncStageIdle || replica.stateSync.repairing || replica.blockAllocator == nil ||
+	if replica.stateSync.stage != syncStageIdle || replica.stateSync.repairing || replica.blockAllocator == nil ||
 		replica.checkpointTransitionActive() || now < replica.scrub.next {
 		return false
 	}
@@ -138,7 +138,7 @@ func (replica *Replica) startScrubRead(address uint64) bool {
 		if !ok {
 			return false
 		}
-		handle, err := replica.io.Submit(IOOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		handle, err := replica.io.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}
@@ -151,7 +151,7 @@ func (replica *Replica) startScrubRead(address uint64) bool {
 	return false
 }
 
-func (replica *Replica) finishScrubRead(operation *blockRepairIO, completion IOCompletion) {
+func (replica *Replica) finishScrubRead(operation *blockRepairIO, completion ioCompletion) {
 	address := operation.address
 	operation.busy = false
 	operation.address = 0
@@ -171,7 +171,7 @@ func (replica *Replica) finishScrubRead(operation *blockRepairIO, completion IOC
 		replica.fail(ErrBlockMissing)
 		return
 	}
-	frame, header, ok := decodeRepairFrameWith(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+	frame, header, ok := decodeRepairFrame(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok || !allZeroBytes(operation.buffer[len(frame):]) {
 		replica.queueKnownCorruptBlock(address, requirement, true)
 		return
@@ -208,7 +208,7 @@ func (replica *Replica) queueKnownCorruptBlock(address uint64, requirement Block
 	}
 }
 
-func (replica *Replica) nextScrubIndex(acquired, released *FixedBitSet) (uint64, bool) {
+func (replica *Replica) nextScrubIndex(acquired, released *fixedBitSet) (uint64, bool) {
 	length := acquired.Len()
 	if length == 0 {
 		return 0, false

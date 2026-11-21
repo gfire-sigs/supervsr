@@ -11,16 +11,16 @@ var (
 	ErrCorrupt     = errors.New("replication: durable state is corrupt")
 )
 
-type SuperblockStore struct {
+type superblockStore struct {
 	mu         sync.Mutex
 	storage    Storage
-	validation SuperblockValidation
-	current    SuperblockCandidate
+	validation superblockValidation
+	current    superblockCandidate
 	buffer     []byte
 	ioActive   bool
 }
 
-func OpenSuperblockStore(storage Storage, validation SuperblockValidation, beforeRepair ...func(Superblock) error) (*SuperblockStore, error) {
+func openSuperblockStore(storage Storage, validation superblockValidation, beforeRepair ...func(superblockRecord) error) (*superblockStore, error) {
 	if storage == nil {
 		return nil, ErrInvalidConfiguration
 	}
@@ -49,8 +49,8 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		return nil, err
 	}
 	copies := int(validation.Cluster.SuperblockCopies)
-	candidates := make([]SuperblockCandidate, 0, copies)
-	var byPhysical [8]SuperblockCandidate
+	candidates := make([]superblockCandidate, 0, copies)
+	var byPhysical [8]superblockCandidate
 	var validPhysical [8]bool
 	allZero := true
 	successfulReads := 0
@@ -66,7 +66,7 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		}
 		successfulReads++
 		allZero = allZero && allZeroBytes(buffer)
-		candidate, err := DecodeSuperblock(buffer, uint16(index), validation)
+		candidate, err := decodeSuperblock(buffer, uint16(index), validation)
 		if err != nil {
 			if errors.Is(err, ErrIncompatibleConfiguration) {
 				incompatibleCopies++
@@ -90,7 +90,7 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		}
 		return nil, ErrCorrupt
 	}
-	selected, err := SelectSuperblock(candidates, validation.Cluster.SuperblockCopies)
+	selected, err := selectSuperblock(candidates, validation.Cluster.SuperblockCopies)
 	if err != nil {
 		if errors.Is(err, ErrSuperblockInitializationIncomplete) {
 			return nil, errors.Join(ErrUnformatted, err)
@@ -98,11 +98,11 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 		return nil, errors.Join(ErrCorrupt, err)
 	}
 	if len(beforeRepair) == 1 {
-		if err := beforeRepair[0](selected.Superblock); err != nil {
+		if err := beforeRepair[0](selected.superblockRecord); err != nil {
 			return nil, err
 		}
 	}
-	store := &SuperblockStore{
+	store := &superblockStore{
 		storage:    storage,
 		validation: validation,
 		current:    selected,
@@ -114,13 +114,13 @@ func OpenSuperblockStore(storage Storage, validation SuperblockValidation, befor
 	return store, nil
 }
 
-func (store *SuperblockStore) Current() Superblock {
+func (store *superblockStore) Current() superblockRecord {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	return store.current.Superblock
+	return store.current.superblockRecord
 }
 
-func (store *SuperblockStore) Persist(next Superblock) error {
+func (store *superblockStore) Persist(next superblockRecord) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	var sequence ioSequence
@@ -136,11 +136,11 @@ func (store *SuperblockStore) Persist(next Superblock) error {
 	return nil
 }
 
-func (store *SuperblockStore) beginPersist(sequence *ioSequence, next *Superblock) error {
+func (store *superblockStore) beginPersist(sequence *ioSequence, next *superblockRecord) error {
 	if store.ioActive {
 		return ErrIOBackpressure
 	}
-	current := &store.current.Superblock
+	current := &store.current.superblockRecord
 	if next.Sequence != current.Sequence+1 || next.ParentChecksum != current.Checksum || durableStateRegressed(&current.State, &next.State) {
 		return ErrInvalidSuperblock
 	}
@@ -158,7 +158,7 @@ func (store *SuperblockStore) beginPersist(sequence *ioSequence, next *Superbloc
 	return nil
 }
 
-func (store *SuperblockStore) prepareCopy(sequence *ioSequence, next *Superblock) error {
+func (store *superblockStore) prepareCopy(sequence *ioSequence, next *superblockRecord) error {
 	physicalIndex := uint16((sequence.index + uint64(sequence.step)) % store.validation.Cluster.SuperblockCopies)
 	if err := next.Encode(store.buffer, physicalIndex, store.validation); err != nil {
 		return err
@@ -168,7 +168,7 @@ func (store *SuperblockStore) prepareCopy(sequence *ioSequence, next *Superblock
 	return nil
 }
 
-func (store *SuperblockStore) advancePersist(sequence *ioSequence, next *Superblock) error {
+func (store *superblockStore) advancePersist(sequence *ioSequence, next *superblockRecord) error {
 	if err := sequence.physical(); err != nil {
 		if sequence.phase == IOPhaseWrite {
 			return fmt.Errorf("%w: superblock copy %d: %w", ErrStorage, sequence.offset/SuperblockBytes, err)
@@ -184,18 +184,18 @@ func (store *SuperblockStore) advancePersist(sequence *ioSequence, next *Superbl
 	if int(sequence.step) < int(writeCopies) {
 		return store.prepareCopy(sequence, next)
 	}
-	store.current = SuperblockCandidate{Superblock: *next, PhysicalIndex: uint16(sequence.index)}
+	store.current = superblockCandidate{superblockRecord: *next, PhysicalIndex: uint16(sequence.index)}
 	sequence.phase = IOPhaseCompletion
 	return nil
 }
 
-func (store *SuperblockStore) repairCopies(byPhysical [8]SuperblockCandidate, validPhysical [8]bool) error {
-	selected := store.current.Superblock
+func (store *superblockStore) repairCopies(byPhysical [8]superblockCandidate, validPhysical [8]bool) error {
+	selected := store.current.superblockRecord
 	copies := int(store.validation.Cluster.SuperblockCopies)
 	for index := range copies {
 		valid := validPhysical[index]
 		candidate := byPhysical[index]
-		if valid && !candidate.MisdirectedIndex && candidate.Superblock.Checksum == selected.Checksum {
+		if valid && !candidate.MisdirectedIndex && candidate.superblockRecord.Checksum == selected.Checksum {
 			continue
 		}
 		if err := selected.Encode(store.buffer, uint16(index), store.validation); err != nil {

@@ -90,6 +90,7 @@ const (
 
 type BlockType uint8
 
+// ChecksumAlgorithm selects the 128-bit frame and storage integrity digest.
 type ChecksumAlgorithm uint8
 
 const (

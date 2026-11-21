@@ -13,6 +13,9 @@ var (
 	ErrHardwareChecksumUnavailable = errors.New("replication: hardware AES checksum unavailable")
 )
 
+// FormatConfig supplies the immutable cluster parameters used to initialize a
+// fresh replica storage file. Setting RequireHardwareChecksum rejects formatting
+// on CPUs without hardware AES support.
 type FormatConfig struct {
 	Group                   protocol.GroupID
 	Membership              Membership
@@ -21,10 +24,13 @@ type FormatConfig struct {
 	RequireHardwareChecksum bool
 }
 
+// FormatDependencies injects the target storage for Format.
 type FormatDependencies struct {
 	Storage Storage
 }
 
+// Format validates configuration and writes the initial superblock copies, root
+// prepare slot, and header ring to empty storage.
 func Format(ctx context.Context, cfg FormatConfig, dependencies FormatDependencies) error {
 	if err := validateFormatConfig(cfg, dependencies); err != nil {
 		return err
@@ -52,11 +58,11 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 	}
 
 	memberCount := cfg.Membership.ActiveCount + cfg.Membership.StandbyCount
-	wal, err := NewWAL(storage, cfg.Cluster, cfg.Group, memberCount)
+	wal, err := newWAL(storage, cfg.Cluster, cfg.Group, memberCount)
 	if err != nil {
 		return err
 	}
-	root, err := rootPrepareHeaderWith(cfg.Group, memberCount, uint32(cfg.Cluster.MessageSizeMax), cfg.Cluster.ChecksumAlgorithm)
+	root, err := rootPrepareHeader(cfg.Group, memberCount, uint32(cfg.Cluster.MessageSizeMax), cfg.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		return err
 	}
@@ -78,7 +84,7 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 		return err
 	}
 
-	emptyChecksum, err := protocol.ChecksumBytesWith(cfg.Cluster.ChecksumAlgorithm, nil)
+	emptyChecksum, err := protocol.ChecksumBytes(cfg.Cluster.ChecksumAlgorithm, nil)
 	if err != nil {
 		return err
 	}
@@ -90,12 +96,12 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 		LogicalStorageSize:        layout.BlockBase,
 		Release:                   cfg.CurrentRelease,
 	}
-	superblock := Superblock{
+	superblock := superblockRecord{
 		FormatVersion: protocol.FormatVersion,
 		Release:       cfg.CurrentRelease,
 		Sequence:      1,
 		Group:         cfg.Group,
-		State: DurableReplicaState{
+		State: durableReplicaState{
 			Checkpoint:   checkpoint,
 			LocalMember:  cfg.Membership.LocalMember,
 			Members:      cfg.Membership.Members,
@@ -109,7 +115,7 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 		ProtocolVersion:       protocol.ProtocolVersion,
 	}
 	superblock.ViewHeaders[0] = root
-	validation := SuperblockValidation{
+	validation := superblockValidation{
 		Group:                 cfg.Group,
 		Membership:            cfg.Membership,
 		ConfigurationChecksum: cfg.Cluster.Fingerprint(),
@@ -175,11 +181,7 @@ func zeroStorage(ctx context.Context, storage Storage, size uint64) error {
 	return storage.Sync()
 }
 
-func rootPrepareHeader(group protocol.GroupID, memberCount uint8, messageSizeMax uint32) ([protocol.HeaderSize]byte, error) {
-	return rootPrepareHeaderWith(group, memberCount, messageSizeMax, ChecksumAEGIS128L)
-}
-
-func rootPrepareHeaderWith(group protocol.GroupID, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
+func rootPrepareHeader(group protocol.GroupID, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
 	var encoded [protocol.HeaderSize]byte
 	header := protocol.Header{
 		Group:    group,
@@ -188,10 +190,10 @@ func rootPrepareHeaderWith(group protocol.GroupID, memberCount uint8, messageSiz
 		Author:   0,
 	}
 	header.Fields[124] = byte(protocol.OperationRoot)
-	if err := protocol.SealFrameWith(encoded[:], &header, algorithm); err != nil {
+	if err := protocol.SealFrame(encoded[:], &header, algorithm); err != nil {
 		return [protocol.HeaderSize]byte{}, err
 	}
-	if _, reason := protocol.DecodeHeaderWith(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
+	if _, reason := protocol.DecodeHeader(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
 		return [protocol.HeaderSize]byte{}, ErrInvalidWAL
 	}
 	return encoded, nil

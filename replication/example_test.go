@@ -105,7 +105,7 @@ func ExampleOpen() {
 	}
 	path := filepath.Join(dir, "replica.vsr")
 
-	formatStorage, err := replication.OpenFileStorage(path, true, false)
+	formatStorage, err := replication.OpenFileStorage(path, replication.FileStorageOptions{Create: true})
 	if err != nil {
 		panic(err)
 	}
@@ -122,7 +122,7 @@ func ExampleOpen() {
 		panic(err)
 	}
 
-	storage, err := replication.OpenFileStorage(path, false, false)
+	storage, err := replication.OpenFileStorage(path, replication.FileStorageOptions{})
 	if err != nil {
 		panic(err)
 	}

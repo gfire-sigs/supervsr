@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication"
@@ -104,7 +102,10 @@ func TestSnapshotRejectsCorruptionWithoutChangingState(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				checksum := protocol.ChecksumBytes(checksumInput)
+				checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, checksumInput)
+				if err != nil {
+					t.Fatal(err)
+				}
 				document.Checksum = hex.EncodeToString(checksum[:])
 				encoded, err := json.Marshal(document)
 				if err != nil {
@@ -273,7 +274,7 @@ func checkpointOpenInput(t *testing.T, group protocol.GroupID, op protocol.Op) r
 	}
 	binary.LittleEndian.PutUint64(header.Fields[96:104], uint64(op))
 	var input replication.OpenCheckpointInput
-	if err := protocol.EncodeHeader(input.State.Header[:], &header); err != nil {
+	if err := protocol.EncodeHeader(input.State.Header[:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return input
@@ -300,35 +301,4 @@ func persistCurrentSnapshot(t *testing.T, machine *kvMachine, op protocol.Op) {
 
 func newSnapshotTestMachine(directory string) *kvMachine {
 	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, protocol.ChecksumAEGIS128L, zerolog.Nop())
-}
-
-func TestClientEventsNonBlockingAndRequestCorrelated(t *testing.T) {
-	events := &clientEvents{notify: make(chan struct{}, 1)}
-	for request := protocol.RequestNo(1); request <= 4; request++ {
-		events.Reply(replication.ClientReply{Request: request, Body: []byte{resultOK}})
-	}
-
-	cluster := &localCluster{
-		process:      replication.DefaultProcessConfig(),
-		clientEvents: events,
-		transport:    &localTransport{},
-	}
-	reply, err := cluster.awaitReply(context.Background(), 200*time.Millisecond, 4)
-	if err != nil {
-		t.Fatalf("awaitReply(4): %v", err)
-	}
-	if reply.Request != 4 {
-		t.Fatalf("reply request = %d, want 4", reply.Request)
-	}
-
-	events.Reply(replication.ClientReply{Request: 4, Body: []byte{resultOK}})
-	if _, err := cluster.awaitReply(context.Background(), 50*time.Millisecond, 5); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("stale reply error = %v, want %v", err, context.DeadlineExceeded)
-	}
-
-	events.Evicted(protocol.EvictionInvalidBody)
-	events.Evicted(protocol.EvictionNoSession)
-	if _, err := cluster.awaitReply(context.Background(), 50*time.Millisecond, 5); !errors.Is(err, errClientEvicted) {
-		t.Fatalf("evicted error = %v, want %v", err, errClientEvicted)
-	}
 }

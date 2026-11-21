@@ -36,11 +36,11 @@ func TestCheckpointJoinsLiveRepairBeforeReusingAddress(t *testing.T) {
 	}
 	storage := &heldRepairStorage{Storage: backing, offset: base, started: make(chan struct{}), release: make(chan struct{})}
 	state := CheckpointState{LogicalStorageSize: base, Release: 1}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(storage, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestCheckpointJoinsLiveRepairBeforeReusingAddress(t *testing.T) {
 	if err := allocator.Publish(address); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewIOEngine(storage, 2, 1)
+	engine, err := newDefaultIOEngine(storage, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestCheckpointJoinsLiveRepairBeforeReusingAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate.reachable, err = NewFixedBitSet(candidate.blockCount)
+	candidate.reachable, err = newFixedBitSet(candidate.blockCount)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,19 +17,19 @@ func TestTrailerStoreRoundTripsMultipleBlocksBackward(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := CheckpointState{LogicalStorageSize: base}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(storage, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks, err := NewBlockStore(storage, cluster, protocol.GroupID{3}, 1)
+	blocks, err := newBlockStore(storage, cluster, protocol.GroupID{3}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	trailers, err := NewTrailerStore(blocks)
+	trailers, err := newTrailerStore(blocks)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,13 +12,13 @@ var updateStorageGolden = flag.Bool("update-storage-golden", false, "update cano
 func TestCanonicalSuperblockFixture(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	actual := make([]byte, int(validation.Cluster.SuperblockCopies)*SuperblockBytes)
-	candidates := make([]SuperblockCandidate, 0, validation.Cluster.SuperblockCopies)
+	candidates := make([]superblockCandidate, 0, validation.Cluster.SuperblockCopies)
 	for index := range uint16(validation.Cluster.SuperblockCopies) {
 		encoded := actual[int(index)*SuperblockBytes : int(index+1)*SuperblockBytes]
 		if err := superblock.Encode(encoded, index, validation); err != nil {
 			t.Fatal(err)
 		}
-		candidate, err := DecodeSuperblock(encoded, index, validation)
+		candidate, err := decodeSuperblock(encoded, index, validation)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,20 +40,20 @@ func TestCanonicalSuperblockFixture(t *testing.T) {
 	if !bytes.Equal(actual, expected) {
 		t.Fatal("canonical durable format fixture changed")
 	}
-	decoded := make([]SuperblockCandidate, 0, validation.Cluster.SuperblockCopies)
+	decoded := make([]superblockCandidate, 0, validation.Cluster.SuperblockCopies)
 	for index := range uint16(validation.Cluster.SuperblockCopies) {
 		encoded := expected[int(index)*SuperblockBytes : int(index+1)*SuperblockBytes]
-		candidate, err := DecodeSuperblock(encoded, index, validation)
+		candidate, err := decodeSuperblock(encoded, index, validation)
 		if err != nil {
 			t.Fatalf("decode fixture copy %d: %v", index, err)
 		}
 		decoded = append(decoded, candidate)
 	}
-	selected, err := SelectSuperblock(decoded, validation.Cluster.SuperblockCopies)
+	selected, err := selectSuperblock(decoded, validation.Cluster.SuperblockCopies)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Superblock != superblock {
+	if selected.superblockRecord != superblock {
 		t.Fatal("decoded durable fixture changed state")
 	}
 }

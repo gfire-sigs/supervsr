@@ -97,10 +97,10 @@ func TestSelectedPrimaryRepairsMissingCommittedPrepare(t *testing.T) {
 	}
 	replica.frames = frames
 	replica.repairBudget = budget
-	replica.random = NewDeterministicRandom(1)
+	replica.random = newDeterministicRandom(1)
 	replica.deps.MessageBus = bus
 	replica.continueRecoveringView(1)
-	request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+	request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || request.Command != protocol.CommandGetPrepare || binary.LittleEndian.Uint64(request.Fields[32:40]) != 1 {
 		t.Fatalf("repair request command=%d op=%d reason=%d", request.Command, binary.LittleEndian.Uint64(request.Fields[32:40]), reason)
 	}
@@ -138,7 +138,7 @@ func TestExitViewQuorumPersistsBeforeJoin(t *testing.T) {
 			t.Fatal(err)
 		}
 		header := protocol.Header{Group: config.Group, View: 0, Protocol: protocol.ProtocolVersion, Command: protocol.CommandExitView, Author: protocol.ReplicaIndex(author)}
-		if err := message.Seal(&header); err != nil {
+		if err := message.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 			t.Fatal(err)
 		}
 		if err := message.BindReplica(config.Membership.Members[header.Author], header.Author); err != nil {
@@ -181,21 +181,21 @@ func canonicalFixture(t testing.TB) (*Replica, protocol.Header, protocol.Header,
 	t.Helper()
 	cluster := compactTestClusterConfig()
 	membership := Membership{Members: [MembersMax]protocol.MemberID{{1}, {2}, {3}}, ActiveCount: 3, LocalMember: protocol.MemberID{1}}
-	rootBytes, err := rootPrepareHeader(protocol.GroupID{1}, 3, uint32(cluster.MessageSizeMax))
+	rootBytes, err := rootPrepareHeader(protocol.GroupID{1}, 3, uint32(cluster.MessageSizeMax), ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, reason := protocol.DecodeHeader(rootBytes[:], protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3)
+	root, reason := protocol.DecodeHeader(rootBytes[:], protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	firstFrame := connectedPrepareFrame(t, cluster, root, 1)
-	first, _, reason := protocol.DecodeFrame(firstFrame, protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3)
+	first, _, reason := protocol.DecodeFrame(firstFrame, protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	secondFrame := connectedPrepareFrame(t, cluster, first, 2)
-	second, _, reason := protocol.DecodeFrame(secondFrame, protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3)
+	second, _, reason := protocol.DecodeFrame(secondFrame, protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}

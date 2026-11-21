@@ -12,22 +12,22 @@ const (
 	ewahLiteralMax = uint64(math.MaxUint32)
 )
 
-type FixedBitSet struct {
+type fixedBitSet struct {
 	words  []uint64
 	length uint64
 }
 
-func NewFixedBitSet(length uint64) (FixedBitSet, error) {
+func newFixedBitSet(length uint64) (fixedBitSet, error) {
 	if length > math.MaxUint64-63 {
-		return FixedBitSet{}, ErrInvalidConfiguration
+		return fixedBitSet{}, ErrInvalidConfiguration
 	}
 	wordCount := (length + 63) / 64
 	if wordCount > uint64(int(^uint(0)>>1)) {
-		return FixedBitSet{}, ErrInvalidConfiguration
+		return fixedBitSet{}, ErrInvalidConfiguration
 	}
-	return FixedBitSet{words: make([]uint64, int(wordCount)), length: length}, nil
+	return fixedBitSet{words: make([]uint64, int(wordCount)), length: length}, nil
 }
-func (set *FixedBitSet) grow(length uint64) error {
+func (set *fixedBitSet) grow(length uint64) error {
 	if length <= set.length {
 		return nil
 	}
@@ -45,13 +45,13 @@ func (set *FixedBitSet) grow(length uint64) error {
 	return nil
 }
 
-func (set *FixedBitSet) Len() uint64 { return set.length }
+func (set *fixedBitSet) Len() uint64 { return set.length }
 
-func (set *FixedBitSet) Test(index uint64) bool {
+func (set *fixedBitSet) Test(index uint64) bool {
 	return index < set.length && set.words[index/64]&(uint64(1)<<(index%64)) != 0
 }
 
-func (set *FixedBitSet) Set(index uint64) bool {
+func (set *fixedBitSet) Set(index uint64) bool {
 	if index >= set.length {
 		return false
 	}
@@ -59,7 +59,7 @@ func (set *FixedBitSet) Set(index uint64) bool {
 	return true
 }
 
-func (set *FixedBitSet) Clear(index uint64) bool {
+func (set *fixedBitSet) Clear(index uint64) bool {
 	if index >= set.length {
 		return false
 	}
@@ -67,7 +67,7 @@ func (set *FixedBitSet) Clear(index uint64) bool {
 	return true
 }
 
-func (set FixedBitSet) Count() uint64 {
+func (set fixedBitSet) Count() uint64 {
 	var count uint64
 	for _, word := range set.words {
 		count += uint64(populationCount(word))
@@ -75,7 +75,7 @@ func (set FixedBitSet) Count() uint64 {
 	return count
 }
 
-func (set *FixedBitSet) EncodeEWAH(destination []uint64) (int, error) {
+func (set *fixedBitSet) EncodeEWAH(destination []uint64) (int, error) {
 	if !set.validTail() {
 		return 0, ErrInvalidEWAH
 	}
@@ -117,7 +117,7 @@ func (set *FixedBitSet) EncodeEWAH(destination []uint64) (int, error) {
 	return written, nil
 }
 
-func (set *FixedBitSet) DecodeEWAH(encoded []uint64) error {
+func (set *fixedBitSet) DecodeEWAH(encoded []uint64) error {
 	clear(set.words)
 	cursor := 0
 	for offset := 0; offset < len(encoded); {
@@ -157,7 +157,7 @@ func (set *FixedBitSet) DecodeEWAH(encoded []uint64) error {
 	return nil
 }
 
-func (set *FixedBitSet) validTail() bool {
+func (set *fixedBitSet) validTail() bool {
 	if set.length == 0 || set.length%64 == 0 {
 		return true
 	}

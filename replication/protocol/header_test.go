@@ -44,11 +44,11 @@ func TestFrameRoundTrip(t *testing.T) {
 	binary.LittleEndian.PutUint64(header.Fields[48:56], 1)
 	binary.LittleEndian.PutUint32(header.Fields[64:68], 1)
 	header.Fields[68] = byte(OperationApplicationMin)
-	if err := SealFrame(frame, &header); err != nil {
+	if err := SealFrame(frame, &header, ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 
-	decoded, decodedBody, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount)
+	decoded, decodedBody, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L)
 	if reason != RejectNone {
 		t.Fatalf("decode reason = %d", reason)
 	}
@@ -67,7 +67,7 @@ func TestHeaderChecksumPrecedesUntrustedSize(t *testing.T) {
 	context := testValidationContext()
 	frame := makeValidEmptyFrame(t, context, CommandExitView, context.Sender, 0)
 	frame[96] ^= 0xff
-	if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount); reason != RejectHeaderChecksum {
+	if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L); reason != RejectHeaderChecksum {
 		t.Fatalf("reason = %d, want %d", reason, RejectHeaderChecksum)
 	}
 }
@@ -89,7 +89,7 @@ func TestFrameRejectsReservedAndCorruptBytes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			frame := makeValidEmptyFrame(t, context, CommandExitView, context.Sender, 0)
 			test.mutate(frame)
-			if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount); reason != test.want {
+			if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L); reason != test.want {
 				t.Fatalf("reason = %d, want %d", reason, test.want)
 			}
 		})
@@ -100,11 +100,11 @@ func TestFrameRejectsCorruptBody(t *testing.T) {
 	context := testValidationContext()
 	frame := make([]byte, HeaderSize+1)
 	header := Header{Group: context.Group, Protocol: ProtocolVersion, Command: CommandRequest, Release: 1}
-	if err := SealFrame(frame, &header); err != nil {
+	if err := SealFrame(frame, &header, ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	frame[HeaderSize] ^= 1
-	if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount); reason != RejectBodyChecksum {
+	if _, _, reason := DecodeFrame(frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L); reason != RejectBodyChecksum {
 		t.Fatalf("reason = %d, want %d", reason, RejectBodyChecksum)
 	}
 }
@@ -131,7 +131,7 @@ func TestFramePoolOwnershipAndBackpressure(t *testing.T) {
 	}
 	copy(body, "test")
 	header := Header{Group: GroupID{1}, Protocol: ProtocolVersion, Command: CommandRequest, Release: 1}
-	if err := first.Seal(&header); err != nil {
+	if err := first.Seal(&header, ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := first.Body(); !errors.Is(err, ErrFrameSealed) {
@@ -163,7 +163,7 @@ func TestFrameSourceBindsOnceAndResetsOnRelease(t *testing.T) {
 		t.Fatalf("unsealed bind error = %v, want %v", err, ErrFrameSource)
 	}
 	header := Header{Group: GroupID{1}, Protocol: ProtocolVersion, Command: CommandExitView}
-	if err := frame.Seal(&header); err != nil {
+	if err := frame.Seal(&header, ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	member := MemberID{9}
@@ -199,7 +199,7 @@ func TestFramePoolSteadyStateHasNoAllocations(t *testing.T) {
 		if acquireErr != nil {
 			panic(acquireErr)
 		}
-		if sealErr := frame.Seal(&header); sealErr != nil {
+		if sealErr := frame.Seal(&header, ChecksumAEGIS128L); sealErr != nil {
 			panic(sealErr)
 		}
 		if _, bytesErr := frame.Bytes(); bytesErr != nil {
@@ -216,14 +216,17 @@ func makeValidEmptyFrame(t testing.TB, context ValidationContext, command Comman
 	t.Helper()
 	frame := make([]byte, HeaderSize)
 	header := Header{Group: context.Group, Protocol: ProtocolVersion, Command: command, Author: author, Release: release}
-	if err := SealFrame(frame, &header); err != nil {
+	if err := SealFrame(frame, &header, ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame
 }
 
 func resealHeaderChecksum(frame []byte) {
-	checksum := ChecksumBytes(frame[HeaderChecksumFrom:HeaderSize])
+	checksum, err := ChecksumBytes(ChecksumAEGIS128L, frame[HeaderChecksumFrom:HeaderSize])
+	if err != nil {
+		panic(err)
+	}
 	copy(frame[:16], checksum[:])
 }
 

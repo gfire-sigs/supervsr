@@ -33,7 +33,7 @@ func TestReplicaRecoveryNonceUsesRestartEntropy(t *testing.T) {
 		t.Cleanup(func() { closeReplica(t, replica) })
 		replica.sendGetView(1)
 		for _, frame := range bus.replicaMessages() {
-			header, _, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount)
+			header, _, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone {
 				t.Fatal(reason)
 			}

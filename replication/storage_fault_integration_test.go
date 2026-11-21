@@ -66,8 +66,8 @@ type fileAppendFault struct {
 }
 
 type fileAppendRecovery struct {
-	wal       *WAL
-	report    WALRecoveryReport
+	wal       *walJournal
+	report    walRecoveryReport
 	err       error
 	prior     []byte
 	attempted []byte
@@ -129,7 +129,7 @@ func exerciseFileAppendFault(t *testing.T, fault fileAppendFault) fileAppendReco
 	storage.writes, storage.syncs = 0, 0
 	storage.writeAtCall, storage.syncAtCall, storage.partial = fault.write, fault.sync, fault.partial
 	engine := fileIOEngine(t, storage, 1, 1)
-	completion := executeFileIO(t, engine, IOOperation{Kind: IOWALAppend, WAL: wal, Buffer: attempted})
+	completion := executeFileIO(t, engine, ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: attempted})
 	if !storage.injected || !errors.Is(completion.Err, errInjectedFileIO) {
 		t.Fatalf("append completion = %v, injected = %t", completion.Err, storage.injected)
 	}
@@ -155,15 +155,15 @@ func exerciseFileAppendFault(t *testing.T, fault fileAppendFault) fileAppendReco
 			t.Fatal("reopened bytes do not preserve the injected physical write boundary")
 		}
 	}
-	store, err := OpenSuperblockStore(reopened, validation)
+	store, err := openSuperblockStore(reopened, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := NewWAL(reopened, config, validation.Group, 1)
+	recovered, err := newWAL(reopened, config, validation.Group, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = recovered.Recover(store.Current().State.Checkpoint, 1, WALRecoveryView{})
+	report, err = recovered.Recover(store.Current().State.Checkpoint, 1, walRecoveryView{})
 	return fileAppendRecovery{wal: recovered, report: report, err: err, prior: prior, attempted: attempted}
 }
 
@@ -180,7 +180,7 @@ func TestFileWALInjectedCapacityFailurePreservesPrefix(t *testing.T) {
 	}
 	storage := &injectedFileStorage{FileStorage: file, capacity: size}
 	engine := fileIOEngine(t, storage, 2, 1)
-	completion := executeFileIO(t, engine, IOOperation{Kind: IOResize, Size: size + config.BlockSize})
+	completion := executeFileIO(t, engine, ioOperation{Kind: IOResize, Size: size + config.BlockSize})
 	if !storage.injected || !errors.Is(completion.Err, syscall.ENOSPC) || !errors.Is(completion.Err, errInjectedFileIO) {
 		t.Fatalf("extension completion = %v, injected = %t", completion.Err, storage.injected)
 	}
@@ -213,19 +213,19 @@ func TestFileWALSustainedIOKeepsResourcesBounded(t *testing.T) {
 	for round := range rounds {
 		for first := 0; first < len(frames); first += slots {
 			for index := range slots {
-				handle, err := engine.Submit(IOOperation{Kind: IOWALAppend, WAL: wal, Buffer: frames[first+index]})
+				handle, err := engine.Submit(ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: frames[first+index]})
 				if err != nil {
 					t.Fatalf("round %d append %d: %v", round, first+index+1, err)
 				}
 				handles[index] = handle
 			}
-			if _, err := engine.Submit(IOOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
+			if _, err := engine.Submit(ioOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
 				t.Fatalf("exhausted pool accepted work: %v", err)
 			}
 			finishFileBatch(t, engine, handles[:])
 			for index := range slots {
 				offset := wal.Layout().PrepareBase + uint64(first+index+1)*wal.Layout().PrepareStride
-				handle, err := engine.Submit(IOOperation{Kind: IORead, Offset: offset, Buffer: buffers[index][:]})
+				handle, err := engine.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: buffers[index][:]})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -264,8 +264,8 @@ func BenchmarkFileWALAppendRead(b *testing.B) {
 	frame := connectedPrepareFrame(b, config, report.HeadHeader, 1)
 	engine := fileIOEngine(b, file, 4, 1)
 	buffer := make([]byte, wal.Layout().PrepareStride)
-	appendOperation := IOOperation{Kind: IOWALAppend, WAL: wal, Buffer: frame}
-	readOperation := IOOperation{Kind: IORead, Offset: wal.Layout().PrepareBase + wal.Layout().PrepareStride, Buffer: buffer}
+	appendOperation := ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: frame}
+	readOperation := ioOperation{Kind: IORead, Offset: wal.Layout().PrepareBase + wal.Layout().PrepareStride, Buffer: buffer}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(frame)))
 	b.ResetTimer()
@@ -299,7 +299,7 @@ func BenchmarkFileWALAppendRead(b *testing.B) {
 	b.ReportMetric(4, "io-slots")
 }
 
-func formattedFileWAL(t testing.TB) (string, ClusterConfig, *FileStorage, SuperblockValidation) {
+func formattedFileWAL(t testing.TB) (string, ClusterConfig, *FileStorage, superblockValidation) {
 	t.Helper()
 	config := compactTestClusterConfig()
 	membership := Membership{Members: [MembersMax]protocol.MemberID{{1}}, ActiveCount: 1, LocalMember: protocol.MemberID{1}}
@@ -309,13 +309,13 @@ func formattedFileWAL(t testing.TB) (string, ClusterConfig, *FileStorage, Superb
 	if err := Format(t.Context(), format, FormatDependencies{Storage: file}); err != nil {
 		t.Fatal(err)
 	}
-	validation := SuperblockValidation{Group: format.Group, Membership: membership, ConfigurationChecksum: config.Fingerprint(), Cluster: config}
+	validation := superblockValidation{Group: format.Group, Membership: membership, ConfigurationChecksum: config.Fingerprint(), Cluster: config}
 	return path, config, file, validation
 }
 
 func openOwnedFile(t testing.TB, path string, create bool) *FileStorage {
 	t.Helper()
-	file, err := OpenFileStorage(path, create, false)
+	file, err := OpenFileStorage(path, FileStorageOptions{Create: create})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,17 +327,17 @@ func openOwnedFile(t testing.TB, path string, create bool) *FileStorage {
 	return file
 }
 
-func recoverFileWAL(t testing.TB, storage Storage, config ClusterConfig, validation SuperblockValidation) (*WAL, WALRecoveryReport) {
+func recoverFileWAL(t testing.TB, storage Storage, config ClusterConfig, validation superblockValidation) (*walJournal, walRecoveryReport) {
 	t.Helper()
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wal, err := NewWAL(storage, config, validation.Group, 1)
+	wal, err := newWAL(storage, config, validation.Group, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(store.Current().State.Checkpoint, 0, WALRecoveryView{})
+	report, err := wal.Recover(store.Current().State.Checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,14 +346,14 @@ func recoverFileWAL(t testing.TB, storage Storage, config ClusterConfig, validat
 
 func decodeFilePrepare(t testing.TB, config ClusterConfig, frame []byte) protocol.Header {
 	t.Helper()
-	header, _, reason := protocol.DecodeFrame(frame, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1)
+	header, _, reason := protocol.DecodeFrame(frame, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	return header
 }
 
-func assertFilePrepare(t testing.TB, wal *WAL, op protocol.Op, expected []byte) {
+func assertFilePrepare(t testing.TB, wal *walJournal, op protocol.Op, expected []byte) {
 	t.Helper()
 	frame, err := wal.ReadPrepare(op, make([]byte, wal.Layout().PrepareStride))
 	if err != nil || !bytes.Equal(frame, expected) {
@@ -369,9 +369,9 @@ func assertFileSize(t testing.TB, file *FileStorage, expected uint64) {
 	}
 }
 
-func fileIOEngine(t testing.TB, storage Storage, slots, workers uint32) *IOEngine {
+func fileIOEngine(t testing.TB, storage Storage, slots, workers uint32) *storageIOEngine {
 	t.Helper()
-	engine, err := NewIOEngine(storage, slots, workers)
+	engine, err := newDefaultIOEngine(storage, slots, workers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,16 +379,16 @@ func fileIOEngine(t testing.TB, storage Storage, slots, workers uint32) *IOEngin
 	return engine
 }
 
-func closeFileIO(t testing.TB, engine *IOEngine) {
+func closeFileIO(t testing.TB, engine *storageIOEngine) {
 	t.Helper()
 	if err := engine.Close(context.Background()); err != nil {
 		t.Errorf("close file IO workers: %v", err)
 	}
 }
 
-func awaitFileIO(t testing.TB, engine *IOEngine) IOCompletion {
+func awaitFileIO(t testing.TB, engine *storageIOEngine) ioCompletion {
 	t.Helper()
-	var completion IOCompletion
+	var completion ioCompletion
 	for !engine.Poll(&completion) {
 		select {
 		case <-engine.Ready():
@@ -399,7 +399,7 @@ func awaitFileIO(t testing.TB, engine *IOEngine) IOCompletion {
 	return completion
 }
 
-func executeFileIO(t testing.TB, engine *IOEngine, operation IOOperation) IOCompletion {
+func executeFileIO(t testing.TB, engine *storageIOEngine, operation ioOperation) ioCompletion {
 	t.Helper()
 	handle, err := engine.Submit(operation)
 	if err != nil {
@@ -412,7 +412,7 @@ func executeFileIO(t testing.TB, engine *IOEngine, operation IOOperation) IOComp
 	return completion
 }
 
-func finishFileBatch(t testing.TB, engine *IOEngine, handles []IOHandle) {
+func finishFileBatch(t testing.TB, engine *storageIOEngine, handles []IOHandle) {
 	t.Helper()
 	var seen uint64
 	for range handles {

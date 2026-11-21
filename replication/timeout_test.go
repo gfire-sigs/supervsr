@@ -7,7 +7,7 @@ import (
 )
 
 func TestTimeoutRequiresResetAfterFire(t *testing.T) {
-	timeout, err := NewTimeout(30*time.Millisecond, 10*time.Millisecond, 2)
+	timeout, err := newTimeout(30*time.Millisecond, 10*time.Millisecond, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,15 +32,15 @@ func TestTimeoutRequiresResetAfterFire(t *testing.T) {
 
 func TestTimeoutBackoffIsBoundedAndDeterministic(t *testing.T) {
 	process := DefaultProcessConfig()
-	first, err := NewTimeout(250*time.Millisecond, process.Tick, 1)
+	first, err := newTimeout(250*time.Millisecond, process.Tick, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := first
 	first.Start()
 	second.Start()
-	randomA := NewDeterministicRandom(17)
-	randomB := NewDeterministicRandom(17)
+	randomA := newDeterministicRandom(17)
+	randomB := newDeterministicRandom(17)
 	for attempt := 1; attempt <= 255; attempt++ {
 		if err := first.Backoff(process, process.MaximumRTT*2, &randomA); err != nil {
 			t.Fatal(err)
@@ -70,12 +70,12 @@ func TestTimeoutBackoffIsBoundedAndDeterministic(t *testing.T) {
 }
 
 func TestTimeoutFixedJitterStaysWithinHalfToOneAndHalfPeriods(t *testing.T) {
-	timeout, err := NewTimeout(time.Second, 10*time.Millisecond, 0)
+	timeout, err := newTimeout(time.Second, 10*time.Millisecond, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	timeout.Start()
-	random := NewDeterministicRandom(23)
+	random := newDeterministicRandom(23)
 	for range 1000 {
 		if err := timeout.ResetJitter(&random); err != nil {
 			t.Fatal(err)
@@ -88,12 +88,12 @@ func TestTimeoutFixedJitterStaysWithinHalfToOneAndHalfPeriods(t *testing.T) {
 
 func BenchmarkTimeoutBackoff(b *testing.B) {
 	process := DefaultProcessConfig()
-	timeout, err := NewTimeout(250*time.Millisecond, process.Tick, 0)
+	timeout, err := newTimeout(250*time.Millisecond, process.Tick, 0)
 	if err != nil {
 		b.Fatal(err)
 	}
 	timeout.Start()
-	random := NewDeterministicRandom(31)
+	random := newDeterministicRandom(31)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

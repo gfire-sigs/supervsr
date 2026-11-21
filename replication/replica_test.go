@@ -45,7 +45,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	}
 	processReplicaUntil(t, replica, 1)
 	registrationReply := bus.clientMessage(t, 0)
-	registrationHeader, registrationBody, reason := protocol.DecodeFrame(registrationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	registrationHeader, registrationBody, reason := protocol.DecodeFrame(registrationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || len(registrationBody) != 64 {
 		t.Fatalf("registration reply reason=%v size=%d", reason, len(registrationBody))
 	}
@@ -61,7 +61,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaMessages(t, replica, 2)
-	rejection, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	rejection, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || protocol.EvictionReason(rejection.Fields[127]) != protocol.EvictionInvalidBody {
 		t.Fatalf("application rejection=%+v reason=%v", rejection, reason)
 	}
@@ -72,7 +72,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	}
 	processReplicaUntil(t, replica, 2)
 	applicationReply := bus.clientMessage(t, 2)
-	applicationHeader, applicationBody, reason := protocol.DecodeFrame(applicationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	applicationHeader, applicationBody, reason := protocol.DecodeFrame(applicationReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || string(applicationBody) != "reply:put" {
 		t.Fatalf("application reply reason=%v body=%q", reason, applicationBody)
 	}
@@ -86,7 +86,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 	}
 	processReplicaMessages(t, replica, 4)
 	duplicateReply := bus.clientMessage(t, 3)
-	_, duplicateBody, reason := protocol.DecodeFrame(duplicateReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	_, duplicateBody, reason := protocol.DecodeFrame(duplicateReply, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || string(duplicateBody) != "reply:put" {
 		t.Fatalf("duplicate reply reason=%v body=%q", reason, duplicateBody)
 	}
@@ -105,7 +105,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaNetworkMessages(t, replica, bus, headersStart+1)
-	headers, headersBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, headersStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	headers, headersBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, headersStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || headers.Command != protocol.CommandHeaders || len(headersBody) != 2*protocol.HeaderSize {
 		t.Fatalf("headers command=%d body=%d reason=%v", headers.Command, len(headersBody), reason)
 	}
@@ -117,7 +117,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaNetworkMessages(t, replica, bus, prepareStart+1)
-	repairedPrepare, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, prepareStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	repairedPrepare, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, prepareStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || repairedPrepare.Command != protocol.CommandPrepare || repairedPrepare.HeaderChecksum != prepareHeader.HeaderChecksum {
 		t.Fatalf("prepare repair=%+v reason=%v", repairedPrepare, reason)
 	}
@@ -133,7 +133,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaNetworkMessages(t, replica, bus, replyStart+1)
-	repairedReply, replyBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, replyStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	repairedReply, replyBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, replyStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || repairedReply.HeaderChecksum != applicationHeader.HeaderChecksum || string(replyBody) != "reply:put" {
 		t.Fatalf("reply repair=%+v body=%q reason=%v", repairedReply, replyBody, reason)
 	}
@@ -161,7 +161,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaNetworkMessages(t, replica, bus, blockStart+1)
-	repairedBlock, blockBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, blockStart), config.Group, uint32(config.Cluster.BlockSize), 1)
+	repairedBlock, blockBody, reason := protocol.DecodeFrame(bus.replicaMessage(t, blockStart), config.Group, uint32(config.Cluster.BlockSize), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || repairedBlock.HeaderChecksum != blockReference.Checksum || len(blockBody) != 1 || blockBody[0] != 7 {
 		t.Fatalf("block repair=%+v body=%x reason=%v", repairedBlock, blockBody, reason)
 	}
@@ -172,7 +172,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaNetworkMessages(t, replica, bus, viewStart+1)
-	view, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, viewStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	view, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, viewStart), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || view.Command != protocol.CommandView || view.Fields[0] != 5 {
 		t.Fatalf("view response=%+v reason=%v", view, reason)
 	}
@@ -181,7 +181,7 @@ func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaUntil(t, replica, 3)
-	_, reconfigurationReply, reason := protocol.DecodeFrame(bus.clientMessage(t, 4), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	_, reconfigurationReply, reason := protocol.DecodeFrame(bus.clientMessage(t, 4), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || len(reconfigurationReply) != 4 || ReconfigurationResult(binary.LittleEndian.Uint32(reconfigurationReply)) != ReconfigurationApplied {
 		t.Fatalf("reconfiguration reply=%x reason=%v", reconfigurationReply, reason)
 	}
@@ -275,7 +275,10 @@ func TestReplicaFailStopsUnknownSupportedCommand(t *testing.T) {
 	encoded := append([]byte(nil), requestBytes...)
 	request.Release()
 	encoded[114] = 0xff
-	checksum := protocol.ChecksumBytes(encoded[protocol.HeaderChecksumFrom:])
+	checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, encoded[protocol.HeaderChecksumFrom:])
+	if err != nil {
+		t.Fatal(err)
+	}
 	copy(encoded[:16], checksum[:])
 	unknown, err := pool.AcquireEncoded(encoded)
 	if err != nil {
@@ -319,7 +322,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	pingHeader := protocol.Header{Group: config.Group, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandClientPing}
 	copy(pingHeader.Fields[:16], client[:])
 	binary.LittleEndian.PutUint64(pingHeader.Fields[16:24], 99)
-	if err := ping.Seal(&pingHeader); err != nil {
+	if err := ping.Seal(&pingHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := ping.BindClient(); err != nil {
@@ -329,7 +332,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaMessages(t, replica, 1)
-	pong, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	pong, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || pong.Command != protocol.CommandClientPong || binary.LittleEndian.Uint64(pong.Fields[:8]) != 99 || bus.clientDestination(0) != client {
 		t.Fatalf("pong=%+v reason=%v destination=%x", pong, reason, bus.clientDestination(0))
 	}
@@ -351,7 +354,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaMessages(t, replica, 2)
-	eviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	eviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 1), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || eviction.Command != protocol.CommandEviction || protocol.EvictionReason(eviction.Fields[127]) != protocol.EvictionNoSession {
 		t.Fatalf("eviction=%+v reason=%v", eviction, reason)
 	}
@@ -360,7 +363,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaMessages(t, replica, 3)
-	invalidEviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 2), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	invalidEviction, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 2), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || protocol.EvictionReason(invalidEviction.Fields[127]) != protocol.EvictionInvalidOperation {
 		t.Fatalf("invalid operation eviction=%+v reason=%v", invalidEviction, reason)
 	}
@@ -374,7 +377,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	binary.LittleEndian.PutUint64(malformedHeader.Fields[48:56], 1)
 	binary.LittleEndian.PutUint32(malformedHeader.Fields[64:68], 3)
 	malformedHeader.Fields[68] = byte(protocol.OperationApplicationMin)
-	if err := malformed.Seal(&malformedHeader); err != nil {
+	if err := malformed.Seal(&malformedHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := malformed.BindClient(); err != nil {
@@ -396,7 +399,7 @@ func TestReplicaClientPingAndNoSessionEviction(t *testing.T) {
 	binary.LittleEndian.PutUint64(futureHeader.Fields[48:56], 1)
 	binary.LittleEndian.PutUint32(futureHeader.Fields[64:68], 4)
 	futureHeader.Fields[68] = byte(protocol.OperationApplicationMin)
-	if err := future.Seal(&futureHeader); err != nil {
+	if err := future.Seal(&futureHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := future.BindClient(); err != nil {
@@ -575,7 +578,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 		t.Fatal(err)
 	}
 	processReplicaUntil(t, replica, 1)
-	registrationHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	registrationHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatalf("registration reply: %v", reason)
 	}
@@ -588,7 +591,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 			t.Fatal(err)
 		}
 		processReplicaUntil(t, replica, protocol.Op(requestNo)+1)
-		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 		if replyReason != protocol.RejectNone {
 			t.Fatalf("request %d reply: %v", requestNo, replyReason)
 		}
@@ -622,7 +625,7 @@ func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 			t.Fatal(err)
 		}
 		processReplicaUntil(t, replica, protocol.Op(requestNo)+1)
-		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		reply, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(requestNo)), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 		if replyReason != protocol.RejectNone {
 			t.Fatalf("request %d reply: %v", requestNo, replyReason)
 		}
@@ -697,7 +700,7 @@ func makeReplicaCommand(t testing.TB, pool *protocol.FramePool, header protocol.
 		t.Fatal(err)
 	}
 	copy(frameBody, body)
-	if err := frame.Seal(&header); err != nil {
+	if err := frame.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := frame.BindReplica(protocol.MemberID{byte(header.Author) + 1}, header.Author); err != nil {
@@ -725,7 +728,7 @@ func processReplicaNetworkMessages(t testing.TB, replica *Replica, bus *captureB
 	}
 }
 
-func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *WAL, *ReplyStore, *SessionTable, *SuperblockStore) {
+func replicaFixture(t testing.TB) (Config, *crashStorage, replicaInitialState, *walJournal, *durableReplyStore, *sessionTable, *superblockStore) {
 	t.Helper()
 	cluster := compactTestClusterConfig()
 
@@ -746,28 +749,28 @@ func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *
 		t.Fatal(err)
 	}
 	storage.Crash()
-	validation := SuperblockValidation{Group: config.Group, Membership: membership, ConfigurationChecksum: cluster.Fingerprint(), Cluster: cluster}
-	store, err := OpenSuperblockStore(storage, validation)
+	validation := superblockValidation{Group: config.Group, Membership: membership, ConfigurationChecksum: cluster.Fingerprint(), Cluster: cluster}
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	superblock := store.Current()
-	head, reason := protocol.DecodeHeader(superblock.State.Checkpoint.Header[:], config.Group, uint32(cluster.MessageSizeMax), 1)
+	head, reason := protocol.DecodeHeader(superblock.State.Checkpoint.Header[:], config.Group, uint32(cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatalf("root header: %v", reason)
 	}
-	wal, err := NewWAL(storage, cluster, config.Group, 1)
+	wal, err := newWAL(storage, cluster, config.Group, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wal.Recover(superblock.State.Checkpoint, superblock.State.CommitMax, WALRecoveryView{}); err != nil {
+	if _, err := wal.Recover(superblock.State.Checkpoint, superblock.State.CommitMax, walRecoveryView{}); err != nil {
 		t.Fatal(err)
 	}
-	replies, err := NewReplyStore(storage, cluster, config.Group, 1)
+	replies, err := newDurableReplyStore(storage, cluster, config.Group, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions, err := NewSessionTable(SessionTableConfig{
+	sessions, err := newSessionTable(sessionTableConfig{
 		ClientsMax:              uint32(cluster.ClientsMax),
 		Group:                   config.Group,
 		ActiveCount:             1,
@@ -777,7 +780,7 @@ func replicaFixture(t testing.TB) (Config, *crashStorage, ReplicaInitialState, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial := ReplicaInitialState{
+	initial := replicaInitialState{
 		Status:      StatusNormal,
 		View:        superblock.State.View,
 		DurableView: superblock.State.View,
@@ -808,7 +811,7 @@ func makeClientRequest(t testing.TB, pool *protocol.FramePool, group protocol.Gr
 	binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(session))
 	binary.LittleEndian.PutUint32(header.Fields[64:68], uint32(request))
 	header.Fields[68] = byte(operation)
-	if err := frame.Seal(&header); err != nil {
+	if err := frame.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := frame.BindClient(); err != nil {
@@ -989,7 +992,7 @@ func TestHigherViewPingEntersViewChangeBeforeClockTraffic(t *testing.T) {
 	pingHeader := protocol.Header{Group: config.Group, View: 7, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPing, Author: 0}
 	binary.LittleEndian.PutUint64(pingHeader.Fields[24:32], 11)
 	binary.LittleEndian.PutUint16(pingHeader.Fields[32:34], 1)
-	if err := ping.Seal(&pingHeader); err != nil {
+	if err := ping.Seal(&pingHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := ping.BindReplica(protocol.MemberID{1}, 0); err != nil {
@@ -1035,7 +1038,7 @@ func TestReplicaTimersBroadcastCommitAndPing(t *testing.T) {
 	}
 	var commits, pings int
 	for _, frame := range bus.replicaMessages() {
-		header, _, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		header, _, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 		if reason != protocol.RejectNone {
 			t.Fatalf("timer frame rejected: %v", reason)
 		}
@@ -1069,7 +1072,7 @@ func TestReplicaSingleExitSuspicionDoesNotChangeView(t *testing.T) {
 		quorums:         Quorums{ViewChange: 2},
 		deps:            Dependencies{MessageBus: bus},
 		status:          StatusNormal,
-		failureDetector: NewFailureDetector(1),
+		failureDetector: newLivenessDetector(1),
 		frames:          frames,
 	}
 	replica.handleExitTimeout(TimeSample{Monotonic: uint64(7*time.Second) + 2})
@@ -1346,7 +1349,7 @@ func TestReplicaSnapshotConcurrentWithRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitCaptureClientCount(t, bus, 1)
-	regHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	regHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatalf("registration decode reason=%v", reason)
 	}
@@ -1358,7 +1361,7 @@ func TestReplicaSnapshotConcurrentWithRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitCaptureClientCount(t, bus, int(seq)+1)
-		replyHeader, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(seq)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		replyHeader, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(seq)), config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 		if replyReason != protocol.RejectNone {
 			t.Fatalf("reply %d decode reason=%v", seq, replyReason)
 		}

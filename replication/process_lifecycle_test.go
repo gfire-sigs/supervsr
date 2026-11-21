@@ -244,7 +244,7 @@ func TestProcessFencedLostReplicaReplacementPreservesCounter(t *testing.T) {
 	lost := cluster.lastReplyFrom
 	fence := &processReplacementFence{cluster: cluster, index: lost, quarantine: t.TempDir()}
 	newPath := filepath.Join(t.TempDir(), "replacement.vsr")
-	storage, err := OpenFileStorage(newPath, true, false)
+	storage, err := OpenFileStorage(newPath, FileStorageOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}

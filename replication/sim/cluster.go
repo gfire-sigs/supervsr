@@ -1,3 +1,6 @@
+// Package sim provides a deterministic discrete-time fault-injection simulator
+// for multi-replica VSR clusters, network faults, storage faults, and clock
+// skew testing.
 package sim
 
 import (

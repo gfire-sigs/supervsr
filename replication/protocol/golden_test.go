@@ -41,7 +41,7 @@ func TestCanonicalFrameFixtures(t *testing.T) {
 
 	context := goldenValidationContext()
 	for _, test := range cases {
-		header, body, reason := DecodeFrame(test.frame, context.Group, context.MessageSizeMax, context.MemberCount)
+		header, body, reason := DecodeFrame(test.frame, context.Group, context.MessageSizeMax, context.MemberCount, ChecksumAEGIS128L)
 		if reason != RejectNone {
 			t.Fatalf("%s decode rejected: %d", test.name, reason)
 		}
@@ -66,7 +66,7 @@ func canonicalFrameCases(t *testing.T) []goldenFrameCase {
 			Author:   author,
 			Fields:   fields,
 		}
-		if err := SealFrame(frame, &header); err != nil {
+		if err := SealFrame(frame, &header, ChecksumAEGIS128L); err != nil {
 			t.Fatalf("seal command %d: %v", command, err)
 		}
 		return frame

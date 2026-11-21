@@ -32,12 +32,12 @@ func TestOpenResumesInstalledCheckpointWithMissingCommittedSuffix(t *testing.T) 
 	if err := Format(context.Background(), format, FormatDependencies{Storage: storage}); err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	next := store.Current()
-	root, reason := protocol.DecodeHeader(next.State.Checkpoint.Header[:], format.Group, uint32(format.Cluster.MessageSizeMax), 3)
+	root, reason := protocol.DecodeHeader(next.State.Checkpoint.Header[:], format.Group, uint32(format.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
@@ -46,16 +46,16 @@ func TestOpenResumesInstalledCheckpointWithMissingCommittedSuffix(t *testing.T) 
 		t.Fatal("checkpoint unavailable")
 	}
 	checkpointFrame := connectedPrepareFrame(t, format.Cluster, root, checkpointOp)
-	checkpointHeader, _, reason := protocol.DecodeFrame(checkpointFrame, format.Group, uint32(format.Cluster.MessageSizeMax), 3)
+	checkpointHeader, _, reason := protocol.DecodeFrame(checkpointFrame, format.Group, uint32(format.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	suffix := connectedPrepareFrame(t, format.Cluster, checkpointHeader, checkpointOp+1)
-	suffixHeader, _, reason := protocol.DecodeFrame(suffix, format.Group, uint32(format.Cluster.MessageSizeMax), 3)
+	suffixHeader, _, reason := protocol.DecodeFrame(suffix, format.Group, uint32(format.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
-	parentID, err := next.State.Checkpoint.ID()
+	parentID, err := next.State.Checkpoint.ID(ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestOpenResumesInstalledCheckpointWithMissingCommittedSuffix(t *testing.T) 
 	next.State.SyncMax = checkpointOp
 	next.State.CommitMax = checkpointOp + 1
 	next.ViewHeaderCount = 2
-	if err := protocol.EncodeHeader(next.ViewHeaders[0][:], &suffixHeader); err != nil {
+	if err := protocol.EncodeHeader(next.ViewHeaders[0][:], &suffixHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	copy(next.ViewHeaders[1][:], checkpointFrame[:protocol.HeaderSize])
@@ -108,19 +108,19 @@ func TestStateSyncAcceptsEvenlySplitClientTrailer(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := CheckpointState{LogicalStorageSize: base}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(source, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(source, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks, err := NewBlockStore(source, cluster, protocol.GroupID{9}, 1)
+	blocks, err := newBlockStore(source, cluster, protocol.GroupID{9}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	trailers, err := NewTrailerStore(blocks)
+	trailers, err := newTrailerStore(blocks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestStateSyncAcceptsEvenlySplitClientTrailer(t *testing.T) {
 		repair := &replica.blockRepairTargets[index]
 		offset, _ := cluster.BlockOffset(repair.reference.Address)
 		physical := source.working[offset : offset+cluster.BlockSize]
-		frame, header, ok := decodeRepairFrame(physical, config.Group, uint32(cluster.BlockSize), 2)
+		frame, header, ok := decodeRepairFrame(physical, config.Group, uint32(cluster.BlockSize), 2, ChecksumAEGIS128L)
 		if !ok {
 			t.Fatal("source trailer invalid")
 		}
@@ -188,11 +188,11 @@ func TestStateSyncAcceptsEvenlySplitClientTrailer(t *testing.T) {
 			t.Fatal(replica.fatalErr)
 		}
 	}
-	targetBlocks, err := NewBlockStore(target, cluster, config.Group, 1)
+	targetBlocks, err := newBlockStore(target, cluster, config.Group, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	targetTrailers, err := NewTrailerStore(targetBlocks)
+	targetTrailers, err := newTrailerStore(targetBlocks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,16 +227,16 @@ func TestStateSyncActivatesCheckpointReleaseBeforeOpeningBlocks(t *testing.T) {
 		t.Fatal("invalid checkpoint boundary")
 	}
 	frame := connectedPrepareFrame(t, config.Cluster, initial.HeadHeader, op)
-	header, _, reason := protocol.DecodeFrame(frame, protocol.GroupID{1}, uint32(config.Cluster.MessageSizeMax), 1)
+	header, _, reason := protocol.DecodeFrame(frame, protocol.GroupID{1}, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	header.Group = config.Group
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	copy(target.Header[:], frame[:protocol.HeaderSize])
-	target.ParentID, err = initial.Checkpoint.ID()
+	target.ParentID, err = initial.Checkpoint.ID(ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}

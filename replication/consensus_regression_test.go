@@ -34,7 +34,7 @@ func TestCanonicalLatestLogViewExcludesTruncatedSuffix(t *testing.T) {
 	second.View, second.Author = 1, 1
 	frame := make([]byte, protocol.HeaderSize+1)
 	frame[protocol.HeaderSize] = 1
-	if err := protocol.SealFrame(frame, &second); err != nil {
+	if err := protocol.SealFrame(frame, &second, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	installJoinRecord(replica, 0, 1, 1, []protocol.Header{first}, 1, 0)
@@ -88,7 +88,7 @@ func consensusPulse(t testing.TB, replica *Replica, parent protocol.Header, op p
 	binary.LittleEndian.PutUint64(header.Fields[96:104], uint64(op))
 	binary.LittleEndian.PutUint64(header.Fields[112:120], uint64(op)+100)
 	header.Fields[124] = byte(protocol.OperationPulse)
-	if err := message.Seal(&header); err != nil {
+	if err := message.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return message, header
@@ -96,7 +96,7 @@ func consensusPulse(t testing.TB, replica *Replica, parent protocol.Header, op p
 
 func consensusRoot(t testing.TB, replica *Replica) protocol.Header {
 	t.Helper()
-	header, reason := protocol.DecodeHeader(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount)
+	header, reason := protocol.DecodeHeader(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
@@ -114,7 +114,7 @@ func countConsensusCommand(t testing.TB, replica *Replica, bus *captureBus, comm
 	t.Helper()
 	count := 0
 	for _, frame := range bus.replicaMessages() {
-		header, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount)
+		header, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount, protocol.ChecksumAEGIS128L)
 		if reason != protocol.RejectNone {
 			t.Fatal(reason)
 		}
@@ -180,20 +180,20 @@ func TestCanonicalInstallationPreservesCommittedPrefixAndTruncatesTraffic(t *tes
 	consensusProcess(t, replica)
 	message, _ = consensusPulse(t, replica, second, 3, 0)
 	frame, _ := message.Bytes()
-	third, _, _ := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+	third, _, _ := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if !replica.handlePrepare(message, third, replica.deps.Clock.Now()) {
 		message.Release()
 		t.Fatal("third rejected")
 	}
 	consensusProcess(t, replica)
 	body := make([]byte, CheckpointStateSize+2*protocol.HeaderSize)
-	if err := replica.checkpoint.Encode(body[:CheckpointStateSize]); err != nil {
+	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:CheckpointStateSize+protocol.HeaderSize], &second); err != nil {
+	if err := protocol.EncodeHeader(body[CheckpointStateSize:CheckpointStateSize+protocol.HeaderSize], &second, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize+protocol.HeaderSize:], &root); err != nil {
+	if err := protocol.EncodeHeader(body[CheckpointStateSize+protocol.HeaderSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	view := protocol.Header{Group: replica.config.Group, View: 2, Author: 2, Command: protocol.CommandView}
@@ -225,10 +225,10 @@ func TestViewNonceRejectedBeforeRepairWindowMutation(t *testing.T) {
 	replica.getViewNonce = protocol.Nonce{1}
 	root := consensusRoot(t, replica)
 	body := make([]byte, CheckpointStateSize+protocol.HeaderSize)
-	if err := replica.checkpoint.Encode(body[:CheckpointStateSize]); err != nil {
+	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &root); err != nil {
+	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	header := protocol.Header{Group: replica.config.Group, View: 2, Author: 2, Command: protocol.CommandView}
@@ -236,7 +236,7 @@ func TestViewNonceRejectedBeforeRepairWindowMutation(t *testing.T) {
 	binary.LittleEndian.PutUint64(header.Fields[16:24], 100)
 	binary.LittleEndian.PutUint64(header.Fields[24:32], 100)
 	replica.handleView(header, body)
-	if replica.repairViewValid || replica.commitMax != 0 || replica.stateSync.stage != SyncStageIdle {
+	if replica.repairViewValid || replica.commitMax != 0 || replica.stateSync.stage != syncStageIdle {
 		t.Fatalf("mismatched nonce mutated state: %+v", replica.Snapshot())
 	}
 }
@@ -248,7 +248,7 @@ func TestCachedReplyEnvelopeTracksNewPrimary(t *testing.T) {
 			client := protocol.ClientID{7}
 			frame, original := makeReplyFrame(t, client, 1, body)
 			original.Group = replica.config.Group
-			if err := protocol.SealFrame(frame, &original); err != nil {
+			if err := protocol.SealFrame(frame, &original, protocol.ChecksumAEGIS128L); err != nil {
 				t.Fatal(err)
 			}
 			replica.view, replica.logView, replica.durableView = 2, 2, 2
@@ -256,9 +256,9 @@ func TestCachedReplyEnvelopeTracksNewPrimary(t *testing.T) {
 				replica.sendHeaderOnlyCachedReply(client, original)
 			} else {
 				read := duplicateRead{busy: true, header: original, client: client}
-				replica.finishDuplicateRead(&read, IOCompletion{Size: uint64(len(frame)), Buffer: frame})
+				replica.finishDuplicateRead(&read, ioCompletion{Size: uint64(len(frame)), Buffer: frame})
 			}
-			got, gotBody, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+			got, gotBody, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone || got.View != 2 || got.Author != 2 || !bytes.Equal(gotBody, body) || replyContext(&got) != replyContext(&original) {
 				t.Fatalf("cached envelope view=%d author=%d body=%q reason=%v", got.View, got.Author, gotBody, reason)
 			}
@@ -292,7 +292,7 @@ func TestHigherViewEvidenceRequestsEvidencePrimary(t *testing.T) {
 				replica.status = StatusRecoveringHead
 			}
 			replica.handleHigherViewEvidence(protocol.Header{Command: command, View: 2, Author: 2})
-			header, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+			header, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone || header.Command != protocol.CommandGetView || header.View != 2 || bus.destination != 2 || protocol.Nonce(header.Fields[:16]) == (protocol.Nonce{}) {
 				t.Fatalf("request destination=%d header=%+v reason=%v", bus.destination, header, reason)
 			}
@@ -313,16 +313,16 @@ func TestSameViewLaggingBackupRequestsAndInstallsView(t *testing.T) {
 		t.Fatal("gap accepted")
 	}
 	secondMessage.Release()
-	request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3)
+	request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone || request.Command != protocol.CommandGetView {
 		t.Fatalf("gap response=%+v reason=%v", request, reason)
 	}
 	body := make([]byte, CheckpointStateSize+3*protocol.HeaderSize)
-	if err := replica.checkpoint.Encode(body[:CheckpointStateSize]); err != nil {
+	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
 	for index, header := range []protocol.Header{second, first, root} {
-		if err := protocol.EncodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header); err != nil {
+		if err := protocol.EncodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header, protocol.ChecksumAEGIS128L); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -358,13 +358,13 @@ func TestRegistrationAdmissionCannotEvictPendingApplicationSession(t *testing.T)
 	}
 	registration := makeClientRequest(t, replica.frames, config.Group, protocol.ClientID{99}, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
 	frame, _ := registration.Bytes()
-	header, body, _ := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	header, body, _ := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if !replica.handleRequest(registration, header, body, replica.deps.Clock.Now()) {
 		registration.Release()
 	}
 	application := makeClientRequest(t, replica.frames, config.Group, protocol.ClientID{1}, 1, 1, replyContext(&old), protocol.OperationApplicationMin, []byte("must not execute"))
 	frame, _ = application.Bytes()
-	header, body, _ = protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	header, body, _ = protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if !replica.handleRequest(application, header, body, replica.deps.Clock.Now()) {
 		application.Release()
 	}
@@ -404,7 +404,7 @@ func TestCheckpointProgressReleasesWithheldPrepareAcknowledgement(t *testing.T) 
 	}
 	checkpointMessage, checkpointHeader := consensusPulse(t, replica, root, next, 0)
 	checkpointMessage.Release()
-	if err := protocol.EncodeHeader(replica.checkpoint.Header[:], &checkpointHeader); err != nil {
+	if err := protocol.EncodeHeader(replica.checkpoint.Header[:], &checkpointHeader, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	consensusProcess(t, replica)

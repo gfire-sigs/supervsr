@@ -2,6 +2,8 @@ package protocol
 
 import "encoding/binary"
 
+// ValidationContext carries local node and transport authentication context
+// used by ValidateSemantics.
 type ValidationContext struct {
 	Authenticated           bool
 	ReplicaSource           bool
@@ -20,6 +22,8 @@ type ValidationContext struct {
 	ChecksumAlgorithm       ChecksumAlgorithm
 }
 
+// ValidateSemantics enforces sender authentication, command ownership, release
+// bounds, and command-specific body shapes for a decoded frame.
 func ValidateSemantics(header *Header, body []byte, context ValidationContext) RejectReason {
 	if !context.Authenticated {
 		return RejectAuthentication
@@ -300,7 +304,7 @@ func validateEmbeddedPrepareHeaders(body []byte, context ValidationContext, allo
 		if allowBlank && allZero(encoded) {
 			continue
 		}
-		header, reason := DecodeHeaderWith(encoded, context.Group, context.MessageSizeMax, context.MemberCount, context.ChecksumAlgorithm)
+		header, reason := DecodeHeader(encoded, context.Group, context.MessageSizeMax, context.MemberCount, context.ChecksumAlgorithm)
 		if reason != RejectNone || header.Command != CommandPrepare {
 			return RejectBodyShape
 		}

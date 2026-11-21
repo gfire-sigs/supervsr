@@ -15,11 +15,11 @@ func TestBlockAllocatorPublishesAndReusesOnlyAfterDurableRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := CheckpointState{LogicalStorageSize: base}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(storage, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestBlockAllocatorPublishesAndReusesOnlyAfterDurableRelease(t *testing.T) {
 	if err := allocator.Release(late); err != nil {
 		t.Fatal(err)
 	}
-	reachable, err := NewFixedBitSet(allocator.blockCount)
+	reachable, err := newFixedBitSet(allocator.blockCount)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,11 +108,11 @@ func TestBlockAllocatorRejectsReachableReleaseAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := CheckpointState{LogicalStorageSize: base}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(storage, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestBlockAllocatorRejectsReachableReleaseAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reachable, err := NewFixedBitSet(1)
+	reachable, err := newFixedBitSet(1)
 	if err != nil {
 		t.Fatal(err)
 	}

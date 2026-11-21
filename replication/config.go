@@ -34,6 +34,8 @@ func (err *ConfigError) Unwrap() error {
 	return ErrInvalidConfiguration
 }
 
+// ClusterConfig specifies cluster-wide immutable layout, quorum, pipeline, and
+// checksum parameters included in the superblock ConfigurationChecksum.
 type ClusterConfig struct {
 	CacheLineSize                   uint64
 	ClientsMax                      uint64
@@ -57,6 +59,7 @@ type ClusterConfig struct {
 	ChecksumAlgorithm               ChecksumAlgorithm
 }
 
+// DefaultClusterConfig returns validated cluster defaults using ChecksumAEGIS128L.
 func DefaultClusterConfig() ClusterConfig {
 	const messageSize = 1 << 20
 	return ClusterConfig{
@@ -205,10 +208,12 @@ func (cfg ClusterConfig) FingerprintEncoding() [136]byte {
 	return encoded
 }
 
+// Fingerprint returns the 128-bit configuration checksum stored in superblocks
+// and verified on startup to detect incompatible cluster parameters.
 func (cfg ClusterConfig) Fingerprint() protocol.Checksum {
 	encoded := cfg.FingerprintEncoding()
 	if cfg.ChecksumAlgorithm == ChecksumAEGIS128L {
-		return protocol.ChecksumBytes(encoded[:])
+		return mustChecksumBytes(ChecksumAEGIS128L, encoded[:])
 	}
 	if !cfg.ChecksumAlgorithm.Valid() {
 		return protocol.Checksum{}
@@ -220,7 +225,7 @@ func (cfg ClusterConfig) Fingerprint() protocol.Checksum {
 }
 
 func mustChecksumBytes(algorithm ChecksumAlgorithm, input []byte) protocol.Checksum {
-	checksum, err := protocol.ChecksumBytesWith(algorithm, input)
+	checksum, err := protocol.ChecksumBytes(algorithm, input)
 	if err != nil {
 		panic(err)
 	}
@@ -298,6 +303,8 @@ func (cfg ClusterConfig) BlockOffset(address uint64) (uint64, bool) {
 	return checkedAdd(base, delta)
 }
 
+// ProcessConfig defines per-process runtime limits, retry backoffs, I/O
+// concurrencies, storage ceiling, and optional hardware-checksum enforcement.
 type ProcessConfig struct {
 	Tick                    time.Duration
 	InitialRTT              time.Duration
@@ -327,6 +334,7 @@ type ProcessConfig struct {
 	RequireHardwareChecksum bool
 }
 
+// DefaultProcessConfig returns baseline per-process runtime settings.
 func DefaultProcessConfig() ProcessConfig {
 	return ProcessConfig{
 		Tick:                    10 * time.Millisecond,

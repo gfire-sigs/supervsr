@@ -10,13 +10,13 @@ import (
 
 func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 	storage := newBlockingStorage()
-	engine, err := NewIOEngine(storage, 2, 1)
+	engine, err := newDefaultIOEngine(storage, 2, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeIOEngine(t, engine)
 
-	first, err := engine.Submit(IOOperation{Kind: IOWrite, Buffer: []byte{1}})
+	first, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,14 +25,14 @@ func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first write did not start")
 	}
-	second, err := engine.Submit(IOOperation{Kind: IOWrite, Buffer: []byte{2}})
+	second, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{2}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !engine.Cancel(second) {
 		t.Fatal("queued cancellation failed")
 	}
-	if _, err := engine.Submit(IOOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
+	if _, err := engine.Submit(ioOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
 		t.Fatalf("third submit error = %v, want %v", err, ErrIOBackpressure)
 	}
 	close(storage.release)
@@ -66,18 +66,18 @@ func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 func TestIOEngineRejectsStaleHandleAfterReuse(t *testing.T) {
 	storage := newBlockingStorage()
 	close(storage.release)
-	engine, err := NewIOEngine(storage, 1, 1)
+	engine, err := newDefaultIOEngine(storage, 1, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeIOEngine(t, engine)
 
-	old, err := engine.Submit(IOOperation{Kind: IOSync})
+	old, err := engine.Submit(ioOperation{Kind: IOSync})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = collectIOCompletions(t, engine, 1)
-	current, err := engine.Submit(IOOperation{Kind: IOSync})
+	current, err := engine.Submit(ioOperation{Kind: IOSync})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,11 +100,11 @@ func TestSynchronousIOEngineCompletesInline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeIOEngine(t, engine)
-	handle, err := engine.Submit(IOOperation{Kind: IOWrite, Buffer: []byte{7}})
+	handle, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{7}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var completion IOCompletion
+	var completion ioCompletion
 	if !engine.Poll(&completion) || completion.Handle != handle || completion.Err != nil {
 		t.Fatalf("completion=%+v", completion)
 	}
@@ -113,16 +113,16 @@ func TestSynchronousIOEngineCompletesInline(t *testing.T) {
 	}
 }
 
-func collectIOCompletions(t testing.TB, engine *IOEngine, count int) []IOCompletion {
+func collectIOCompletions(t testing.TB, engine *storageIOEngine, count int) []ioCompletion {
 	t.Helper()
-	completions := make([]IOCompletion, 0, count)
+	completions := make([]ioCompletion, 0, count)
 	deadline := time.NewTimer(time.Second)
 	defer deadline.Stop()
 	for len(completions) < count {
 		select {
 		case <-engine.Ready():
 			for {
-				var completion IOCompletion
+				var completion ioCompletion
 				if !engine.Poll(&completion) {
 					break
 				}
@@ -135,7 +135,7 @@ func collectIOCompletions(t testing.TB, engine *IOEngine, count int) []IOComplet
 	return completions
 }
 
-func closeIOEngine(t testing.TB, engine *IOEngine) {
+func closeIOEngine(t testing.TB, engine *storageIOEngine) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

@@ -22,11 +22,11 @@ func replyRecoveryFixture(t testing.TB) (*Replica, *crashStorage, *captureBus) {
 	if err := storage.Resize(base); err != nil {
 		t.Fatal(err)
 	}
-	wal, err := NewWAL(storage, cluster, config.Group, 2)
+	wal, err := newWAL(storage, cluster, config.Group, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := NewReplyStore(storage, cluster, config.Group, 2)
+	replies, err := newDurableReplyStore(storage, cluster, config.Group, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func replyRecoveryFixture(t testing.TB) (*Replica, *crashStorage, *captureBus) {
 	replica := &Replica{config: config, membership: membership, local: 1, view: 1, durableView: 1, logView: 1, status: StatusNormal,
 		deps: Dependencies{Storage: storage, MessageBus: bus, Clock: fixedClock{}, StateMachine: &testStateMachine{}},
 		wal:  wal, replies: replies, sessions: sessions, io: engine, frames: frames, metrics: &ReplicaMetrics{},
-		duplicateReads: []duplicateRead{{buffer: buffer}}, random: NewDeterministicRandom(7),
+		duplicateReads: []duplicateRead{{buffer: buffer}}, random: newDeterministicRandom(7),
 		releaseReports: make([]releaseReport, 2),
 	}
 	if err := replica.initReplyRepair(); err != nil {
@@ -65,9 +65,9 @@ func replyRecoveryFixture(t testing.TB) (*Replica, *crashStorage, *captureBus) {
 	return replica, storage, bus
 }
 
-func completeReplyRecoveryIO(t testing.TB, replica *Replica) IOCompletion {
+func completeReplyRecoveryIO(t testing.TB, replica *Replica) ioCompletion {
 	t.Helper()
-	var completion IOCompletion
+	var completion ioCompletion
 	if !replica.io.Poll(&completion) {
 		t.Fatal("reply IO completion missing")
 	}
@@ -97,7 +97,7 @@ func TestLatestReplyRepairRestoresDuplicateWithoutExecution(t *testing.T) {
 				storage.working[offset+protocol.HeaderSize] ^= 0x80
 			}
 			replica.sendCachedReply(replyClient(&header), 1, replyRequest(&header))
-			var duplicate IOCompletion
+			var duplicate ioCompletion
 			if !replica.io.Poll(&duplicate) {
 				t.Fatal("duplicate read missing")
 			}
@@ -109,7 +109,7 @@ func TestLatestReplyRepairRestoresDuplicateWithoutExecution(t *testing.T) {
 			if !replica.continueReplyRepair(uint64(time.Second)) {
 				t.Fatal("missing reply did not request repair")
 			}
-			request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 2)
+			request, _, reason := protocol.DecodeFrame(bus.replicaMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 2, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone || request.Command != protocol.CommandGetReply || protocol.Checksum(request.Fields[:16]) != header.HeaderChecksum || protocol.ClientID(request.Fields[32:48]) != replyClient(&header) || binary.LittleEndian.Uint64(request.Fields[48:56]) != 5 {
 				t.Fatalf("repair request identity: %+v, rejection=%v", request, reason)
 			}
@@ -127,7 +127,7 @@ func TestLatestReplyRepairRestoresDuplicateWithoutExecution(t *testing.T) {
 				t.Fatal("repaired duplicate read missing")
 			}
 			replica.finishDuplicateRead(&replica.duplicateReads[0], duplicate)
-			got, body, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 2)
+			got, body, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 2, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone || !bytes.Equal(body, frame[protocol.HeaderSize:]) || got.View != 1 || got.Author != 1 || replyContext(&got) != replyContext(&header) {
 				t.Fatalf("repaired duplicate header=%+v body=%q rejection=%v", got, body, reason)
 			}

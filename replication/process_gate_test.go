@@ -126,7 +126,7 @@ func (bus *processReplicaBus) SendReplica(to protocol.ReplicaIndex, message *Mes
 	if err != nil {
 		return
 	}
-	header, reason := protocol.DecodeHeader(frame[:protocol.HeaderSize], processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), bus.activeCount)
+	header, reason := protocol.DecodeHeader(frame[:protocol.HeaderSize], processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), bus.activeCount, protocol.ChecksumAEGIS128L)
 	if err := bus.emitter.emit(processWireMessage{Kind: "replica_frame", From: uint8(bus.index), To: uint8(to), Frame: frame}); err != nil {
 		panic(err)
 	}
@@ -150,7 +150,7 @@ func (bus *processReplicaBus) BroadcastReplicas(message *Message) {
 	if err != nil {
 		return
 	}
-	header, reason := protocol.DecodeHeader(frame[:protocol.HeaderSize], processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), bus.activeCount)
+	header, reason := protocol.DecodeHeader(frame[:protocol.HeaderSize], processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), bus.activeCount, protocol.ChecksumAEGIS128L)
 	trigger := reason == protocol.RejectNone && header.Command == protocol.CommandPrepare
 	for index := range bus.activeCount {
 		to := protocol.ReplicaIndex(index)
@@ -342,7 +342,7 @@ func runReplicaProcessHelper() error {
 	directory := os.Getenv(processReplicaDirectory)
 	emitter := &processEmitter{encoder: json.NewEncoder(os.Stdout)}
 	gate := &processStageGate{index: index, emitter: emitter}
-	storage, err := OpenFileStorage(processGateReplicaPath(directory, index), false, false)
+	storage, err := OpenFileStorage(processGateReplicaPath(directory, index), FileStorageOptions{})
 	if err != nil {
 		return err
 	}
@@ -705,7 +705,7 @@ func formatProcessGateCluster(t testing.TB, directory string) {
 	t.Helper()
 	for index := range uint8(3) {
 		replicaIndex := protocol.ReplicaIndex(index)
-		storage, err := OpenFileStorage(processGateReplicaPath(directory, replicaIndex), true, false)
+		storage, err := OpenFileStorage(processGateReplicaPath(directory, replicaIndex), FileStorageOptions{Create: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -757,7 +757,7 @@ func (cluster *processClusterHarness) route(event processReplicaEvent) {
 		if cluster.client == nil {
 			return
 		}
-		header, _, reason := protocol.DecodeFrame(message.Frame, processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), 3)
+		header, _, reason := protocol.DecodeFrame(message.Frame, processGateGroup(), uint32(processGateClusterConfig().MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 		if reason == protocol.RejectNone && header.Command == protocol.CommandReply {
 			cluster.lastReplyFrom = header.Author
 			cluster.lastReplyView = header.View

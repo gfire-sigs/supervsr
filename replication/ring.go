@@ -21,7 +21,7 @@ type ringSequence struct {
 
 // MPSCRing is a bounded, nonblocking multi-producer, single-consumer queue.
 // It allocates its slots at construction and retains no references after pop.
-type MPSCRing[T any] struct {
+type mpscRing[T any] struct {
 	enqueue ringCursor
 	dequeue ringCursor
 
@@ -31,13 +31,13 @@ type MPSCRing[T any] struct {
 	values    []T
 }
 
-func NewMPSCRing[T any](capacity uint64) (*MPSCRing[T], error) {
+func newMPSCRing[T any](capacity uint64) (*mpscRing[T], error) {
 	maxInt := uint64(^uint(0) >> 1)
 	if capacity < 2 || capacity&(capacity-1) != 0 || capacity > maxInt {
 		return nil, ErrInvalidRingCapacity
 	}
 
-	ring := &MPSCRing[T]{
+	ring := &mpscRing[T]{
 		mask:      capacity - 1,
 		capacity:  capacity,
 		sequences: make([]ringSequence, int(capacity)),
@@ -49,17 +49,17 @@ func NewMPSCRing[T any](capacity uint64) (*MPSCRing[T], error) {
 	return ring, nil
 }
 
-func (r *MPSCRing[T]) Capacity() uint64 {
+func (r *mpscRing[T]) Capacity() uint64 {
 	return r.capacity
 }
 
 // Len returns an instantaneous upper bound that includes producer-reserved slots.
-func (r *MPSCRing[T]) Len() uint64 {
+func (r *mpscRing[T]) Len() uint64 {
 	length := r.enqueue.position.Load() - r.dequeue.position.Load()
 	return min(length, r.capacity)
 }
 
-func (r *MPSCRing[T]) TryPush(value T) bool {
+func (r *mpscRing[T]) TryPush(value T) bool {
 	position := r.enqueue.position.Load()
 	for {
 		sequence := r.sequences[position&r.mask].value.Load()
@@ -82,7 +82,7 @@ func (r *MPSCRing[T]) TryPush(value T) bool {
 }
 
 // TryPop writes the oldest value to destination. Only one goroutine may call it.
-func (r *MPSCRing[T]) TryPop(destination *T) bool {
+func (r *mpscRing[T]) TryPop(destination *T) bool {
 	position := r.dequeue.position.Load()
 	index := position & r.mask
 	sequence := r.sequences[index].value.Load()

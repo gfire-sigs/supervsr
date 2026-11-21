@@ -9,7 +9,7 @@ import (
 
 var ErrTimeoutInvariant = errors.New("replication: timeout handler did not reset or stop")
 
-type Timeout struct {
+type tickTimeout struct {
 	running   bool
 	elapsed   uint64
 	threshold uint64
@@ -19,15 +19,15 @@ type Timeout struct {
 	measured  uint64
 }
 
-func NewTimeout(period, tick time.Duration, peer uint8) (Timeout, error) {
+func newTimeout(period, tick time.Duration, peer uint8) (tickTimeout, error) {
 	threshold, ok := durationTicks(period, tick)
 	if !ok {
-		return Timeout{}, ErrInvalidConfiguration
+		return tickTimeout{}, ErrInvalidConfiguration
 	}
-	return Timeout{initial: threshold, peer: peer}, nil
+	return tickTimeout{initial: threshold, peer: peer}, nil
 }
 
-func (timeout *Timeout) Start() {
+func (timeout *tickTimeout) Start() {
 	timeout.running = true
 	timeout.elapsed = 0
 	timeout.threshold = timeout.initial
@@ -35,20 +35,20 @@ func (timeout *Timeout) Start() {
 	timeout.measured = 0
 }
 
-func (timeout *Timeout) Stop() {
+func (timeout *tickTimeout) Stop() {
 	initial := timeout.initial
 	peer := timeout.peer
-	*timeout = Timeout{initial: initial, peer: peer}
+	*timeout = tickTimeout{initial: initial, peer: peer}
 }
 
-func (timeout *Timeout) Reset() {
+func (timeout *tickTimeout) Reset() {
 	timeout.running = true
 	timeout.elapsed = 0
 	timeout.threshold = timeout.initial
 	timeout.attempts = 0
 }
 
-func (timeout *Timeout) Tick() (bool, error) {
+func (timeout *tickTimeout) Tick() (bool, error) {
 	if !timeout.running {
 		return false, nil
 	}
@@ -59,7 +59,7 @@ func (timeout *Timeout) Tick() (bool, error) {
 	return timeout.elapsed == timeout.threshold, nil
 }
 
-func (timeout *Timeout) Backoff(process ProcessConfig, measuredRTT time.Duration, random *DeterministicRandom) error {
+func (timeout *tickTimeout) Backoff(process ProcessConfig, measuredRTT time.Duration, random *deterministicRandom) error {
 	if !timeout.running || random == nil {
 		return ErrTimeoutInvariant
 	}
@@ -92,7 +92,7 @@ func (timeout *Timeout) Backoff(process ProcessConfig, measuredRTT time.Duration
 	return nil
 }
 
-func (timeout *Timeout) ResetJitter(random *DeterministicRandom) error {
+func (timeout *tickTimeout) ResetJitter(random *deterministicRandom) error {
 	if !timeout.running || random == nil {
 		return ErrTimeoutInvariant
 	}
@@ -104,20 +104,20 @@ func (timeout *Timeout) ResetJitter(random *DeterministicRandom) error {
 	return nil
 }
 
-func (timeout *Timeout) Running() bool     { return timeout.running }
-func (timeout *Timeout) Attempts() uint8   { return timeout.attempts }
-func (timeout *Timeout) Peer() uint8       { return timeout.peer }
-func (timeout *Timeout) Threshold() uint64 { return timeout.threshold }
+func (timeout *tickTimeout) Running() bool     { return timeout.running }
+func (timeout *tickTimeout) Attempts() uint8   { return timeout.attempts }
+func (timeout *tickTimeout) Peer() uint8       { return timeout.peer }
+func (timeout *tickTimeout) Threshold() uint64 { return timeout.threshold }
 
-type DeterministicRandom struct {
+type deterministicRandom struct {
 	state uint64
 }
 
-func NewDeterministicRandom(seed uint64) DeterministicRandom {
-	return DeterministicRandom{state: cmp.Or(seed, uint64(0x9e3779b97f4a7c15))}
+func newDeterministicRandom(seed uint64) deterministicRandom {
+	return deterministicRandom{state: cmp.Or(seed, uint64(0x9e3779b97f4a7c15))}
 }
 
-func (random *DeterministicRandom) Next() uint64 {
+func (random *deterministicRandom) Next() uint64 {
 	value := random.state
 	value ^= value >> 12
 	value ^= value << 25
@@ -126,7 +126,7 @@ func (random *DeterministicRandom) Next() uint64 {
 	return value * 0x2545f4914f6cdd1d
 }
 
-func (random *DeterministicRandom) Uniform(bound uint64) uint64 {
+func (random *deterministicRandom) Uniform(bound uint64) uint64 {
 	if bound <= 1 {
 		return 0
 	}

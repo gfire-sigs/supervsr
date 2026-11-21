@@ -8,18 +8,24 @@ import (
 
 type Message = protocol.Frame
 
+// MessageBus transports encoded protocol frames between replicas and clients.
+// Frame buffers are pool-owned and released when Send methods return; asynchronous
+// implementations must either copy frame.Bytes() synchronously or call frame.Retain
+// before returning and frame.Release after transmission completes.
 type MessageBus interface {
 	SendReplica(to protocol.ReplicaIndex, message *Message)
 	SendClient(to protocol.ClientID, message *Message)
 	BroadcastReplicas(message *Message)
 }
 
+// TimeSample supplies synchronized wall-clock and monotonic timestamps in nanoseconds.
 type TimeSample struct {
 	Wall         uint64
 	Monotonic    uint64
 	Synchronized bool
 }
 
+// Clock provides current wall and monotonic time samples to replicas and clients.
 type Clock interface {
 	Now() TimeSample
 }
@@ -43,6 +49,7 @@ type ReplicaMetricSnapshot struct {
 	IncompatibleConfigurations uint64
 }
 
+// ReplicaMetrics holds atomic telemetry counters exported via Snapshot.
 type ReplicaMetrics struct {
 	framesRejected             atomic.Uint64
 	requestsDropped            atomic.Uint64

@@ -189,7 +189,7 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 		next.State.SyncMin = 0
 		next.State.SyncMax = 0
 	}
-	handle, err := replica.io.Submit(IOOperation{Kind: IOSuperblockPersist, SuperblockStore: replica.superblocks, Superblock: next})
+	handle, err := replica.io.Submit(ioOperation{Kind: IOSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
 	if err != nil {
 		replica.abortCheckpointCandidate()
 		replica.fail(err)
@@ -202,13 +202,13 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 	entry.ioKind = IOSuperblockPersist
 }
 
-func (replica *Replica) buildCheckpointState(candidate BlockCheckpointCandidate, acquired, released, sessions TrailerReference, manifest CheckpointManifest) (CheckpointState, error) {
+func (replica *Replica) buildCheckpointState(candidate blockCheckpointCandidate, acquired, released, sessions trailerReference, manifest CheckpointManifest) (CheckpointState, error) {
 	header, found := replica.wal.RecoveredHeader(replica.checkpointTarget)
 	if !found {
 		return CheckpointState{}, ErrWALRecovery
 	}
 	var encodedHeader [protocol.HeaderSize]byte
-	if err := protocol.EncodeHeaderWith(encodedHeader[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
+	if err := protocol.EncodeHeader(encodedHeader[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		return CheckpointState{}, err
 	}
 	if manifest.BlockCount == 0 {
@@ -244,20 +244,20 @@ func (replica *Replica) buildCheckpointState(candidate BlockCheckpointCandidate,
 		ReleasedTrailerEncodedSize: released.EncodedSize, SessionTrailerEncodedSize: sessions.EncodedSize,
 		ManifestBlockCount: manifest.BlockCount, Release: replica.checkpointTargetRelease,
 	}
-	validation := CheckpointValidation{
+	validation := checkpointRules{
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
 		MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
 		BlockSize:   replica.config.Cluster.BlockSize, ClientsMax: replica.config.Cluster.ClientsMax,
 		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
-	if err := state.Validate(validation); err != nil {
+	if err := state.validate(validation); err != nil {
 		return CheckpointState{}, err
 	}
 	return state, nil
 }
 
-func (replica *Replica) checkpointReferenceValid(candidate BlockCheckpointCandidate, reference BlockReference) bool {
+func (replica *Replica) checkpointReferenceValid(candidate blockCheckpointCandidate, reference BlockReference) bool {
 	index, ok := replica.blockAllocator.index(reference.Address)
 	return ok && !reference.Checksum.IsZero() && index < candidate.blockCount && candidate.reachable.Test(index)
 }
@@ -288,7 +288,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 	replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
 	replica.checkpoint = replica.pendingCheckpoint
 	targetRelease := replica.checkpoint.Release
-	checkpointID, err := replica.checkpoint.IDWith(replica.config.Cluster.ChecksumAlgorithm)
+	checkpointID, err := replica.checkpoint.ID(replica.config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		replica.fail(err)
 		return
@@ -315,7 +315,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 	}
 	replica.checkpointTarget = 0
 	replica.checkpointTargetRelease = 0
-	replica.checkpointCandidate = BlockCheckpointCandidate{}
+	replica.checkpointCandidate = blockCheckpointCandidate{}
 	replica.pendingCheckpoint = CheckpointState{}
 	replica.checkpointManifest = CheckpointManifest{}
 	replica.upgradeWindow = upgradeWindow{}
@@ -340,7 +340,7 @@ func (replica *Replica) abortCheckpointCandidate() {
 		if err := replica.blockAllocator.AbortCheckpoint(replica.checkpointCandidate); err != nil {
 			replica.fail(err)
 		}
-		replica.checkpointCandidate = BlockCheckpointCandidate{}
+		replica.checkpointCandidate = blockCheckpointCandidate{}
 	}
 	replica.rollbackCheckpointReleases()
 	replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
@@ -376,13 +376,13 @@ func (replica *Replica) yieldCheckpointToView(entry *pipelineEntry) {
 func (replica *Replica) completeCommitEntry() {
 	replica.popPipeline()
 	replica.stage = CommitStageIdle
-	if replica.stateSync.stage == SyncStageIdle && replica.pipelineLen == 0 && replica.status == StatusNormal && replica.commitMin < replica.commitMax {
+	if replica.stateSync.stage == syncStageIdle && replica.pipelineLen == 0 && replica.status == StatusNormal && replica.commitMin < replica.commitMax {
 		if !replica.beginRepairWindow(replica.view, replica.commitMax) {
 			replica.fail(ErrReplicaInvariant)
 		}
 		return
 	}
-	if replica.stateSync.stage == SyncStageIdle {
+	if replica.stateSync.stage == syncStageIdle {
 		replica.dequeueRequest()
 		replica.advanceCommit()
 	}

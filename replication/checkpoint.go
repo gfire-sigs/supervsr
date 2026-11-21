@@ -40,7 +40,7 @@ type CheckpointState struct {
 	Release                    protocol.Release
 }
 
-type CheckpointValidation struct {
+type checkpointRules struct {
 	Group             protocol.GroupID
 	MessageSizeMax    uint32
 	MemberCount       uint8
@@ -50,7 +50,7 @@ type CheckpointValidation struct {
 	ChecksumAlgorithm ChecksumAlgorithm
 }
 
-func (state *CheckpointState) Encode(destination []byte) error {
+func (state *CheckpointState) encode(destination []byte) error {
 	if len(destination) != CheckpointStateSize {
 		return ErrInvalidCheckpoint
 	}
@@ -82,7 +82,7 @@ func (state *CheckpointState) Encode(destination []byte) error {
 	return nil
 }
 
-func DecodeCheckpointState(source []byte, validation CheckpointValidation) (CheckpointState, error) {
+func decodeCheckpointState(source []byte, validation checkpointRules) (CheckpointState, error) {
 	if len(source) != CheckpointStateSize || !checkpointReservationsZero(source) {
 		return CheckpointState{}, ErrInvalidCheckpoint
 	}
@@ -111,14 +111,14 @@ func DecodeCheckpointState(source []byte, validation CheckpointValidation) (Chec
 	state.SessionTrailerEncodedSize = binary.LittleEndian.Uint64(source[600:608])
 	state.ManifestBlockCount = binary.LittleEndian.Uint32(source[608:612])
 	state.Release = protocol.Release(binary.LittleEndian.Uint32(source[612:616]))
-	if err := state.Validate(validation); err != nil {
+	if err := state.validate(validation); err != nil {
 		return CheckpointState{}, err
 	}
 	return state, nil
 }
 
-func (state *CheckpointState) Validate(validation CheckpointValidation) error {
-	header, reason := protocol.DecodeHeaderWith(state.Header[:], validation.Group, validation.MessageSizeMax, validation.MemberCount, validation.ChecksumAlgorithm)
+func (state *CheckpointState) validate(validation checkpointRules) error {
+	header, reason := protocol.DecodeHeader(state.Header[:], validation.Group, validation.MessageSizeMax, validation.MemberCount, validation.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidCheckpoint
 	}
@@ -126,7 +126,7 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 		return ErrInvalidCheckpoint
 	}
 	blockCount := (state.LogicalStorageSize - validation.BlockBase) / validation.BlockSize
-	emptyChecksum, err := protocol.ChecksumBytesWith(validation.ChecksumAlgorithm, nil)
+	emptyChecksum, err := protocol.ChecksumBytes(validation.ChecksumAlgorithm, nil)
 	if err != nil {
 		return ErrInvalidCheckpoint
 	}
@@ -155,16 +155,12 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 	return nil
 }
 
-func (state *CheckpointState) ID() (protocol.CheckpointID, error) {
-	return state.IDWith(ChecksumAEGIS128L)
-}
-
-func (state *CheckpointState) IDWith(algorithm ChecksumAlgorithm) (protocol.CheckpointID, error) {
+func (state *CheckpointState) ID(algorithm ChecksumAlgorithm) (protocol.CheckpointID, error) {
 	var encoded [CheckpointStateSize]byte
-	if err := state.Encode(encoded[:]); err != nil {
+	if err := state.encode(encoded[:]); err != nil {
 		return protocol.CheckpointID{}, err
 	}
-	checksum, err := protocol.ChecksumBytesWith(algorithm, encoded[:])
+	checksum, err := protocol.ChecksumBytes(algorithm, encoded[:])
 	if err != nil {
 		return protocol.CheckpointID{}, err
 	}

@@ -14,20 +14,20 @@ var (
 	ErrSessionChecksum = errors.New("replication: client session trailer checksum mismatch")
 )
 
-type SessionDecision uint8
+type sessionDecision uint8
 
 const (
-	SessionAdmit SessionDecision = iota + 1
-	SessionDuplicate
-	SessionDrop
-	SessionClientFork
-	SessionNoSession
-	SessionTooLow
-	SessionBehind
-	SessionReleaseMismatch
+	sessionAdmit sessionDecision = iota + 1
+	sessionDuplicate
+	sessionDrop
+	sessionClientFork
+	sessionNoSession
+	sessionTooLow
+	sessionBehind
+	sessionReleaseMismatch
 )
 
-type SessionRequest struct {
+type sessionRequest struct {
 	Client          protocol.ClientID
 	Session         protocol.Session
 	Request         protocol.RequestNo
@@ -36,7 +36,7 @@ type SessionRequest struct {
 	Parent          protocol.Checksum
 }
 
-type SessionTableConfig struct {
+type sessionTableConfig struct {
 	ClientsMax              uint32
 	Group                   protocol.GroupID
 	ActiveCount             uint8
@@ -45,12 +45,12 @@ type SessionTableConfig struct {
 	ChecksumAlgorithm       ChecksumAlgorithm
 }
 
-type SessionRecord struct {
+type sessionRecord struct {
 	Reply   protocol.Header
 	Session protocol.Session
 }
 
-type SessionCommitPlan struct {
+type sessionCommitPlan struct {
 	Slot          uint32
 	Generation    uint64
 	Client        protocol.ClientID
@@ -58,77 +58,77 @@ type SessionCommitPlan struct {
 	ReplyChecksum protocol.Checksum
 }
 
-type SessionTable struct {
-	config      SessionTableConfig
-	records     []SessionRecord
+type sessionTable struct {
+	config      sessionTableConfig
+	records     []sessionRecord
 	busy        []bool
 	generations []uint64
 	count       uint32
 }
 
-func NewSessionTable(config SessionTableConfig) (*SessionTable, error) {
+func newSessionTable(config sessionTableConfig) (*sessionTable, error) {
 	if config.ClientsMax == 0 || config.ActiveCount == 0 || config.MessageSizeMax < protocol.HeaderSize || config.ApplicationReplySizeMax > config.MessageSizeMax-protocol.HeaderSize || !config.ChecksumAlgorithm.Valid() {
 		return nil, ErrSessionCapacity
 	}
-	return &SessionTable{
+	return &sessionTable{
 		config:      config,
-		records:     make([]SessionRecord, config.ClientsMax),
+		records:     make([]sessionRecord, config.ClientsMax),
 		busy:        make([]bool, config.ClientsMax),
 		generations: make([]uint64, config.ClientsMax),
 	}, nil
 }
 
-func (table *SessionTable) Decide(request SessionRequest) SessionDecision {
+func (table *sessionTable) Decide(request sessionRequest) sessionDecision {
 	record, _, found := table.lookup(request.Client)
 	if !found {
-		return SessionNoSession
+		return sessionNoSession
 	}
 	if request.Session < record.Session {
-		return SessionTooLow
+		return sessionTooLow
 	}
 	if request.Session > record.Session {
-		return SessionBehind
+		return sessionBehind
 	}
 	if request.Release != record.Reply.Release {
-		return SessionReleaseMismatch
+		return sessionReleaseMismatch
 	}
 	latestRequest := replyRequest(&record.Reply)
 	if request.Request < latestRequest || request.Request > latestRequest+1 {
-		return SessionDrop
+		return sessionDrop
 	}
 	if request.Request == latestRequest {
 		if request.RequestChecksum == replyRequestChecksum(&record.Reply) {
-			return SessionDuplicate
+			return sessionDuplicate
 		}
-		return SessionClientFork
+		return sessionClientFork
 	}
 	if request.Parent != replyContext(&record.Reply) {
-		return SessionClientFork
+		return sessionClientFork
 	}
-	return SessionAdmit
+	return sessionAdmit
 }
 
-func (table *SessionTable) PlanCommit(reply protocol.Header, session protocol.Session) (SessionCommitPlan, error) {
+func (table *sessionTable) PlanCommit(reply protocol.Header, session protocol.Session) (sessionCommitPlan, error) {
 	if err := table.validateOccupied(reply, session); err != nil {
-		return SessionCommitPlan{}, err
+		return sessionCommitPlan{}, err
 	}
 	client := replyClient(&reply)
 	_, slot, found := table.lookup(client)
 	if found {
 		if table.busy[slot] {
-			return SessionCommitPlan{}, ErrSessionCapacity
+			return sessionCommitPlan{}, ErrSessionCapacity
 		}
 	} else if table.count == uint32(len(table.records)) {
 		slot = table.evictionSlot()
 		if table.busy[slot] {
-			return SessionCommitPlan{}, ErrSessionCapacity
+			return sessionCommitPlan{}, ErrSessionCapacity
 		}
 	} else if slot == uint32(len(table.records)) {
-		return SessionCommitPlan{}, ErrSessionCapacity
+		return sessionCommitPlan{}, ErrSessionCapacity
 	}
 	table.generations[slot]++
 	table.busy[slot] = true
-	return SessionCommitPlan{
+	return sessionCommitPlan{
 		Slot:          slot,
 		Generation:    table.generations[slot],
 		Client:        client,
@@ -137,7 +137,7 @@ func (table *SessionTable) PlanCommit(reply protocol.Header, session protocol.Se
 	}, nil
 }
 
-func (table *SessionTable) Session(client protocol.ClientID) (protocol.Session, bool) {
+func (table *sessionTable) Session(client protocol.ClientID) (protocol.Session, bool) {
 	record, _, found := table.lookup(client)
 	if !found {
 		return 0, false
@@ -145,7 +145,7 @@ func (table *SessionTable) Session(client protocol.ClientID) (protocol.Session, 
 	return record.Session, true
 }
 
-func (table *SessionTable) Commit(reply protocol.Header, session protocol.Session) (uint32, error) {
+func (table *sessionTable) Commit(reply protocol.Header, session protocol.Session) (uint32, error) {
 	plan, err := table.PlanCommit(reply, session)
 	if err != nil {
 		return 0, err
@@ -157,7 +157,7 @@ func (table *SessionTable) Commit(reply protocol.Header, session protocol.Sessio
 	return plan.Slot, nil
 }
 
-func (table *SessionTable) CommitAt(plan SessionCommitPlan, reply protocol.Header, session protocol.Session) error {
+func (table *sessionTable) CommitAt(plan sessionCommitPlan, reply protocol.Header, session protocol.Session) error {
 	if int(plan.Slot) >= len(table.records) || !table.busy[plan.Slot] {
 		return ErrSessionEncoding
 	}
@@ -180,13 +180,13 @@ func (table *SessionTable) CommitAt(plan SessionCommitPlan, reply protocol.Heade
 	return nil
 }
 
-func (table *SessionTable) Abort(plan SessionCommitPlan) {
+func (table *sessionTable) Abort(plan sessionCommitPlan) {
 	if int(plan.Slot) < len(table.records) && table.busy[plan.Slot] && table.generations[plan.Slot] == plan.Generation {
 		table.busy[plan.Slot] = false
 	}
 }
 
-func (table *SessionTable) Reply(client protocol.ClientID, session protocol.Session, request protocol.RequestNo) (protocol.Header, uint32, bool) {
+func (table *sessionTable) Reply(client protocol.ClientID, session protocol.Session, request protocol.RequestNo) (protocol.Header, uint32, bool) {
 	record, slot, found := table.lookup(client)
 	if !found || table.busy[slot] || record.Session != session || replyRequest(&record.Reply) != request {
 		return protocol.Header{}, 0, false
@@ -194,7 +194,7 @@ func (table *SessionTable) Reply(client protocol.ClientID, session protocol.Sess
 	return record.Reply, slot, true
 }
 
-func (table *SessionTable) RepairReply(client protocol.ClientID, op protocol.Op, checksum protocol.Checksum) (protocol.Header, uint32, bool) {
+func (table *sessionTable) RepairReply(client protocol.ClientID, op protocol.Op, checksum protocol.Checksum) (protocol.Header, uint32, bool) {
 	record, slot, found := table.lookup(client)
 	if !found || table.busy[slot] || replyOp(&record.Reply) != op || record.Reply.HeaderChecksum != checksum {
 		return protocol.Header{}, 0, false
@@ -202,15 +202,15 @@ func (table *SessionTable) RepairReply(client protocol.ClientID, op protocol.Op,
 	return record.Reply, slot, true
 }
 
-func (table *SessionTable) Count() uint32 {
+func (table *sessionTable) Count() uint32 {
 	return table.count
 }
 
-func (table *SessionTable) TrailerSize() int {
+func (table *sessionTable) TrailerSize() int {
 	return len(table.records)*protocol.HeaderSize + len(table.records)*8
 }
 
-func (table *SessionTable) EncodeTrailer(destination []byte) (protocol.Checksum, error) {
+func (table *sessionTable) EncodeTrailer(destination []byte) (protocol.Checksum, error) {
 	if len(destination) != table.TrailerSize() {
 		return protocol.Checksum{}, ErrSessionEncoding
 	}
@@ -228,23 +228,23 @@ func (table *SessionTable) EncodeTrailer(destination []byte) (protocol.Checksum,
 		}
 		header := record.Reply
 		start := slot * protocol.HeaderSize
-		if err := protocol.EncodeHeaderWith(destination[start:start+protocol.HeaderSize], &header, table.config.ChecksumAlgorithm); err != nil || header.HeaderChecksum != record.Reply.HeaderChecksum {
+		if err := protocol.EncodeHeader(destination[start:start+protocol.HeaderSize], &header, table.config.ChecksumAlgorithm); err != nil || header.HeaderChecksum != record.Reply.HeaderChecksum {
 			return protocol.Checksum{}, ErrSessionEncoding
 		}
 		binary.LittleEndian.PutUint64(destination[sessionsOffset+slot*8:], uint64(record.Session))
 	}
-	return protocol.ChecksumBytesWith(table.config.ChecksumAlgorithm, destination)
+	return protocol.ChecksumBytes(table.config.ChecksumAlgorithm, destination)
 }
 
-func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protocol.Checksum) error {
+func (table *sessionTable) DecodeTrailer(source []byte, expectedChecksum protocol.Checksum) error {
 	if len(source) != table.TrailerSize() {
 		return ErrSessionEncoding
 	}
-	computed, err := protocol.ChecksumBytesWith(table.config.ChecksumAlgorithm, source)
+	computed, err := protocol.ChecksumBytes(table.config.ChecksumAlgorithm, source)
 	if err != nil || computed != expectedChecksum {
 		return ErrSessionChecksum
 	}
-	decoded := make([]SessionRecord, len(table.records))
+	decoded := make([]sessionRecord, len(table.records))
 	sessionsOffset := len(decoded) * protocol.HeaderSize
 	count := uint32(0)
 	for slot := range decoded {
@@ -256,7 +256,7 @@ func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protoco
 			}
 			continue
 		}
-		header, reason := protocol.DecodeHeaderWith(headerBytes, table.config.Group, table.config.MessageSizeMax, table.config.ActiveCount, table.config.ChecksumAlgorithm)
+		header, reason := protocol.DecodeHeader(headerBytes, table.config.Group, table.config.MessageSizeMax, table.config.ActiveCount, table.config.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || table.validateOccupied(header, session) != nil {
 			return ErrSessionEncoding
 		}
@@ -266,7 +266,7 @@ func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protoco
 				return ErrSessionEncoding
 			}
 		}
-		decoded[slot] = SessionRecord{Reply: header, Session: session}
+		decoded[slot] = sessionRecord{Reply: header, Session: session}
 		count++
 	}
 	copy(table.records, decoded)
@@ -278,7 +278,7 @@ func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protoco
 	return nil
 }
 
-func (table *SessionTable) lookup(client protocol.ClientID) (*SessionRecord, uint32, bool) {
+func (table *sessionTable) lookup(client protocol.ClientID) (*sessionRecord, uint32, bool) {
 	free := uint32(len(table.records))
 	for slot := range table.records {
 		record := &table.records[slot]
@@ -295,7 +295,7 @@ func (table *SessionTable) lookup(client protocol.ClientID) (*SessionRecord, uin
 	return nil, free, false
 }
 
-func (table *SessionTable) evictionSlot() uint32 {
+func (table *sessionTable) evictionSlot() uint32 {
 	selected := uint32(0)
 	for slot := uint32(1); slot < uint32(len(table.records)); slot++ {
 		candidate := &table.records[slot]
@@ -311,7 +311,7 @@ func (table *SessionTable) evictionSlot() uint32 {
 	return selected
 }
 
-func (table *SessionTable) validateOccupied(reply protocol.Header, session protocol.Session) error {
+func (table *sessionTable) validateOccupied(reply protocol.Header, session protocol.Session) error {
 	if session == 0 || reply.Command != protocol.CommandReply || reply.Protocol != protocol.ProtocolVersion || reply.Group != table.config.Group {
 		return ErrSessionEncoding
 	}
@@ -326,7 +326,7 @@ func (table *SessionTable) validateOccupied(reply protocol.Header, session proto
 	}
 	var encoded [protocol.HeaderSize]byte
 	copyOfReply := reply
-	if err := protocol.EncodeHeaderWith(encoded[:], &copyOfReply, table.config.ChecksumAlgorithm); err != nil || copyOfReply.HeaderChecksum != reply.HeaderChecksum {
+	if err := protocol.EncodeHeader(encoded[:], &copyOfReply, table.config.ChecksumAlgorithm); err != nil || copyOfReply.HeaderChecksum != reply.HeaderChecksum {
 		return ErrSessionEncoding
 	}
 	context := protocol.ValidationContext{

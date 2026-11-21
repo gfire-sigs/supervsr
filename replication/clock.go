@@ -34,6 +34,8 @@ type ClockInterval struct {
 	Tolerance uint64
 }
 
+// ClockSynchronizer computes quorum-tolerant synchronized cluster timestamps
+// anchored to local monotonic time.
 type ClockSynchronizer struct {
 	local        LocalClock
 	localIndex   protocol.ReplicaIndex
@@ -54,6 +56,7 @@ type ClockSynchronizer struct {
 	synchronized bool
 }
 
+// NewClockSynchronizer constructs a ClockSynchronizer for the local replica.
 func NewClockSynchronizer(local LocalClock, localIndex protocol.ReplicaIndex, activeCount, replicationQuorum uint8, process ProcessConfig) (*ClockSynchronizer, error) {
 	if local == nil || activeCount == 0 || activeCount > ActiveMax {
 		return nil, ErrInvalidConfiguration

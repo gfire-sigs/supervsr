@@ -111,7 +111,11 @@ func ledgerDigest(previous protocol.Checksum, token, value uint64) protocol.Chec
 	copy(body[:16], previous[:])
 	binary.LittleEndian.PutUint64(body[16:24], token)
 	binary.LittleEndian.PutUint64(body[24:], value)
-	return protocol.ChecksumBytes(body[:])
+	checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, body[:])
+	if err != nil {
+		panic(err)
+	}
+	return checksum
 }
 
 func (machine *LedgerMachine) Commit(input replication.CommitInput, _ replication.PrefetchToken, reply []byte) (int, error) {

@@ -119,5 +119,9 @@ func historyDigest(previous protocol.Checksum, token, value uint64) protocol.Che
 	copy(record[:16], previous[:])
 	binary.LittleEndian.PutUint64(record[16:24], token)
 	binary.LittleEndian.PutUint64(record[24:32], value)
-	return protocol.ChecksumBytes(record[:])
+	checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, record[:])
+	if err != nil {
+		panic(err)
+	}
+	return checksum
 }

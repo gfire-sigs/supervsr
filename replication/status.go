@@ -12,6 +12,7 @@ var (
 	ErrStatusTransition = errors.New("replication: invalid status transition")
 )
 
+// Status identifies the current operating mode of a Replica.
 type Status uint8
 
 const (
@@ -21,18 +22,19 @@ const (
 	StatusRecoveringHead
 )
 
-type TransitionCause uint8
+type transitionCause uint8
 
 const (
-	CauseRecoveredBackup TransitionCause = iota + 1
-	CauseRecoveredUncertainHead
-	CauseRecoveredViewChange
-	CauseCanonicalViewInstalled
-	CauseLocalTimeout
-	CauseHigherView
-	CauseNewerViewChange
+	causeRecoveredBackup transitionCause = iota + 1
+	causeRecoveredUncertainHead
+	causeRecoveredViewChange
+	causeCanonicalViewInstalled
+	causeLocalTimeout
+	causeHigherView
+	causeNewerViewChange
 )
 
+// ReplicaSnapshot captures a point-in-time view of Replica consensus and pipeline state.
 type ReplicaSnapshot struct {
 	Status              Status
 	View                protocol.View
@@ -49,19 +51,19 @@ type ReplicaSnapshot struct {
 	Primary             protocol.ReplicaIndex
 }
 
-func validStatusTransition(from, to Status, cause TransitionCause) bool {
+func validStatusTransition(from, to Status, cause transitionCause) bool {
 	switch from {
 	case StatusRecovering:
-		return to == StatusNormal && cause == CauseRecoveredBackup ||
-			to == StatusRecoveringHead && cause == CauseRecoveredUncertainHead ||
-			to == StatusViewChange && cause == CauseRecoveredViewChange
+		return to == StatusNormal && cause == causeRecoveredBackup ||
+			to == StatusRecoveringHead && cause == causeRecoveredUncertainHead ||
+			to == StatusViewChange && cause == causeRecoveredViewChange
 	case StatusRecoveringHead:
-		return to == StatusNormal && cause == CauseCanonicalViewInstalled
+		return to == StatusNormal && cause == causeCanonicalViewInstalled
 	case StatusNormal:
-		return to == StatusViewChange && (cause == CauseLocalTimeout || cause == CauseHigherView)
+		return to == StatusViewChange && (cause == causeLocalTimeout || cause == causeHigherView)
 	case StatusViewChange:
-		return to == StatusViewChange && cause == CauseNewerViewChange ||
-			to == StatusNormal && cause == CauseCanonicalViewInstalled
+		return to == StatusViewChange && cause == causeNewerViewChange ||
+			to == StatusNormal && cause == causeCanonicalViewInstalled
 	default:
 		return false
 	}

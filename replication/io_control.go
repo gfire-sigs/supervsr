@@ -29,7 +29,7 @@ type IOEvent struct {
 // to one engine incarnation, including after that engine closes.
 // Buffers remain borrowed until the engine's Poll returns their completion.
 type IOController struct {
-	engine *IOEngine
+	engine *storageIOEngine
 }
 
 func NewIOController() *IOController { return &IOController{} }
@@ -101,9 +101,9 @@ func (controller *IOController) storeBusy(candidate *ioSlot) bool {
 			continue
 		}
 		a, b := &candidate.operation, &other.operation
-		sameWAL := a.WAL != nil && a.WAL == b.WAL
-		sameReplies := a.ReplyStore != nil && a.ReplyStore == b.ReplyStore
-		sameSuperblocks := a.SuperblockStore != nil && a.SuperblockStore == b.SuperblockStore
+		sameWAL := a.walJournal != nil && a.walJournal == b.walJournal
+		sameReplies := a.durableReplyStore != nil && a.durableReplyStore == b.durableReplyStore
+		sameSuperblocks := a.superblockStore != nil && a.superblockStore == b.superblockStore
 		if sameWAL || sameReplies || sameSuperblocks {
 			return true
 		}
@@ -202,7 +202,7 @@ type ioSequence struct {
 	checksum   protocol.Checksum
 }
 
-func (sequence *ioSequence) begin(storage Storage, operation *IOOperation) error {
+func (sequence *ioSequence) begin(storage Storage, operation *ioOperation) error {
 	*sequence = ioSequence{storage: storage, buffer: operation.Buffer, offset: operation.Offset, size: uint64(len(operation.Buffer))}
 	switch operation.Kind {
 	case IORead:
@@ -214,17 +214,17 @@ func (sequence *ioSequence) begin(storage Storage, operation *IOOperation) error
 	case IOResize:
 		sequence.phase, sequence.size = IOPhaseResize, operation.Size
 	case IOWALAppend:
-		operation.WAL.mu.Lock()
-		defer operation.WAL.mu.Unlock()
-		return operation.WAL.beginAppend(sequence, operation.Buffer, operation.ReusableThrough)
+		operation.walJournal.mu.Lock()
+		defer operation.walJournal.mu.Unlock()
+		return operation.walJournal.beginAppend(sequence, operation.Buffer, operation.ReusableThrough)
 	case IOReplyWrite, IOReplyRead:
-		operation.ReplyStore.mu.Lock()
-		defer operation.ReplyStore.mu.Unlock()
-		return operation.ReplyStore.beginIO(sequence, operation)
+		operation.durableReplyStore.mu.Lock()
+		defer operation.durableReplyStore.mu.Unlock()
+		return operation.durableReplyStore.beginIO(sequence, operation)
 	case IOSuperblockPersist:
-		operation.SuperblockStore.mu.Lock()
-		defer operation.SuperblockStore.mu.Unlock()
-		return operation.SuperblockStore.beginPersist(sequence, &operation.Superblock)
+		operation.superblockStore.mu.Lock()
+		defer operation.superblockStore.mu.Unlock()
+		return operation.superblockStore.beginPersist(sequence, &operation.superblockRecord)
 	default:
 		return ErrIOHandle
 	}
@@ -246,30 +246,30 @@ func (sequence *ioSequence) physical() error {
 	}
 }
 
-func (sequence *ioSequence) advance(operation *IOOperation) error {
+func (sequence *ioSequence) advance(operation *ioOperation) error {
 	switch operation.Kind {
 	case IOWALAppend:
-		operation.WAL.mu.Lock()
-		defer operation.WAL.mu.Unlock()
-		err := operation.WAL.advanceAppend(sequence, operation.Buffer)
+		operation.walJournal.mu.Lock()
+		defer operation.walJournal.mu.Unlock()
+		err := operation.walJournal.advanceAppend(sequence, operation.Buffer)
 		if err != nil || sequence.phase == IOPhaseCompletion {
-			operation.WAL.ioActive = false
+			operation.walJournal.ioActive = false
 		}
 		return err
 	case IOReplyRead, IOReplyWrite:
-		operation.ReplyStore.mu.Lock()
-		defer operation.ReplyStore.mu.Unlock()
-		err := operation.ReplyStore.advanceIO(sequence, operation)
+		operation.durableReplyStore.mu.Lock()
+		defer operation.durableReplyStore.mu.Unlock()
+		err := operation.durableReplyStore.advanceIO(sequence, operation)
 		if err != nil || sequence.phase == IOPhaseCompletion {
-			operation.ReplyStore.ioActive = false
+			operation.durableReplyStore.ioActive = false
 		}
 		return err
 	case IOSuperblockPersist:
-		operation.SuperblockStore.mu.Lock()
-		defer operation.SuperblockStore.mu.Unlock()
-		err := operation.SuperblockStore.advancePersist(sequence, &operation.Superblock)
+		operation.superblockStore.mu.Lock()
+		defer operation.superblockStore.mu.Unlock()
+		err := operation.superblockStore.advancePersist(sequence, &operation.superblockRecord)
 		if err != nil || sequence.phase == IOPhaseCompletion {
-			operation.SuperblockStore.ioActive = false
+			operation.superblockStore.ioActive = false
 		}
 		return err
 	default:
@@ -279,20 +279,20 @@ func (sequence *ioSequence) advance(operation *IOOperation) error {
 	}
 }
 
-func (sequence *ioSequence) abandon(operation *IOOperation) {
+func (sequence *ioSequence) abandon(operation *ioOperation) {
 	switch operation.Kind {
 	case IOWALAppend:
-		operation.WAL.mu.Lock()
-		operation.WAL.ioActive = false
-		operation.WAL.mu.Unlock()
+		operation.walJournal.mu.Lock()
+		operation.walJournal.ioActive = false
+		operation.walJournal.mu.Unlock()
 	case IOReplyRead, IOReplyWrite:
-		operation.ReplyStore.mu.Lock()
-		operation.ReplyStore.ioActive = false
-		operation.ReplyStore.mu.Unlock()
+		operation.durableReplyStore.mu.Lock()
+		operation.durableReplyStore.ioActive = false
+		operation.durableReplyStore.mu.Unlock()
 	case IOSuperblockPersist:
-		operation.SuperblockStore.mu.Lock()
-		operation.SuperblockStore.ioActive = false
-		operation.SuperblockStore.mu.Unlock()
+		operation.superblockStore.mu.Lock()
+		operation.superblockStore.ioActive = false
+		operation.superblockStore.mu.Unlock()
 	}
 }
 

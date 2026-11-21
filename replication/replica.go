@@ -26,6 +26,8 @@ var (
 	ErrClockUnsynchronized         = errors.New("replication: cluster clock is not synchronized")
 )
 
+// Dependencies injects storage, transport, time, entropy, and state machine
+// collaborators required to open and drive a Replica.
 type Dependencies struct {
 	Storage         Storage
 	MessageBus      MessageBus
@@ -40,7 +42,7 @@ type Dependencies struct {
 	IOController    *IOController
 }
 
-type ReplicaInitialState struct {
+type replicaInitialState struct {
 	Status            Status
 	View              protocol.View
 	DurableView       protocol.View
@@ -56,6 +58,7 @@ type ReplicaInitialState struct {
 	checkpointSession checkpointSessionSnapshot
 }
 
+// CommitStage identifies the active commit or checkpoint pipeline phase reported in ReplicaSnapshot.
 type CommitStage uint8
 
 const (
@@ -113,7 +116,7 @@ type pipelineEntry struct {
 	completion    SMCompletion
 	reply         *Message
 	replyHeader   protocol.Header
-	replyPlan     SessionCommitPlan
+	replyPlan     sessionCommitPlan
 	lastBroadcast uint64
 }
 
@@ -164,15 +167,15 @@ type Replica struct {
 	lastPrepareTimestamp    uint64
 	lastCommitTimestamp     uint64
 	lastPrimaryCommit       uint64
-	failureDetector         FailureDetector
+	failureDetector         livenessDetector
 	timers                  replicaTimers
-	random                  DeterministicRandom
+	random                  deterministicRandom
 	checkpointSession       []byte
 	checkpointSessionOp     protocol.Op
 	checkpointTarget        protocol.Op
 	checkpointTargetRelease protocol.Release
 	checkpointManifest      CheckpointManifest
-	checkpointCandidate     BlockCheckpointCandidate
+	checkpointCandidate     blockCheckpointCandidate
 	pendingCheckpoint       CheckpointState
 	checkpointBlocks        *CheckpointBlockTransaction
 	checkpointReader        *CheckpointBlockReader
@@ -182,16 +185,16 @@ type Replica struct {
 	checkpointScratch       checkpointGraphScratch
 	checkpointRepairDrain   bool
 
-	wal                    *WAL
-	replies                *ReplyStore
-	superblocks            *SuperblockStore
-	sessions               *SessionTable
-	blocks                 *BlockStore
-	trailers               *TrailerStore
-	blockAllocator         *BlockAllocator
-	io                     *IOEngine
+	wal                    *walJournal
+	replies                *durableReplyStore
+	superblocks            *superblockStore
+	sessions               *sessionTable
+	blocks                 *blockStore
+	trailers               *trailerStore
+	blockAllocator         *blockSpaceAllocator
+	io                     *storageIOEngine
 	frames                 *protocol.FramePool
-	events                 *MPSCRing[replicaEvent]
+	events                 *mpscRing[replicaEvent]
 	notify                 chan struct{}
 	pipeline               []pipelineEntry
 	pipelineHead           uint32
@@ -269,11 +272,11 @@ type Replica struct {
 	fatalErr           error
 }
 
-func newReplica(config Config, dependencies Dependencies, initial ReplicaInitialState, wal *WAL, replyStore *ReplyStore, sessions *SessionTable, superblocks *SuperblockStore) (*Replica, error) {
+func newReplica(config Config, dependencies Dependencies, initial replicaInitialState, wal *walJournal, replyStore *durableReplyStore, sessions *sessionTable, superblocks *superblockStore) (*Replica, error) {
 	return newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, nil)
 }
 
-func newReplicaWithBlocks(config Config, dependencies Dependencies, initial ReplicaInitialState, wal *WAL, replyStore *ReplyStore, sessions *SessionTable, superblocks *SuperblockStore, blocks *blockRuntime) (*Replica, error) {
+func newReplicaWithBlocks(config Config, dependencies Dependencies, initial replicaInitialState, wal *walJournal, replyStore *durableReplyStore, sessions *sessionTable, superblocks *superblockStore, blocks *blockRuntime) (*Replica, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -338,7 +341,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	for eventCapacity < minimumEvents {
 		eventCapacity <<= 1
 	}
-	events, err := NewMPSCRing[replicaEvent](eventCapacity)
+	events, err := newMPSCRing[replicaEvent](eventCapacity)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +367,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if metrics == nil {
 		metrics = &ReplicaMetrics{}
 	}
-	checkpointID, err := initial.Checkpoint.IDWith(config.Cluster.ChecksumAlgorithm)
+	checkpointID, err := initial.Checkpoint.ID(config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		_ = ioEngine.Close(context.Background())
 		return nil, err
@@ -461,7 +464,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 		headChecksum:         initial.HeadHeader.HeaderChecksum,
 		lastPrepareTimestamp: prepareTimestamp(&initial.HeadHeader),
 		lastCommitTimestamp:  prepareTimestamp(&initial.HeadHeader),
-		failureDetector:      NewFailureDetector(initialTime.Monotonic),
+		failureDetector:      newLivenessDetector(initialTime.Monotonic),
 		timers:               timers,
 		random:               random,
 		checkpointSession:    checkpointSession,
@@ -526,6 +529,8 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	return replica, nil
 }
 
+// Snapshot returns a consistent point-in-time view of consensus status, view,
+// commit progress, and durable checkpoint state. Safe for concurrent calls.
 func (replica *Replica) Snapshot() ReplicaSnapshot {
 	if replica.runState.Load() == 1 {
 		if current := replica.publishedSnapshot.Load(); current != nil {
@@ -563,6 +568,8 @@ func (replica *Replica) computeSnapshot() ReplicaSnapshot {
 	}
 }
 
+// DurableChecksum reports the durable prepare header checksum for op when op
+// lies within the retained WAL window and is free of local storage faults.
 func (replica *Replica) DurableChecksum(op protocol.Op) (protocol.Checksum, bool) {
 	if op < replica.checkpoint.PrepareOp() || op > replica.headOp {
 		return protocol.Checksum{}, false
@@ -574,6 +581,10 @@ func (replica *Replica) DurableChecksum(op protocol.Op) (protocol.Checksum, bool
 	return header.HeaderChecksum, true
 }
 
+// Submit validates frame source authentication and enqueues an inbound protocol
+// frame onto the Replica's MPSC event queue. On a nil return, Replica assumes
+// frame ownership and releases it once processed; on error, the caller retains
+// ownership and must call Release. Safe for concurrent calls.
 func (replica *Replica) Submit(frame *protocol.Frame) error {
 	replica.submitters.Add(1)
 	defer replica.submitters.Add(-1)
@@ -609,6 +620,9 @@ func (replica *Replica) enqueueSMCompletion(completion *SMCompletion) error {
 	return nil
 }
 
+// Run executes the Replica event loop, driving Process and Tick until Close is
+// called, ctx is canceled, or a fatal storage/invariant error occurs. Run must be
+// invoked at most once per Replica.
 func (replica *Replica) Run(ctx context.Context) (runErr error) {
 	replica.loopMu.Lock()
 	if replica.runState.Load() != 0 {
@@ -655,6 +669,9 @@ func (replica *Replica) Run(ctx context.Context) (runErr error) {
 	}
 }
 
+// Tick advances logical consensus, failure detection, and repair timers by one
+// configured Process.Tick step. Intended for deterministic single-goroutine callers
+// that do not invoke Run.
 func (replica *Replica) Tick() error {
 	if !replica.accepting.Load() {
 		return ErrReplicaClosed
@@ -665,6 +682,9 @@ func (replica *Replica) Tick() error {
 	return replica.fatalErr
 }
 
+// Process drains up to limit queued inbound frames, I/O completions, and
+// asynchronous StateMachine completions in deterministic order. Intended for manual
+// stepping when Run is not active.
 func (replica *Replica) Process(limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -686,9 +706,9 @@ func (replica *Replica) Process(limit int) (int, error) {
 			continue
 		default:
 		}
-		var completion IOCompletion
+		var completion ioCompletion
 		if replica.io.Poll(&completion) {
-			if replica.stateSync.stage == SyncStageCancelingGrid {
+			if replica.stateSync.stage == syncStageCancelingGrid {
 				replica.handleStateSyncDrainIO(completion)
 			} else {
 				replica.handleIOCompletion(completion)
@@ -706,13 +726,13 @@ func (replica *Replica) Process(limit int) (int, error) {
 		}
 		switch event.kind {
 		case replicaEventMessage:
-			if replica.stateSync.stage != SyncStageIdle || replica.stateSync.replayRunning {
+			if replica.stateSync.stage != syncStageIdle || replica.stateSync.replayRunning {
 				event.message.Release()
 			} else if !replica.handleMessage(event.message) {
 				event.message.Release()
 			}
 		case replicaEventSMCompletion:
-			if replica.stateSync.stage == SyncStageCancelingGrid || replica.stateSync.stage == SyncStageUpdatingCheckpoint || replica.stateSync.replayRunning {
+			if replica.stateSync.stage == syncStageCancelingGrid || replica.stateSync.stage == syncStageUpdatingCheckpoint || replica.stateSync.replayRunning {
 				replica.handleStateSyncDrainSM(event)
 			} else {
 				replica.handleSMCompletion(event)
@@ -733,13 +753,13 @@ func (replica *Replica) Process(limit int) (int, error) {
 	if !replica.stateSyncAwaitingOpen() && replica.pendingView > replica.view && replica.viewIO == (IOHandle{}) && !replica.commitInFlight() {
 		replica.resumePendingViewChange()
 	}
-	if replica.stateSync.stage == SyncStageIdle && !replica.stateSync.replayRunning && !replica.stateSyncAwaitingOpen() {
+	if replica.stateSync.stage == syncStageIdle && !replica.stateSync.replayRunning && !replica.stateSyncAwaitingOpen() {
 		if replica.repairViewValid {
 			replica.continueRecoveringView(replica.deps.Clock.Now().Monotonic)
 		}
 		replica.acknowledgeDurablePrepares()
 	}
-	if !replica.stateSync.replayRunning && (replica.stateSync.stage == SyncStageIdle || replica.stateSync.stage == SyncStageCancelingCommit) {
+	if !replica.stateSync.replayRunning && (replica.stateSync.stage == syncStageIdle || replica.stateSync.stage == syncStageCancelingCommit) {
 		replica.advanceCommit()
 	}
 	replica.dispatchStateSync()
@@ -753,6 +773,8 @@ func (replica *Replica) Process(limit int) (int, error) {
 	return processed, nil
 }
 
+// Close halts acceptance of new frames, resets the state machine, drains
+// I/O and worker goroutines, and closes both StateMachine and Storage.
 func (replica *Replica) Close(ctx context.Context) error {
 	replica.accepting.Store(false)
 	if replica.runState.CompareAndSwap(0, 2) {
@@ -826,7 +848,7 @@ func (replica *Replica) waitForReset(generation uint64) {
 
 func (replica *Replica) drainShutdownEvents(generation uint64) bool {
 	resetComplete := false
-	var completion IOCompletion
+	var completion ioCompletion
 	for replica.io.Poll(&completion) {
 	}
 	var event replicaEvent
@@ -875,7 +897,7 @@ func (replica *Replica) releaseOwnedFrames() {
 	}
 }
 
-func (replica *Replica) Transition(to Status, cause TransitionCause) error {
+func (replica *Replica) transition(to Status, cause transitionCause) error {
 	if !validStatusTransition(replica.status, to, cause) {
 		return ErrStatusTransition
 	}

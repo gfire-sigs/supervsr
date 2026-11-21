@@ -35,8 +35,8 @@ type checkpointBlockRecord struct {
 // CheckpointBlockTransaction owns the bounded block reservations for one checkpoint.
 type CheckpointBlockTransaction struct {
 	mu         sync.Mutex
-	allocator  *BlockAllocator
-	store      *BlockStore
+	allocator  *blockSpaceAllocator
+	store      *blockStore
 	records    []checkpointBlockRecord
 	limit      uint32
 	generation uint64
@@ -55,11 +55,11 @@ type CheckpointBlock struct {
 
 // CheckpointBlockReader reads immutable application blocks selected by the durable free set.
 type CheckpointBlockReader struct {
-	allocator *BlockAllocator
-	store     *BlockStore
+	allocator *blockSpaceAllocator
+	store     *blockStore
 }
 
-func newCheckpointBlockReader(allocator *BlockAllocator, store *BlockStore) *CheckpointBlockReader {
+func newCheckpointBlockReader(allocator *blockSpaceAllocator, store *blockStore) *CheckpointBlockReader {
 	return &CheckpointBlockReader{allocator: allocator, store: store}
 }
 
@@ -75,7 +75,7 @@ func (reader *CheckpointBlockReader) Read(reference BlockReference, blockType Bl
 	return reader.store.Read(reference, blockType, destination)
 }
 
-func newCheckpointBlockTransaction(allocator *BlockAllocator, store *BlockStore, limit uint32) *CheckpointBlockTransaction {
+func newCheckpointBlockTransaction(allocator *blockSpaceAllocator, store *blockStore, limit uint32) *CheckpointBlockTransaction {
 	return &CheckpointBlockTransaction{
 		allocator: allocator,
 		store:     store,
@@ -84,7 +84,7 @@ func newCheckpointBlockTransaction(allocator *BlockAllocator, store *BlockStore,
 	}
 }
 
-func (transaction *CheckpointBlockTransaction) setRuntime(allocator *BlockAllocator, store *BlockStore) error {
+func (transaction *CheckpointBlockTransaction) setRuntime(allocator *blockSpaceAllocator, store *blockStore) error {
 	transaction.mu.Lock()
 	defer transaction.mu.Unlock()
 	if transaction.state != checkpointBlockTransactionIdle || allocator == nil || store == nil {

@@ -102,7 +102,7 @@ func TestZeroCheckpointBlockCannotWrite(t *testing.T) {
 	}
 }
 
-func checkpointBlockTransactionFixture(t *testing.T, limit uint32) (*CheckpointBlockTransaction, *BlockAllocator, *BlockStore) {
+func checkpointBlockTransactionFixture(t *testing.T, limit uint32) (*CheckpointBlockTransaction, *blockSpaceAllocator, *blockStore) {
 	t.Helper()
 	cluster := compactTestClusterConfig()
 	base, ok := cluster.BlockBase()
@@ -116,15 +116,15 @@ func checkpointBlockTransactionFixture(t *testing.T, limit uint32) (*CheckpointB
 		t.Fatal(err)
 	}
 	state := CheckpointState{LogicalStorageSize: base}
-	acquired, released, err := EmptyBlockSets(state, cluster)
+	acquired, released, err := emptyBlockSets(state, cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	allocator, err := OpenBlockAllocator(storage, cluster, process, state, acquired, released)
+	allocator, err := openBlockAllocator(storage, cluster, process, state, acquired, released)
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewBlockStore(storage, cluster, GroupID{1}, 1)
+	store, err := newBlockStore(storage, cluster, GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

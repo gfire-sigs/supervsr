@@ -138,7 +138,7 @@ func (budget *blockRepairBudget) referencesEligible(peer protocol.ReplicaIndex, 
 	return true
 }
 
-func (budget *blockRepairBudget) Destination(random *DeterministicRandom) (protocol.ReplicaIndex, bool) {
+func (budget *blockRepairBudget) Destination(random *deterministicRandom) (protocol.ReplicaIndex, bool) {
 
 	if random == nil || budget.requestsAvailable == 0 {
 		return 0, false

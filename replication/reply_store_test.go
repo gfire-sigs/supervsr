@@ -16,11 +16,11 @@ func TestReplyStoreSerializesOverlappingWorkerWrites(t *testing.T) {
 		t.Fatal("invalid layout")
 	}
 	storage := &overlapStorage{bytes: make([]byte, layout.BlockBase)}
-	store, err := NewReplyStore(storage, config, protocol.GroupID{9}, 3)
+	store, err := newDurableReplyStore(storage, config, protocol.GroupID{9}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewIOEngine(storage, 2, 2)
+	engine, err := newDefaultIOEngine(storage, 2, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestReplyStoreSerializesOverlappingWorkerWrites(t *testing.T) {
 	firstFrame, firstHeader := makeReplyFrame(t, protocol.ClientID{1}, 5, []byte("first reply"))
 	secondFrame, secondHeader := makeReplyFrame(t, protocol.ClientID{2}, 6, []byte("second reply"))
 	for slot, frame := range [][]byte{firstFrame, secondFrame} {
-		if _, err := engine.Submit(IOOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame, ReplyStore: store}); err != nil {
+		if _, err := engine.Submit(ioOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame, durableReplyStore: store}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -79,12 +79,15 @@ func makeReplyFrame(t testing.TB, client protocol.ClientID, op protocol.Op, body
 	putUint64(header.Fields[96:104], uint64(op))
 	putUint32(header.Fields[104:108], 1)
 	header.Fields[108] = byte(protocol.OperationNoop)
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
-	context := protocol.ChecksumBytes(frame[protocol.HeaderChecksumFrom:protocol.HeaderSize])
+	context, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, frame[protocol.HeaderChecksumFrom:protocol.HeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
 	copy(header.Fields[32:48], context[:])
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrame(frame, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return frame, header

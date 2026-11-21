@@ -222,7 +222,7 @@ func (machine *kvMachine) StartCheckpoint(input replication.CheckpointInput, _ *
 }
 
 func (machine *kvMachine) StartOpen(input replication.OpenCheckpointInput, _ *replication.SMCompletion) (replication.StartResult[replication.OpenResult], error) {
-	header, reason := protocol.DecodeHeaderWith(input.State.Header[:], machine.group, machine.messageSizeMax, machine.memberCount, machine.checksum)
+	header, reason := protocol.DecodeHeader(input.State.Header[:], machine.group, machine.messageSizeMax, machine.memberCount, machine.checksum)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return replication.StartResult[replication.OpenResult]{}, errInvalidSnapshot
 	}
@@ -388,7 +388,7 @@ func (machine *kvMachine) encodeSnapshot(op protocol.Op) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Join(errInvalidSnapshot, err)
 	}
-	checksum, err := protocol.ChecksumBytesWith(machine.checksum, checksumInput)
+	checksum, err := protocol.ChecksumBytes(machine.checksum, checksumInput)
 	if err != nil {
 		return nil, errors.Join(errInvalidSnapshot, err)
 	}
@@ -460,7 +460,7 @@ func (machine *kvMachine) readSnapshot(op protocol.Op) error {
 	if _, err := hex.Decode(stored[:], []byte(document.Checksum)); err != nil || hex.EncodeToString(stored[:]) != document.Checksum {
 		return errInvalidSnapshot
 	}
-	computed, err := protocol.ChecksumBytesWith(machine.checksum, checksumInput)
+	computed, err := protocol.ChecksumBytes(machine.checksum, checksumInput)
 	if err != nil || computed != stored {
 		return errInvalidSnapshot
 	}

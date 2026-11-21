@@ -102,20 +102,20 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	if _, err := target.Process(64); err != nil {
 		t.Fatal(err)
 	}
-	if target.stateSync.stage != SyncStageCancelingGrid {
+	if target.stateSync.stage != syncStageCancelingGrid {
 		t.Fatalf("stage after selection = %d", target.stateSync.stage)
 	}
 	if _, err := target.Process(64); err != nil {
 		t.Fatal(err)
 	}
-	if target.stateSync.stage != SyncStageUpdatingCheckpoint {
+	if target.stateSync.stage != syncStageUpdatingCheckpoint {
 		t.Fatalf("stage after grid drain = %d", target.stateSync.stage)
 	}
 
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()
 	monotonic := uint64(time.Second)
-	for target.stateSync.stage != SyncStageIdle || target.stateSync.repairing {
+	for target.stateSync.stage != syncStageIdle || target.stateSync.repairing {
 		target.handleRepairTimeout(TimeSample{Monotonic: monotonic})
 		monotonic += uint64(100 * time.Millisecond)
 		if _, err := target.Process(64); err != nil {
@@ -246,7 +246,7 @@ func TestStateSyncDrainDoesNotAcknowledgeCompletedWALAppend(t *testing.T) {
 	replica := Replica{pipeline: make([]pipelineEntry, 1), pipelineLen: 1}
 	replica.pipeline[0].io = handle
 	replica.pipeline[0].ioKind = IOWALAppend
-	replica.handleStateSyncDrainIO(IOCompletion{Handle: handle})
+	replica.handleStateSyncDrainIO(ioCompletion{Handle: handle})
 	entry := &replica.pipeline[0]
 	if entry.io != (IOHandle{}) || entry.ioKind != 0 || entry.durable || entry.acks != 0 {
 		t.Fatalf("drained entry=%+v", entry)
@@ -257,7 +257,7 @@ func TestStateSyncDrainFailsOnViewPersistenceError(t *testing.T) {
 	handle := IOHandle{Index: 1, Generation: 2}
 	failure := errors.New("view persistence failed")
 	replica := Replica{viewIO: handle}
-	replica.handleStateSyncDrainIO(IOCompletion{Handle: handle, Err: failure})
+	replica.handleStateSyncDrainIO(ioCompletion{Handle: handle, Err: failure})
 	if !errors.Is(replica.fatalErr, failure) {
 		t.Fatalf("fatal error=%v, want %v", replica.fatalErr, failure)
 	}
@@ -265,7 +265,7 @@ func TestStateSyncDrainFailsOnViewPersistenceError(t *testing.T) {
 
 type syncOrderMachine struct {
 	testStateMachine
-	store        *SuperblockStore
+	store        *superblockStore
 	resetSyncMin protocol.Op
 }
 
@@ -285,14 +285,14 @@ func (*pendingReplayMachine) StartPrefetch(PrefetchInput, *SMCompletion) (StartR
 func makeStateSyncViewBody(t testing.TB, config Config, checkpoint CheckpointState) []byte {
 	t.Helper()
 	body := make([]byte, CheckpointStateSize+protocol.HeaderSize)
-	if err := checkpoint.Encode(body[:CheckpointStateSize]); err != nil {
+	if err := checkpoint.encode(body[:CheckpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
-	header, reason := protocol.DecodeHeader(checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount)
+	header, reason := protocol.DecodeHeader(checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatalf("checkpoint header reason = %d", reason)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &header); err != nil {
+	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return body
@@ -300,7 +300,7 @@ func makeStateSyncViewBody(t testing.TB, config Config, checkpoint CheckpointSta
 
 func mustCheckpointID(t testing.TB, checkpoint CheckpointState) protocol.CheckpointID {
 	t.Helper()
-	checkpointID, err := checkpoint.ID()
+	checkpointID, err := checkpoint.ID(ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}

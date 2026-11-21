@@ -19,19 +19,19 @@ func TestSessionTableDecisionTable(t *testing.T) {
 	context := replyContext(&reply)
 	cases := []struct {
 		name    string
-		request SessionRequest
-		want    SessionDecision
+		request sessionRequest
+		want    sessionDecision
 	}{
-		{"missing", SessionRequest{Client: protocol.ClientID{2}}, SessionNoSession},
-		{"session-low", SessionRequest{Client: client, Session: 6, Release: 1}, SessionTooLow},
-		{"session-high", SessionRequest{Client: client, Session: 8, Release: 1}, SessionBehind},
-		{"release", SessionRequest{Client: client, Session: 7, Release: 2}, SessionReleaseMismatch},
-		{"old", SessionRequest{Client: client, Session: 7, Request: 0, Release: 1}, SessionDrop},
-		{"duplicate", SessionRequest{Client: client, Session: 7, Request: 1, Release: 1, RequestChecksum: requestChecksum}, SessionDuplicate},
-		{"duplicate-fork", SessionRequest{Client: client, Session: 7, Request: 1, Release: 1, RequestChecksum: protocol.Checksum{99}}, SessionClientFork},
-		{"next", SessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: context}, SessionAdmit},
-		{"parent-fork", SessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: protocol.Checksum{99}}, SessionClientFork},
-		{"gap", SessionRequest{Client: client, Session: 7, Request: 3, Release: 1, Parent: context}, SessionDrop},
+		{"missing", sessionRequest{Client: protocol.ClientID{2}}, sessionNoSession},
+		{"session-low", sessionRequest{Client: client, Session: 6, Release: 1}, sessionTooLow},
+		{"session-high", sessionRequest{Client: client, Session: 8, Release: 1}, sessionBehind},
+		{"release", sessionRequest{Client: client, Session: 7, Release: 2}, sessionReleaseMismatch},
+		{"old", sessionRequest{Client: client, Session: 7, Request: 0, Release: 1}, sessionDrop},
+		{"duplicate", sessionRequest{Client: client, Session: 7, Request: 1, Release: 1, RequestChecksum: requestChecksum}, sessionDuplicate},
+		{"duplicate-fork", sessionRequest{Client: client, Session: 7, Request: 1, Release: 1, RequestChecksum: protocol.Checksum{99}}, sessionClientFork},
+		{"next", sessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: context}, sessionAdmit},
+		{"parent-fork", sessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: protocol.Checksum{99}}, sessionClientFork},
+		{"gap", sessionRequest{Client: client, Session: 7, Request: 3, Release: 1, Parent: context}, sessionDrop},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -103,7 +103,10 @@ func TestSessionTableDecodeValidatesBeforePublication(t *testing.T) {
 
 	corrupt := append([]byte(nil), encoded...)
 	corrupt[protocol.HeaderSize] = 1
-	corruptChecksum := protocol.ChecksumBytes(corrupt)
+	corruptChecksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, corrupt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := recovered.DecodeTrailer(corrupt, corruptChecksum); !errors.Is(err, ErrSessionEncoding) {
 		t.Fatalf("free slot mismatch error = %v", err)
 	}
@@ -172,19 +175,19 @@ func BenchmarkSessionTableDecision(b *testing.B) {
 	if _, err := table.Commit(reply, 7); err != nil {
 		b.Fatal(err)
 	}
-	request := SessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: replyContext(&reply)}
+	request := sessionRequest{Client: client, Session: 7, Request: 2, Release: 1, Parent: replyContext(&reply)}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		if table.Decide(request) != SessionAdmit {
+		if table.Decide(request) != sessionAdmit {
 			b.Fatal("request rejected")
 		}
 	}
 }
 
-func newTestSessionTable(t testing.TB, clientsMax uint32) *SessionTable {
+func newTestSessionTable(t testing.TB, clientsMax uint32) *sessionTable {
 	t.Helper()
-	table, err := NewSessionTable(SessionTableConfig{
+	table, err := newSessionTable(sessionTableConfig{
 		ClientsMax:              clientsMax,
 		Group:                   protocol.GroupID{9},
 		ActiveCount:             3,
@@ -199,8 +202,12 @@ func newTestSessionTable(t testing.TB, clientsMax uint32) *SessionTable {
 
 func makeSessionReply(t testing.TB, client protocol.ClientID, op protocol.Op, request protocol.RequestNo, operation protocol.Operation) protocol.Header {
 	t.Helper()
+	emptyChecksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	header := protocol.Header{
-		BodyChecksum: protocol.ChecksumBytes(nil),
+		BodyChecksum: emptyChecksum,
 		Group:        protocol.GroupID{9},
 		Size:         protocol.HeaderSize,
 		View:         0,
@@ -217,12 +224,15 @@ func makeSessionReply(t testing.TB, client protocol.ClientID, op protocol.Op, re
 	binary.LittleEndian.PutUint32(header.Fields[104:108], uint32(request))
 	header.Fields[108] = byte(operation)
 	var encoded [protocol.HeaderSize]byte
-	if err := protocol.EncodeHeader(encoded[:], &header); err != nil {
+	if err := protocol.EncodeHeader(encoded[:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
-	context := protocol.ChecksumBytes(encoded[protocol.HeaderChecksumFrom:])
+	context, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, encoded[protocol.HeaderChecksumFrom:])
+	if err != nil {
+		t.Fatal(err)
+	}
 	copy(header.Fields[32:48], context[:])
-	if err := protocol.EncodeHeader(encoded[:], &header); err != nil {
+	if err := protocol.EncodeHeader(encoded[:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return header

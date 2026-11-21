@@ -11,7 +11,7 @@ import (
 
 func TestFileStorageDurabilityAndExactIO(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "replica.data")
-	storage, err := OpenFileStorage(path, true, false)
+	storage, err := OpenFileStorage(path, FileStorageOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestDirectStorageRequiresAlignedBuffers(t *testing.T) {
 		t.Skip("direct I/O hook unavailable")
 	}
 	path := filepath.Join(t.TempDir(), "direct.data")
-	storage, err := OpenFileStorage(path, true, true)
+	storage, err := OpenFileStorage(path, FileStorageOptions{Create: true, DirectIO: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestAlignedBufferAlignmentAndBounds(t *testing.T) {
 
 func TestFileStorageConcurrentCloseAndIO(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "concurrent.data")
-	storage, err := OpenFileStorage(path, true, false)
+	storage, err := OpenFileStorage(path, FileStorageOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}

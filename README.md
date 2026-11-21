@@ -46,7 +46,7 @@ Enter `put KEY VALUE`, `get KEY`, `delete KEY` (`del`), or `quit` at the prompt.
 
 ## Usage
 
-Embedding `supervsr` takes four steps: implement `replication.StateMachine`, format a replica file with `replication.Format`, open and recover it with `replication.Open`, and run `Replica.Run`.
+Embedding `supervsr` takes four steps: implement `replication.StateMachine`, format a replica file with `replication.Format`, open and recover it with `replication.Open`, and run `Replica.Run`. Clients connect through `replication.ManagedClient` for goroutine-safe `Register` and `Submit` calls, or through `replication.Client` in single-threaded event loops.
 
 ```go
 package main
@@ -156,7 +156,7 @@ func main() {
 	}
 	path := filepath.Join(dir, "replica.vsr")
 
-	formatStorage, err := replication.OpenFileStorage(path, true, false)
+	formatStorage, err := replication.OpenFileStorage(path, replication.FileStorageOptions{Create: true})
 	if err != nil {
 		panic(err)
 	}
@@ -173,7 +173,7 @@ func main() {
 		panic(err)
 	}
 
-	storage, err := replication.OpenFileStorage(path, false, false)
+	storage, err := replication.OpenFileStorage(path, replication.FileStorageOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -206,13 +206,13 @@ func main() {
 }
 ```
 
-In a multi-node service, bind authenticated incoming frames with `Frame.BindReplica` or `Frame.BindClient` before calling `Replica.Submit`, and submit client operations through `replication.NewClient`. A runnable copy of the snippet above lives in [example_test.go](replication/example_test.go), and a block-checkpointing state machine (`LedgerMachine`) lives in [ledger.go](replication/sim/ledger.go).
+In a multi-node service, bind authenticated incoming frames with `Frame.BindReplica` or `Frame.BindClient` before calling `Replica.Submit`, and submit client operations through `replication.NewManagedClient` or `replication.NewClient`. A runnable copy of the snippet above lives in [example_test.go](replication/example_test.go), and a block-checkpointing state machine (`LedgerMachine`) lives in [ledger.go](replication/sim/ledger.go).
 
 ## State machine architecture
 
 ### Design and execution contract
 
-Each `Replica` runs a single-threaded event loop (`Replica.Run` / `Replica.Process`) that drains an `MPSCRing` of inbound messages and state-machine completions alongside an `IOEngine` completion ring. Because all `StateMachine` methods are invoked from this event loop in strict `Op` order, implementations need no internal mutexes unless background workers complete asynchronous operations.
+Each `Replica` runs a single-threaded event loop (`Replica.Run` / `Replica.Process`) that drains an MPSC ring of inbound messages and state-machine completions alongside an asynchronous storage I/O completion ring. Because all `StateMachine` methods are invoked from this event loop in strict `Op` order, implementations need no internal mutexes unless background workers complete asynchronous operations.
 
 Methods in [sm.go](replication/sm.go) use two patterns:
 
@@ -226,33 +226,33 @@ A replica moves between four `Status` modes defined in [status.go](replication/s
 ```mermaid
 stateDiagram-v2
     [*] --> StatusRecovering: "Open or state sync"
-    StatusRecovering --> StatusNormal: "CauseRecoveredBackup / sync complete"
-    StatusRecovering --> StatusViewChange: "CauseRecoveredViewChange"
-    StatusRecovering --> StatusRecoveringHead: "CauseRecoveredUncertainHead / suffix repair"
-    StatusNormal --> StatusViewChange: "CauseLocalTimeout / CauseHigherView"
+    StatusRecovering --> StatusNormal: "causeRecoveredBackup / sync complete"
+    StatusRecovering --> StatusViewChange: "causeRecoveredViewChange"
+    StatusRecovering --> StatusRecoveringHead: "causeRecoveredUncertainHead / suffix repair"
+    StatusNormal --> StatusViewChange: "causeLocalTimeout / causeHigherView"
     StatusNormal --> StatusRecoveringHead: "Gap or higher commit observed"
     StatusNormal --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
-    StatusViewChange --> StatusViewChange: "CauseNewerViewChange"
-    StatusViewChange --> StatusNormal: "CauseCanonicalViewInstalled"
+    StatusViewChange --> StatusViewChange: "causeNewerViewChange"
+    StatusViewChange --> StatusNormal: "causeCanonicalViewInstalled"
     StatusViewChange --> StatusRecoveringHead: "Missing canonical suffix"
     StatusViewChange --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
-    StatusRecoveringHead --> StatusNormal: "CauseCanonicalViewInstalled / suffix repaired"
+    StatusRecoveringHead --> StatusNormal: "causeCanonicalViewInstalled / suffix repaired"
     StatusRecoveringHead --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
 ```
 
 | Status | Role | Key transitions out |
 | --- | --- | --- |
 | `StatusNormal` | Accepts/replicates prepares in the current view | Enters `StatusViewChange` on primary timeout or higher view, `StatusRecoveringHead` on a log gap, or `StatusRecovering` on state sync |
-| `StatusViewChange` | Persists view change, exchanges `JoinView`/`View` messages | Advances view (`CauseNewerViewChange`), installs `StatusNormal` (`CauseCanonicalViewInstalled`), or repairs missing suffix in `StatusRecoveringHead` |
+| `StatusViewChange` | Persists view change, exchanges `JoinView`/`View` messages | Advances view (`causeNewerViewChange`), installs `StatusNormal` (`causeCanonicalViewInstalled`), or repairs missing suffix in `StatusRecoveringHead` |
 | `StatusRecovering` | Resumes WAL or installs a peer checkpoint via state sync | Moves to `StatusNormal`, `StatusViewChange`, or `StatusRecoveringHead` once storage and `StartOpen` finish |
 | `StatusRecoveringHead` | Repairs missing WAL headers/prepares up to canonical head | Installs `StatusNormal` when suffix and replies are durable |
 
-When `beginStateSync` runs in [state_sync.go](replication/state_sync.go), the replica steps through four `SyncStage` phases before reopening the state machine:
+When `beginStateSync` runs in [state_sync.go](replication/state_sync.go), the replica steps through four `syncStage` phases before reopening the state machine:
 
-1. `SyncStageCancelingCommit`: wait for any active `CommitStage` entry to return to `CommitStageIdle`.
-2. `SyncStageCancelingGrid`: cancel in-flight repair or duplicate reads and drain `IOEngine`.
-3. `SyncStageUpdatingCheckpoint`: record `SyncMin`/`SyncMax` in the superblock, reset the state machine via `StartReset`, and persist the new checkpoint superblock.
-4. `SyncStageResizingStorage`: fetch missing blocks, call `StartOpen` with the target `CheckpointBlockReader`, repair reply slots, and switch to `StatusNormal` or `StatusRecoveringHead`.
+1. `syncStageCancelingCommit`: wait for any active `CommitStage` entry to return to `CommitStageIdle`.
+2. `syncStageCancelingGrid`: cancel in-flight repair or duplicate reads and drain `storageIOEngine`.
+3. `syncStageUpdatingCheckpoint`: record `SyncMin`/`SyncMax` in the superblock, reset the state machine via `StartReset`, and persist the new checkpoint superblock.
+4. `syncStageResizingStorage`: fetch missing blocks, call `StartOpen` with the target `CheckpointBlockReader`, repair reply slots, and switch to `StatusNormal` or `StatusRecoveringHead`.
 
 ### Commit and checkpoint pipeline transitions
 
@@ -283,7 +283,7 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 
 | Path | Responsibility |
 | --- | --- |
-| `replication/` | VSR `Replica`, `Client`, `WAL`, `SuperblockStore`, `BlockStore`, `BlockAllocator`, `IOEngine`, `MPSCRing`, `ClockSynchronizer`, scrubbing, and `ReplaceLostReplica`. |
+| `replication/` | VSR `Replica`, `Client`, `ManagedClient`, `FileStorage`, `ClockSynchronizer`, `CheckpointBlockTransaction`, scrubbing, and `ReplaceLostReplica`, backed by an internal WAL, superblock store, block store/allocator, I/O engine, and MPSC ring. |
 | `replication/protocol/` | 256-byte fixed headers, `FramePool`, source binding, semantic validation, and 128-bit checksums (`ChecksumAEGIS128L` with AVX-AES, NEON-AES, and portable fallback; `ChecksumWyhash128`). |
 | `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`, `IOController`), `LedgerMachine`, and global invariant checks. |
 | `cmd/toykv/` | Local multi-replica in-process cluster demo and KV REPL. |

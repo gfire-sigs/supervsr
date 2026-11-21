@@ -24,23 +24,23 @@ func TestWALRecoverInstalledViewExcludesOnlyOlderTail(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config, storage, checkpoint := formattedWALFixture(t)
-			wal, err := NewWAL(storage, config, protocol.GroupID{1}, 3)
+			wal, err := newWAL(storage, config, protocol.GroupID{1}, 3)
 			if err != nil {
 				t.Fatal(err)
 			}
-			report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+			report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			prepare := connectedPrepareFrame(t, config, report.HeadHeader, 1)
 			oldHeader := [protocol.HeaderSize]byte(prepare[:protocol.HeaderSize])
-			header, _, reason := protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 3)
+			header, _, reason := protocol.DecodeFrame(prepare, protocol.GroupID{1}, uint32(config.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 			if reason != protocol.RejectNone {
 				t.Fatal(reason)
 			}
 			header.View = test.view
 			header.Author = protocol.ReplicaIndex(test.view)
-			if err := protocol.SealFrame(prepare, &header); err != nil {
+			if err := protocol.SealFrame(prepare, &header, protocol.ChecksumAEGIS128L); err != nil {
 				t.Fatal(err)
 			}
 			if err := wal.Append(prepare, 0); err != nil {
@@ -58,11 +58,11 @@ func TestWALRecoverInstalledViewExcludesOnlyOlderTail(t *testing.T) {
 			}
 			storage.Crash()
 
-			wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+			wal, err = newWAL(storage, config, protocol.GroupID{1}, 3)
 			if err != nil {
 				t.Fatal(err)
 			}
-			report, err = wal.Recover(checkpoint, 0, WALRecoveryView{LogView: 1, HeadOp: 0})
+			report, err = wal.Recover(checkpoint, 0, walRecoveryView{LogView: 1, HeadOp: 0})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -83,11 +83,11 @@ func TestWALRecoverInstalledViewExcludesOnlyOlderTail(t *testing.T) {
 
 func TestWALDiscardAfterSurvivesNeighborHeaderWrite(t *testing.T) {
 	config, storage, checkpoint := formattedWALFixture(t)
-	wal, err := NewWAL(storage, config, protocol.GroupID{1}, 3)
+	wal, err := newWAL(storage, config, protocol.GroupID{1}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,11 +107,11 @@ func TestWALDiscardAfterSurvivesNeighborHeaderWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage.Crash()
-	wal, err = NewWAL(storage, config, protocol.GroupID{1}, 3)
+	wal, err = newWAL(storage, config, protocol.GroupID{1}, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err = wal.Recover(checkpoint, 0, WALRecoveryView{LogView: 1, HeadOp: 0})
+	report, err = wal.Recover(checkpoint, 0, walRecoveryView{LogView: 1, HeadOp: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,22 +122,22 @@ func TestWALDiscardAfterSurvivesNeighborHeaderWrite(t *testing.T) {
 
 func TestWALRecoverStaleExcludedHeaderCannotHideCurrentCorruption(t *testing.T) {
 	config, storage, checkpoint := formattedWALFixture(t)
-	wal, err := NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err := newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := wal.Recover(checkpoint, 0, WALRecoveryView{})
+	report, err := wal.Recover(checkpoint, 0, walRecoveryView{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldFrame := connectedPrepareFrame(t, config, report.HeadHeader, 1)
 	current := append([]byte(nil), oldFrame...)
-	header, _, reason := protocol.DecodeFrame(current, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1)
+	header, _, reason := protocol.DecodeFrame(current, protocol.GroupID{1}, uint32(config.MessageSizeMax), 1, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}
 	header.View = 1
-	if err := protocol.SealFrame(current, &header); err != nil {
+	if err := protocol.SealFrame(current, &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := wal.Append(current, 0); err != nil {
@@ -150,11 +150,11 @@ func TestWALRecoverStaleExcludedHeaderCannotHideCurrentCorruption(t *testing.T) 
 		t.Fatal(err)
 	}
 	storage.Crash()
-	wal, err = NewWAL(storage, config, protocol.GroupID{1}, 1)
+	wal, err = newWAL(storage, config, protocol.GroupID{1}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report, err := wal.Recover(checkpoint, 0, WALRecoveryView{LogView: 1, HeadOp: 0}); !errors.Is(err, ErrWALUncertainSolo) {
+	if report, err := wal.Recover(checkpoint, 0, walRecoveryView{LogView: 1, HeadOp: 0}); !errors.Is(err, ErrWALUncertainSolo) {
 		t.Fatalf("stale excluded header hid a durable current-view prepare: report=%+v err=%v", report, err)
 	}
 }

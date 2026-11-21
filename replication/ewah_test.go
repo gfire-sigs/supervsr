@@ -7,7 +7,7 @@ import (
 )
 
 func TestEWAHCanonicalMarkerVector(t *testing.T) {
-	set, err := NewFixedBitSet(6 * 64)
+	set, err := newFixedBitSet(6 * 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestEWAHCanonicalMarkerVector(t *testing.T) {
 			t.Fatalf("word %d = %016x want %016x", index, encoded[index], want[index])
 		}
 	}
-	decoded, err := NewFixedBitSet(6 * 64)
+	decoded, err := newFixedBitSet(6 * 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,20 +46,20 @@ func TestEWAHCanonicalMarkerVector(t *testing.T) {
 }
 
 func TestEWAHRejectsNoncanonicalLiteralFillAndLengthOverflow(t *testing.T) {
-	set, err := NewFixedBitSet(64)
+	set, err := newFixedBitSet(64)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := set.DecodeEWAH([]uint64{1 << 32, 0}); !errors.Is(err, ErrInvalidEWAH) {
 		t.Fatalf("literal fill error = %v", err)
 	}
-	if _, err := NewFixedBitSet(math.MaxUint64); !errors.Is(err, ErrInvalidConfiguration) {
+	if _, err := newFixedBitSet(math.MaxUint64); !errors.Is(err, ErrInvalidConfiguration) {
 		t.Fatalf("overflow error = %v", err)
 	}
 }
 
 func TestFixedBitSetTailAndPopulation(t *testing.T) {
-	set, err := NewFixedBitSet(65)
+	set, err := newFixedBitSet(65)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestFixedBitSetTailAndPopulation(t *testing.T) {
 }
 
 func BenchmarkFixedBitSetEncodeEWAH(b *testing.B) {
-	set, err := NewFixedBitSet(4096)
+	set, err := newFixedBitSet(4096)
 	if err != nil {
 		b.Fatal(err)
 	}

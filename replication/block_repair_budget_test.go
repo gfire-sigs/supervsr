@@ -52,7 +52,7 @@ func TestBlockRepairBudgetDestinationRequiresFullBatch(t *testing.T) {
 	if !budget.Reserve(1, references, 1) {
 		t.Fatal("reservation rejected")
 	}
-	random := NewDeterministicRandom(1)
+	random := newDeterministicRandom(1)
 	for range 32 {
 		peer, ok := budget.Destination(&random)
 		if !ok || peer != 2 {
@@ -66,7 +66,7 @@ func BenchmarkBlockRepairBudget(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	random := NewDeterministicRandom(1)
+	random := newDeterministicRandom(1)
 	reference := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
 	b.ReportAllocs()
 	b.ResetTimer()

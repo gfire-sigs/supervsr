@@ -13,21 +13,25 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	checkpointValidation := checkpointValidationFor(t, validation)
 	var encoded [CheckpointStateSize]byte
-	if err := superblock.State.Checkpoint.Encode(encoded[:]); err != nil {
+	if err := superblock.State.Checkpoint.encode(encoded[:]); err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := DecodeCheckpointState(encoded[:], checkpointValidation)
+	decoded, err := decodeCheckpointState(encoded[:], checkpointValidation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decoded != superblock.State.Checkpoint {
 		t.Fatal("checkpoint round trip changed state")
 	}
-	id, err := decoded.ID()
+	id, err := decoded.ID(ChecksumAEGIS128L)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id != protocol.CheckpointID(protocol.ChecksumBytes(encoded[:])) {
+	expectedID, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, encoded[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != protocol.CheckpointID(expectedID) {
 		t.Fatalf("checkpoint ID = %x", id)
 	}
 }
@@ -36,7 +40,7 @@ func TestCheckpointRejectsInvalidReferenceAndReservation(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	checkpointValidation := checkpointValidationFor(t, validation)
 	var encoded [CheckpointStateSize]byte
-	if err := superblock.State.Checkpoint.Encode(encoded[:]); err != nil {
+	if err := superblock.State.Checkpoint.encode(encoded[:]); err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,7 +58,7 @@ func TestCheckpointRejectsInvalidReferenceAndReservation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			corrupt := encoded
 			test.mutate(corrupt[:])
-			if _, err := DecodeCheckpointState(corrupt[:], checkpointValidation); !errors.Is(err, ErrInvalidCheckpoint) {
+			if _, err := decodeCheckpointState(corrupt[:], checkpointValidation); !errors.Is(err, ErrInvalidCheckpoint) {
 				t.Fatalf("error = %v, want %v", err, ErrInvalidCheckpoint)
 			}
 		})
@@ -70,7 +74,7 @@ func TestCheckpointRejectsOversizedEWAHTrailer(t *testing.T) {
 	state.AcquiredTrailerLastChecksum = protocol.Checksum{1}
 	state.AcquiredAggregateChecksum = protocol.Checksum{2}
 	state.AcquiredTrailerEncodedSize = 24
-	if err := state.Validate(checkpointValidation); !errors.Is(err, ErrInvalidCheckpoint) {
+	if err := state.validate(checkpointValidation); !errors.Is(err, ErrInvalidCheckpoint) {
 		t.Fatalf("oversized EWAH error = %v", err)
 	}
 }
@@ -92,14 +96,14 @@ func TestSuperblockCopiesShareLogicalChecksum(t *testing.T) {
 		t.Fatal("physical copy indexes are equal")
 	}
 
-	firstCandidate, err := DecodeSuperblock(first[:], 0, validation)
+	firstCandidate, err := decodeSuperblock(first[:], 0, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstCandidate.MisdirectedIndex {
 		t.Fatal("correct physical index marked misdirected")
 	}
-	misdirected, err := DecodeSuperblock(first[:], 1, validation)
+	misdirected, err := decodeSuperblock(first[:], 1, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,16 +118,16 @@ func TestSuperblockSelectionPrefersNewestOpenQuorum(t *testing.T) {
 
 	newer := old
 	newer.Sequence = 2
-	newer.ParentChecksum = oldCandidates[0].Superblock.Checksum
+	newer.ParentChecksum = oldCandidates[0].superblockRecord.Checksum
 	newer.State.View = 1
 	newCandidates := encodeSuperblockCopies(t, newer, validation, 2, 3)
 	candidates := append(oldCandidates, newCandidates...)
-	selected, err := SelectSuperblock(candidates, 4)
+	selected, err := selectSuperblock(candidates, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Superblock.Sequence != 2 {
-		t.Fatalf("selected sequence = %d, want 2", selected.Superblock.Sequence)
+	if selected.superblockRecord.Sequence != 2 {
+		t.Fatalf("selected sequence = %d, want 2", selected.superblockRecord.Sequence)
 	}
 }
 
@@ -135,7 +139,7 @@ func TestSuperblockSelectionRejectsForkAndRegression(t *testing.T) {
 		fork := base
 		fork.State.View = 1
 		forkCandidates := encodeSuperblockCopies(t, fork, validation, 2, 3)
-		_, err := SelectSuperblock(append(baseCandidates, forkCandidates...), 4)
+		_, err := selectSuperblock(append(baseCandidates, forkCandidates...), 4)
 		if !errors.Is(err, ErrSuperblockFork) {
 			t.Fatalf("error = %v, want %v", err, ErrSuperblockFork)
 		}
@@ -147,9 +151,9 @@ func TestSuperblockSelectionRejectsForkAndRegression(t *testing.T) {
 		olderCandidates := encodeSuperblockCopies(t, older, validation, 0, 1)
 		newer := base
 		newer.Sequence = 2
-		newer.ParentChecksum = olderCandidates[0].Superblock.Checksum
+		newer.ParentChecksum = olderCandidates[0].superblockRecord.Checksum
 		newCandidates := encodeSuperblockCopies(t, newer, validation, 2, 3)
-		_, err := SelectSuperblock(append(olderCandidates, newCandidates...), 4)
+		_, err := selectSuperblock(append(olderCandidates, newCandidates...), 4)
 		if !errors.Is(err, ErrInvalidSuperblock) {
 			t.Fatalf("error = %v, want %v", err, ErrInvalidSuperblock)
 		}
@@ -176,14 +180,14 @@ func TestSuperblockRejectsCorruptionAndReservedBytes(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			corrupt := encoded
 			test.mutate(corrupt[:])
-			if _, err := DecodeSuperblock(corrupt[:], 0, validation); !errors.Is(err, ErrInvalidSuperblock) {
+			if _, err := decodeSuperblock(corrupt[:], 0, validation); !errors.Is(err, ErrInvalidSuperblock) {
 				t.Fatalf("error = %v, want %v", err, ErrInvalidSuperblock)
 			}
 		})
 	}
 }
 
-func validSuperblockFixture(t testing.TB) (SuperblockValidation, Superblock) {
+func validSuperblockFixture(t testing.TB) (superblockValidation, superblockRecord) {
 	t.Helper()
 	cluster := DefaultClusterConfig()
 	blockBase, ok := cluster.BlockBase()
@@ -197,7 +201,10 @@ func validSuperblockFixture(t testing.TB) (SuperblockValidation, Superblock) {
 		LocalMember: protocol.MemberID{1},
 	}
 	rootHeader := validRootHeader(t, group, membership.ActiveCount)
-	emptyChecksum := protocol.ChecksumBytes(nil)
+	emptyChecksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	checkpoint := CheckpointState{
 		Header:                    rootHeader,
 		AcquiredAggregateChecksum: emptyChecksum,
@@ -206,18 +213,18 @@ func validSuperblockFixture(t testing.TB) (SuperblockValidation, Superblock) {
 		LogicalStorageSize:        blockBase,
 		Release:                   1,
 	}
-	validation := SuperblockValidation{
+	validation := superblockValidation{
 		Group:                 group,
 		Membership:            membership,
 		ConfigurationChecksum: cluster.Fingerprint(),
 		Cluster:               cluster,
 	}
-	superblock := Superblock{
+	superblock := superblockRecord{
 		FormatVersion: protocol.FormatVersion,
 		Release:       1,
 		Sequence:      1,
 		Group:         group,
-		State: DurableReplicaState{
+		State: durableReplicaState{
 			Checkpoint:  checkpoint,
 			LocalMember: membership.LocalMember,
 			Members:     membership.Members,
@@ -241,22 +248,22 @@ func validRootHeader(t testing.TB, group protocol.GroupID, memberCount uint8) [p
 		Author:   0,
 	}
 	header.Fields[124] = byte(protocol.OperationRoot)
-	if err := protocol.SealFrame(encoded[:], &header); err != nil {
+	if err := protocol.SealFrame(encoded[:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
-	if _, reason := protocol.DecodeHeader(encoded[:], group, 1<<20, memberCount); reason != protocol.RejectNone {
+	if _, reason := protocol.DecodeHeader(encoded[:], group, 1<<20, memberCount, protocol.ChecksumAEGIS128L); reason != protocol.RejectNone {
 		t.Fatalf("root header reason = %d", reason)
 	}
 	return encoded
 }
 
-func checkpointValidationFor(t testing.TB, validation SuperblockValidation) CheckpointValidation {
+func checkpointValidationFor(t testing.TB, validation superblockValidation) checkpointRules {
 	t.Helper()
 	blockBase, ok := validation.Cluster.BlockBase()
 	if !ok {
 		t.Fatal("BlockBase overflow")
 	}
-	return CheckpointValidation{
+	return checkpointRules{
 		Group:          validation.Group,
 		MessageSizeMax: uint32(validation.Cluster.MessageSizeMax),
 		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
@@ -266,15 +273,15 @@ func checkpointValidationFor(t testing.TB, validation SuperblockValidation) Chec
 	}
 }
 
-func encodeSuperblockCopies(t testing.TB, superblock Superblock, validation SuperblockValidation, indexes ...uint16) []SuperblockCandidate {
+func encodeSuperblockCopies(t testing.TB, superblock superblockRecord, validation superblockValidation, indexes ...uint16) []superblockCandidate {
 	t.Helper()
-	candidates := make([]SuperblockCandidate, 0, len(indexes))
+	candidates := make([]superblockCandidate, 0, len(indexes))
 	for _, index := range indexes {
 		var encoded [SuperblockBytes]byte
 		if err := superblock.Encode(encoded[:], index, validation); err != nil {
 			t.Fatal(err)
 		}
-		candidate, err := DecodeSuperblock(encoded[:], index, validation)
+		candidate, err := decodeSuperblock(encoded[:], index, validation)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -284,7 +291,10 @@ func encodeSuperblockCopies(t testing.TB, superblock Superblock, validation Supe
 }
 
 func resealSuperblock(encoded []byte) {
-	checksum := protocol.ChecksumBytes(encoded[34:])
+	checksum, err := protocol.ChecksumBytes(protocol.ChecksumAEGIS128L, encoded[34:])
+	if err != nil {
+		panic(err)
+	}
 	copy(encoded[:16], checksum[:])
 }
 
@@ -309,7 +319,7 @@ func TestFormatAndOpenSuperblockStoreWithWyhash128(t *testing.T) {
 	group := protocol.GroupID{7}
 	path := filepath.Join(t.TempDir(), "wyhash.vsr")
 
-	formatStorage, err := OpenFileStorage(path, true, false)
+	formatStorage, err := OpenFileStorage(path, FileStorageOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +336,7 @@ func TestFormatAndOpenSuperblockStoreWithWyhash128(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	storage, err := OpenFileStorage(path, false, false)
+	storage, err := OpenFileStorage(path, FileStorageOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,13 +346,13 @@ func TestFormatAndOpenSuperblockStoreWithWyhash128(t *testing.T) {
 		}
 	}()
 
-	validation := SuperblockValidation{
+	validation := superblockValidation{
 		Group:                 group,
 		Membership:            membership,
 		ConfigurationChecksum: cluster.Fingerprint(),
 		Cluster:               cluster,
 	}
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,13 +366,13 @@ func TestFormatAndOpenSuperblockStoreWithWyhash128(t *testing.T) {
 	if aegisCluster.Fingerprint() == cluster.Fingerprint() {
 		t.Fatal("AEGIS128L and Wyhash128 fingerprints collided")
 	}
-	aegisValidation := SuperblockValidation{
+	aegisValidation := superblockValidation{
 		Group:                 group,
 		Membership:            membership,
 		ConfigurationChecksum: aegisCluster.Fingerprint(),
 		Cluster:               aegisCluster,
 	}
-	if _, err := OpenSuperblockStore(storage, aegisValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
+	if _, err := openSuperblockStore(storage, aegisValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
 		t.Fatalf("mismatched checksum algorithm error = %v, want %v", err, ErrIncompatibleConfiguration)
 	}
 }
@@ -378,7 +388,7 @@ func TestSuperblockAEGIS128LRejectedUnderWyhash128Config(t *testing.T) {
 	wyhashValidation := validation
 	wyhashValidation.Cluster = wyhashCluster
 	wyhashValidation.ConfigurationChecksum = wyhashCluster.Fingerprint()
-	if _, err := DecodeSuperblock(encoded[:], 0, wyhashValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
+	if _, err := decodeSuperblock(encoded[:], 0, wyhashValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
 		t.Fatalf("AEGIS superblock under Wyhash config error = %v, want %v", err, ErrIncompatibleConfiguration)
 	}
 }
@@ -405,7 +415,7 @@ func TestRequireHardwareChecksumOptIn(t *testing.T) {
 		t.Fatalf("software process validate error = %v, want %v", err, ErrHardwareChecksumUnavailable)
 	}
 
-	optInStorage, err := OpenFileStorage(filepath.Join(t.TempDir(), "optin.vsr"), true, false)
+	optInStorage, err := OpenFileStorage(filepath.Join(t.TempDir(), "optin.vsr"), FileStorageOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}

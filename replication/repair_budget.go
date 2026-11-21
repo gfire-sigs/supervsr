@@ -39,7 +39,7 @@ func newJournalRepairBudget(active uint8, local protocol.ReplicaIndex) (journalR
 	return budget, nil
 }
 
-func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *DeterministicRandom) (protocol.ReplicaIndex, bool) {
+func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *deterministicRandom) (protocol.ReplicaIndex, bool) {
 	if random == nil || budget.outstanding == budget.capacity {
 		return 0, false
 	}

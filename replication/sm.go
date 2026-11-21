@@ -92,15 +92,20 @@ const (
 	startPending
 )
 
+// StartResult holds either an immediately completed synchronous result (via Ready)
+// or a marker that the operation will finish asynchronously via SMCompletion (via Pending).
 type StartResult[T any] struct {
 	state startState
 	value T
 }
 
+// Ready constructs an immediately completed synchronous StartResult.
 func Ready[T any](value T) StartResult[T] {
 	return StartResult[T]{state: startReady, value: value}
 }
 
+// Pending constructs an asynchronous StartResult that completes when
+// SMCompletion.Complete is invoked.
 func Pending[T any]() StartResult[T] {
 	return StartResult[T]{state: startPending}
 }
@@ -148,6 +153,8 @@ type SMCompletion struct {
 	result     SMResult
 }
 
+// Complete delivers an asynchronous state machine operation result to the
+// owning Replica. It returns ErrCompletionGeneration if stale or already completed.
 func (completion *SMCompletion) Complete(result SMResult) error {
 	if !completion.state.CompareAndSwap(1, 2) {
 		return ErrCompletionGeneration
@@ -186,6 +193,11 @@ func (completion *SMCompletion) take(generation uint64) (SMResult, bool) {
 	return result, true
 }
 
+// StateMachine defines the deterministic replicated application driven by a Replica.
+// Replica invokes all StateMachine methods sequentially on its event-loop thread,
+// except that asynchronous operations completed via SMCompletion.Complete may be
+// signaled from background worker goroutines. Implementations must return ErrStateMachine
+// or wrap domain errors, and Replica.Close takes responsibility for calling Close.
 type StateMachine interface {
 	Capacities() StateMachineCapacities
 	Validate(input ValidateInput) ValidationResult

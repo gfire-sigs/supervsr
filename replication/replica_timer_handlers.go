@@ -46,7 +46,7 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 	}
 }
 
-func (replica *Replica) tickTimer(timeout *Timeout) bool {
+func (replica *Replica) tickTimer(timeout *tickTimeout) bool {
 	fired, err := timeout.Tick()
 	if err != nil {
 		replica.fail(err)
@@ -108,7 +108,7 @@ func (replica *Replica) handleExitTimeout(sample TimeSample) {
 	if replica.status != StatusNormal || replica.isPrimary() {
 		return
 	}
-	if replica.failureDetector.Level(sample.Monotonic) == FailureRed {
+	if replica.failureDetector.Level(sample.Monotonic) == failureRed {
 		replica.sendExitView()
 	}
 }
@@ -165,7 +165,7 @@ func (replica *Replica) sendPing(sample TimeSample) {
 	binary.LittleEndian.PutUint64(header.Fields[16:24], uint64(replica.checkpoint.PrepareOp()))
 	binary.LittleEndian.PutUint64(header.Fields[24:32], max(uint64(1), sample.Monotonic))
 	binary.LittleEndian.PutUint16(header.Fields[32:34], uint16(len(replica.releaseHistory)))
-	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
+	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.BroadcastReplicas(message)
 	}
 	message.Release()
@@ -181,7 +181,7 @@ func (replica *Replica) handlePing(header protocol.Header, body []byte) {
 	response := protocol.Header{Group: replica.config.Group, View: replica.durableView, Release: replica.config.CurrentRelease, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPong, Author: replica.local}
 	copy(response.Fields[:8], header.Fields[24:32])
 	binary.LittleEndian.PutUint64(response.Fields[8:16], max(uint64(1), replica.deps.Clock.Now().Wall))
-	if message.SealWith(&response, replica.config.Cluster.ChecksumAlgorithm) == nil {
+	if message.Seal(&response, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(header.Author, message)
 	}
 	message.Release()
@@ -211,7 +211,7 @@ func (replica *Replica) sendCommit(sample TimeSample) {
 	binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(replica.checkpoint.PrepareOp()))
 	binary.LittleEndian.PutUint64(header.Fields[56:64], uint64(replica.commitMin))
 	binary.LittleEndian.PutUint64(header.Fields[64:72], max(uint64(1), sample.Monotonic))
-	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
+	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.BroadcastReplicas(message)
 	}
 	message.Release()
@@ -223,7 +223,7 @@ func (replica *Replica) sendExitView() {
 		return
 	}
 	header := protocol.Header{Group: replica.config.Group, View: replica.view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandExitView, Author: replica.local}
-	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
+	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.handleExitView(header)
 		replica.deps.MessageBus.BroadcastReplicas(message)
 	}
@@ -243,7 +243,7 @@ func (replica *Replica) createPulse(sample TimeSample) error {
 	binary.LittleEndian.PutUint64(header.Fields[104:112], uint64(replica.commitMin))
 	binary.LittleEndian.PutUint64(header.Fields[112:120], timestamp)
 	header.Fields[124] = byte(protocol.OperationPulse)
-	if err := prepare.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
+	if err := prepare.Seal(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		prepare.Release()
 		return err
 	}

@@ -236,7 +236,7 @@ func TestNetworkAppliesPartitionDuplicationAndCorruptionDeterministically(t *tes
 	body, _ := message.Body()
 	body[0] = 7
 	header := protocol.Header{Group: protocol.GroupID{1}, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPing}
-	if err := message.Seal(&header); err != nil {
+	if err := message.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	if err := network.Partition(0, 1); err != nil {
@@ -309,7 +309,7 @@ func TestNetworkControlsAsymmetricDelayReorderingMisdirectionAndReconnect(t *tes
 		body, _ := frame.Body()
 		body[0] = marker
 		header := protocol.Header{Group: protocol.GroupID{1}, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPing}
-		if sealErr := frame.Seal(&header); sealErr != nil {
+		if sealErr := frame.Seal(&header, protocol.ChecksumAEGIS128L); sealErr != nil {
 			t.Fatal(sealErr)
 		}
 		network.ReplicaBus(0).SendReplica(to, frame)
@@ -426,7 +426,7 @@ func TestNetworkReportsDeterministicBackpressure(t *testing.T) {
 		t.Fatal(err)
 	}
 	header := protocol.Header{Group: protocol.GroupID{1}, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPing}
-	if err := message.Seal(&header); err != nil {
+	if err := message.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	network.ReplicaBus(0).SendReplica(1, message)

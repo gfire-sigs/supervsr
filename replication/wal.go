@@ -82,7 +82,7 @@ func DeriveWALLayout(cfg ClusterConfig) (WALLayout, bool) {
 	}, true
 }
 
-type WALSlot struct {
+type walSlot struct {
 	Authoritative   [protocol.HeaderSize]byte
 	Redundant       [protocol.HeaderSize]byte
 	PrepareChecksum protocol.Checksum
@@ -93,20 +93,20 @@ type WALSlot struct {
 	Faulty          bool
 }
 
-type WAL struct {
+type walJournal struct {
 	mu            sync.Mutex
 	storage       Storage
 	config        ClusterConfig
 	group         protocol.GroupID
 	memberCount   uint8
 	layout        WALLayout
-	slots         []WALSlot
+	slots         []walSlot
 	headerRing    []byte
 	prepareBuffer []byte
 	ioActive      bool
 }
 
-func NewWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCount uint8) (*WAL, error) {
+func newWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCount uint8) (*walJournal, error) {
 	layout, ok := DeriveWALLayout(cfg)
 	if !ok || cfg.JournalSlots > uint64(int(^uint(0)>>1)) || cfg.MessageSizeMax > uint64(int(^uint(0)>>1)) || memberCount == 0 {
 		return nil, ErrInvalidWAL
@@ -119,18 +119,18 @@ func NewWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCo
 	if err != nil {
 		return nil, err
 	}
-	wal := &WAL{
+	wal := &walJournal{
 		storage:       storage,
 		config:        cfg,
 		group:         group,
 		memberCount:   memberCount,
 		layout:        layout,
-		slots:         make([]WALSlot, int(cfg.JournalSlots)),
+		slots:         make([]walSlot, int(cfg.JournalSlots)),
 		headerRing:    headerRing,
 		prepareBuffer: prepareBuffer,
 	}
 	for index := range wal.slots {
-		reserved, buildErr := ReservedPrepareHeaderWith(group, protocol.Op(index), memberCount, uint32(cfg.MessageSizeMax), cfg.ChecksumAlgorithm)
+		reserved, buildErr := reservedPrepareHeader(group, protocol.Op(index), memberCount, uint32(cfg.MessageSizeMax), cfg.ChecksumAlgorithm)
 		if buildErr != nil {
 			return nil, buildErr
 		}
@@ -141,11 +141,11 @@ func NewWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCo
 	return wal, nil
 }
 
-func (wal *WAL) Layout() WALLayout {
+func (wal *walJournal) Layout() WALLayout {
 	return wal.layout
 }
 
-func (wal *WAL) Append(frame []byte, reusableThrough protocol.Op) error {
+func (wal *walJournal) Append(frame []byte, reusableThrough protocol.Op) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	var sequence ioSequence
@@ -161,11 +161,11 @@ func (wal *WAL) Append(frame []byte, reusableThrough protocol.Op) error {
 	return nil
 }
 
-func (wal *WAL) beginAppend(sequence *ioSequence, frame []byte, reusableThrough protocol.Op) error {
+func (wal *walJournal) beginAppend(sequence *ioSequence, frame []byte, reusableThrough protocol.Op) error {
 	if wal.ioActive {
 		return ErrIOBackpressure
 	}
-	header, _, reason := protocol.DecodeFrameWith(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	header, _, reason := protocol.DecodeFrame(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidWAL
 	}
@@ -190,7 +190,7 @@ func (wal *WAL) beginAppend(sequence *ioSequence, frame []byte, reusableThrough 
 	return nil
 }
 
-func (wal *WAL) advanceAppend(sequence *ioSequence, frame []byte) error {
+func (wal *walJournal) advanceAppend(sequence *ioSequence, frame []byte) error {
 	slot := &wal.slots[sequence.index]
 	if err := sequence.physical(); err != nil {
 		labels := [...]string{"prepare", "durable prepare", "header", "durable header"}
@@ -222,11 +222,7 @@ func (wal *WAL) advanceAppend(sequence *ioSequence, frame []byte) error {
 	return nil
 }
 
-func ReservedPrepareHeader(group protocol.GroupID, physicalSlot protocol.Op, memberCount uint8, messageSizeMax uint32) ([protocol.HeaderSize]byte, error) {
-	return ReservedPrepareHeaderWith(group, physicalSlot, memberCount, messageSizeMax, ChecksumAEGIS128L)
-}
-
-func ReservedPrepareHeaderWith(group protocol.GroupID, physicalSlot protocol.Op, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
+func reservedPrepareHeader(group protocol.GroupID, physicalSlot protocol.Op, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
 	var encoded [protocol.HeaderSize]byte
 	header := protocol.Header{
 		Group:    group,
@@ -236,115 +232,115 @@ func ReservedPrepareHeaderWith(group protocol.GroupID, physicalSlot protocol.Op,
 	}
 	binary.LittleEndian.PutUint64(header.Fields[96:104], uint64(physicalSlot))
 	header.Fields[124] = byte(protocol.OperationReserved)
-	if err := protocol.SealFrameWith(encoded[:], &header, algorithm); err != nil {
+	if err := protocol.SealFrame(encoded[:], &header, algorithm); err != nil {
 		return [protocol.HeaderSize]byte{}, err
 	}
-	if _, reason := protocol.DecodeHeaderWith(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
+	if _, reason := protocol.DecodeHeader(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
 		return [protocol.HeaderSize]byte{}, ErrInvalidWAL
 	}
 	return encoded, nil
 }
 
-type WALCandidateKind uint8
+type walCandidateKind uint8
 
 const (
-	WALCandidateInvalid WALCandidateKind = iota
-	WALCandidateReserved
-	WALCandidateOrdinary
+	walCandidateInvalid walCandidateKind = iota
+	walCandidateReserved
+	walCandidateOrdinary
 )
 
-type WALCandidate struct {
-	Kind           WALCandidateKind
+type walCandidate struct {
+	Kind           walCandidateKind
 	Op             protocol.Op
 	View           protocol.View
 	HeaderChecksum protocol.Checksum
 	BodyChecksum   protocol.Checksum
 }
 
-type WALRecoveryDecision uint8
+type walRecoveryDecision uint8
 
 const (
-	WALRecoveryClean WALRecoveryDecision = iota
-	WALRecoveryCleanEmpty
-	WALRecoveryLocalRepair
-	WALRecoveryRemoteRepair
-	WALRecoveryTruncate
-	WALRecoveryFail
+	walRecoveryClean walRecoveryDecision = iota
+	walRecoveryCleanEmpty
+	walRecoveryLocalRepair
+	walRecoveryRemoteRepair
+	walRecoveryTruncate
+	walRecoveryFail
 )
 
-type WALRecoveryContext struct {
+type walRecoveryContext struct {
 	PhysicalSlot uint64
 	JournalSlots uint64
 	RetainedMin  protocol.Op
 	PrepareMax   protocol.Op
 	UntrustedMax protocol.Op
-	Installed    WALRecoveryView
+	Installed    walRecoveryView
 }
 
-func ClassifyWALSlot(header, prepare WALCandidate, context WALRecoveryContext) WALRecoveryDecision {
+func classifyWALSlot(header, prepare walCandidate, context walRecoveryContext) walRecoveryDecision {
 	if impossibleWALCandidate(header, context) || impossibleWALCandidate(prepare, context) {
-		return WALRecoveryFail
+		return walRecoveryFail
 	}
 	if futureWALCandidate(header, context) || futureWALCandidate(prepare, context) {
-		return WALRecoveryTruncate
+		return walRecoveryTruncate
 	}
 	obsoleteHeader := obsoleteWALCandidate(header, context.Installed)
 	obsoletePrepare := obsoleteWALCandidate(prepare, context.Installed)
 	if obsoleteHeader || obsoletePrepare {
-		if header.Kind == WALCandidateInvalid || prepare.Kind == WALCandidateInvalid {
-			return WALRecoveryRemoteRepair
+		if header.Kind == walCandidateInvalid || prepare.Kind == walCandidateInvalid {
+			return walRecoveryRemoteRepair
 		}
-		retainedHeader := header.Kind == WALCandidateOrdinary && !obsoleteHeader
-		retainedPrepare := prepare.Kind == WALCandidateOrdinary && !obsoletePrepare
+		retainedHeader := header.Kind == walCandidateOrdinary && !obsoleteHeader
+		retainedPrepare := prepare.Kind == walCandidateOrdinary && !obsoletePrepare
 		if !retainedHeader && !retainedPrepare {
-			return WALRecoveryTruncate
+			return walRecoveryTruncate
 		}
 		if obsoleteHeader && retainedOrdinary(prepare, context) {
-			return WALRecoveryLocalRepair
+			return walRecoveryLocalRepair
 		}
-		return WALRecoveryRemoteRepair
+		return walRecoveryRemoteRepair
 	}
 	switch {
-	case header.Kind == WALCandidateOrdinary && prepare.Kind == WALCandidateOrdinary && candidatesEqual(header, prepare):
-		return WALRecoveryClean
-	case header.Kind == WALCandidateReserved && prepare.Kind == WALCandidateReserved:
-		return WALRecoveryCleanEmpty
-	case header.Kind == WALCandidateReserved && retainedOrdinary(prepare, context):
-		return WALRecoveryLocalRepair
-	case header.Kind == WALCandidateInvalid && retainedOrdinary(prepare, context) && prepare.Op == context.UntrustedMax:
-		return WALRecoveryLocalRepair
-	case header.Kind == WALCandidateOrdinary && retainedOrdinary(prepare, context) && prepare.Op > header.Op:
-		return WALRecoveryLocalRepair
-	case header.Kind == WALCandidateOrdinary && (prepare.Kind == WALCandidateInvalid || prepare.Kind == WALCandidateReserved):
+	case header.Kind == walCandidateOrdinary && prepare.Kind == walCandidateOrdinary && candidatesEqual(header, prepare):
+		return walRecoveryClean
+	case header.Kind == walCandidateReserved && prepare.Kind == walCandidateReserved:
+		return walRecoveryCleanEmpty
+	case header.Kind == walCandidateReserved && retainedOrdinary(prepare, context):
+		return walRecoveryLocalRepair
+	case header.Kind == walCandidateInvalid && retainedOrdinary(prepare, context) && prepare.Op == context.UntrustedMax:
+		return walRecoveryLocalRepair
+	case header.Kind == walCandidateOrdinary && retainedOrdinary(prepare, context) && prepare.Op > header.Op:
+		return walRecoveryLocalRepair
+	case header.Kind == walCandidateOrdinary && (prepare.Kind == walCandidateInvalid || prepare.Kind == walCandidateReserved):
 		// A durable append can lose its body later; recency cannot prove it uncommitted.
-		return WALRecoveryRemoteRepair
-	case header.Kind == WALCandidateInvalid && prepare.Kind != WALCandidateOrdinary:
-		return WALRecoveryRemoteRepair
-	case header.Kind == WALCandidateInvalid && prepare.Kind == WALCandidateOrdinary:
-		return WALRecoveryRemoteRepair
-	case header.Kind == WALCandidateOrdinary && prepare.Kind == WALCandidateOrdinary:
-		return WALRecoveryRemoteRepair
+		return walRecoveryRemoteRepair
+	case header.Kind == walCandidateInvalid && prepare.Kind != walCandidateOrdinary:
+		return walRecoveryRemoteRepair
+	case header.Kind == walCandidateInvalid && prepare.Kind == walCandidateOrdinary:
+		return walRecoveryRemoteRepair
+	case header.Kind == walCandidateOrdinary && prepare.Kind == walCandidateOrdinary:
+		return walRecoveryRemoteRepair
 	default:
-		return WALRecoveryRemoteRepair
+		return walRecoveryRemoteRepair
 	}
 }
 
-func candidatesEqual(left, right WALCandidate) bool {
+func candidatesEqual(left, right walCandidate) bool {
 	return left.Op == right.Op && left.View == right.View && left.HeaderChecksum == right.HeaderChecksum && left.BodyChecksum == right.BodyChecksum
 }
 
-func retainedOrdinary(candidate WALCandidate, context WALRecoveryContext) bool {
-	return candidate.Kind == WALCandidateOrdinary && candidate.Op >= context.RetainedMin && candidate.Op <= context.PrepareMax
+func retainedOrdinary(candidate walCandidate, context walRecoveryContext) bool {
+	return candidate.Kind == walCandidateOrdinary && candidate.Op >= context.RetainedMin && candidate.Op <= context.PrepareMax
 }
 
-func futureWALCandidate(candidate WALCandidate, context WALRecoveryContext) bool {
-	return candidate.Kind == WALCandidateOrdinary && candidate.Op > context.PrepareMax
+func futureWALCandidate(candidate walCandidate, context walRecoveryContext) bool {
+	return candidate.Kind == walCandidateOrdinary && candidate.Op > context.PrepareMax
 }
 
-func impossibleWALCandidate(candidate WALCandidate, context WALRecoveryContext) bool {
-	return candidate.Kind == WALCandidateOrdinary && (context.JournalSlots == 0 || uint64(candidate.Op)%context.JournalSlots != context.PhysicalSlot)
+func impossibleWALCandidate(candidate walCandidate, context walRecoveryContext) bool {
+	return candidate.Kind == walCandidateOrdinary && (context.JournalSlots == 0 || uint64(candidate.Op)%context.JournalSlots != context.PhysicalSlot)
 }
 
-func obsoleteWALCandidate(candidate WALCandidate, installed WALRecoveryView) bool {
-	return candidate.Kind == WALCandidateOrdinary && candidate.Op > installed.HeadOp && candidate.View < installed.LogView
+func obsoleteWALCandidate(candidate walCandidate, installed walRecoveryView) bool {
+	return candidate.Kind == walCandidateOrdinary && candidate.Op > installed.HeadOp && candidate.View < installed.LogView
 }

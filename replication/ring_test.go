@@ -9,7 +9,7 @@ import (
 
 func TestMPSCRingRejectsInvalidCapacity(t *testing.T) {
 	for _, capacity := range []uint64{0, 1, 3, 6, 1 << 63} {
-		_, err := NewMPSCRing[uint64](capacity)
+		_, err := newMPSCRing[uint64](capacity)
 		if !errors.Is(err, ErrInvalidRingCapacity) {
 			t.Fatalf("capacity %d: error = %v, want %v", capacity, err, ErrInvalidRingCapacity)
 		}
@@ -17,7 +17,7 @@ func TestMPSCRingRejectsInvalidCapacity(t *testing.T) {
 }
 
 func TestMPSCRingPreservesFIFOAcrossWrap(t *testing.T) {
-	ring, err := NewMPSCRing[uint64](4)
+	ring, err := newMPSCRing[uint64](4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestMPSCRingPreservesFIFOAcrossWrap(t *testing.T) {
 }
 
 func TestMPSCRingReleasesPoppedReference(t *testing.T) {
-	ring, err := NewMPSCRing[*int](2)
+	ring, err := newMPSCRing[*int](2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestMPSCRingConcurrentProducers(t *testing.T) {
 		producerCount     = 8
 		valuesPerProducer = 20_000
 	)
-	ring, err := NewMPSCRing[uint64](1024)
+	ring, err := newMPSCRing[uint64](1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestMPSCRingConcurrentProducers(t *testing.T) {
 }
 
 func TestMPSCRingSteadyStateHasNoAllocations(t *testing.T) {
-	ring, err := NewMPSCRing[uint64](2)
+	ring, err := newMPSCRing[uint64](2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestMPSCRingSteadyStateHasNoAllocations(t *testing.T) {
 }
 
 func BenchmarkMPSCRingPushPop(b *testing.B) {
-	ring, err := NewMPSCRing[uint64](1024)
+	ring, err := newMPSCRing[uint64](1024)
 	if err != nil {
 		b.Fatal(err)
 	}

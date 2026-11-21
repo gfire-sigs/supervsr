@@ -16,7 +16,7 @@ func TestFormatCreatesRepairableInitialQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage.Crash()
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func TestOpenSuperblockStoreDistinguishesIncompatibleConfiguration(t *testing.T)
 	}
 	storage.Crash()
 	validation.ConfigurationChecksum[0] ^= 0xff
-	if _, err := OpenSuperblockStore(storage, validation); !errors.Is(err, ErrIncompatibleConfiguration) {
+	if _, err := openSuperblockStore(storage, validation); !errors.Is(err, ErrIncompatibleConfiguration) {
 		t.Fatalf("open error = %v, want %v", err, ErrIncompatibleConfiguration)
 	}
 }
@@ -58,7 +58,7 @@ func TestFormatCrashBeforeWriteQuorumRemainsUnformatted(t *testing.T) {
 			}
 			storage.Crash()
 			durableCopies := validInitialCopyCount(storage, validation)
-			store, err := OpenSuperblockStore(storage, validation)
+			store, err := openSuperblockStore(storage, validation)
 			if durableCopies < int(writeQuorum) {
 				if !errors.Is(err, ErrUnformatted) {
 					t.Fatalf("durable copies %d: open error = %v, want %v", durableCopies, err, ErrUnformatted)
@@ -93,7 +93,7 @@ func TestSuperblockUpdateCrashSelectsOnlyDurableQuorum(t *testing.T) {
 				t.Fatal(err)
 			}
 			storage.Crash()
-			store, err := OpenSuperblockStore(storage, validation)
+			store, err := openSuperblockStore(storage, validation)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -108,7 +108,7 @@ func TestSuperblockUpdateCrashSelectsOnlyDurableQuorum(t *testing.T) {
 			}
 			storage.Crash()
 			durableNewCopies := validSequenceCopyCount(storage, validation, 2)
-			reopened, err := OpenSuperblockStore(storage, validation)
+			reopened, err := openSuperblockStore(storage, validation)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -123,7 +123,7 @@ func TestSuperblockUpdateCrashSelectsOnlyDurableQuorum(t *testing.T) {
 	}
 }
 
-func formatFixture(t testing.TB) (FormatConfig, SuperblockValidation) {
+func formatFixture(t testing.TB) (FormatConfig, superblockValidation) {
 	t.Helper()
 	cluster := compactTestClusterConfig()
 	if err := cluster.Validate(3, 0); err != nil {
@@ -140,7 +140,7 @@ func formatFixture(t testing.TB) (FormatConfig, SuperblockValidation) {
 		Cluster:        cluster,
 		CurrentRelease: 1,
 	}
-	return cfg, SuperblockValidation{
+	return cfg, superblockValidation{
 		Group:                 cfg.Group,
 		Membership:            membership,
 		ConfigurationChecksum: cluster.Fingerprint(),
@@ -148,19 +148,19 @@ func formatFixture(t testing.TB) (FormatConfig, SuperblockValidation) {
 	}
 }
 
-func validInitialCopyCount(storage *crashStorage, validation SuperblockValidation) int {
+func validInitialCopyCount(storage *crashStorage, validation superblockValidation) int {
 	return validSequenceCopyCount(storage, validation, 1)
 }
 
-func validSequenceCopyCount(storage *crashStorage, validation SuperblockValidation, sequence uint64) int {
+func validSequenceCopyCount(storage *crashStorage, validation superblockValidation, sequence uint64) int {
 	if len(storage.working) < int(validation.Cluster.SuperblockCopies)*SuperblockBytes {
 		return 0
 	}
 	count := 0
 	for index := range int(validation.Cluster.SuperblockCopies) {
 		start := index * SuperblockBytes
-		candidate, err := DecodeSuperblock(storage.working[start:start+SuperblockBytes], uint16(index), validation)
-		if err == nil && candidate.Superblock.Sequence == sequence {
+		candidate, err := decodeSuperblock(storage.working[start:start+SuperblockBytes], uint16(index), validation)
+		if err == nil && candidate.superblockRecord.Sequence == sequence {
 			count++
 		}
 	}

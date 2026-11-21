@@ -45,6 +45,8 @@ var (
 	aegisConstant1 = [16]byte{0x00, 0x01, 0x01, 0x02, 0x03, 0x05, 0x08, 0x0d, 0x15, 0x22, 0x37, 0x59, 0x90, 0xe9, 0x79, 0x62}
 )
 
+// ChecksumHasher computes incremental 128-bit digests under the configured
+// ChecksumAlgorithm without heap allocations.
 type ChecksumHasher struct {
 	algorithm ChecksumAlgorithm
 	state     [8][16]byte
@@ -54,29 +56,16 @@ type ChecksumHasher struct {
 	length    uint64
 }
 
-func NewChecksumHasher() ChecksumHasher {
+// NewChecksumHasher constructs an initialized ChecksumHasher for algorithm.
+func NewChecksumHasher(algorithm ChecksumAlgorithm) (ChecksumHasher, error) {
 	var hasher ChecksumHasher
-	hasher.Reset()
-	return hasher
-}
-
-func NewChecksumHasherWith(algorithm ChecksumAlgorithm) (ChecksumHasher, error) {
-	var hasher ChecksumHasher
-	if err := hasher.ResetWith(algorithm); err != nil {
+	if err := hasher.Reset(algorithm); err != nil {
 		return ChecksumHasher{}, err
 	}
 	return hasher, nil
 }
 
-func (hasher *ChecksumHasher) Reset() {
-	algorithm := hasher.algorithm
-	if !algorithm.Valid() {
-		algorithm = ChecksumAEGIS128L
-	}
-	_ = hasher.ResetWith(algorithm)
-}
-
-func (hasher *ChecksumHasher) ResetWith(algorithm ChecksumAlgorithm) error {
+func (hasher *ChecksumHasher) Reset(algorithm ChecksumAlgorithm) error {
 	if !algorithm.Valid() {
 		return ErrInvalidChecksumAlgorithm
 	}
@@ -154,21 +143,24 @@ func (hasher ChecksumHasher) Sum() Checksum {
 	return checksum
 }
 
-func ChecksumBytes(input []byte) Checksum {
-	hasher := NewChecksumHasher()
-	_, err := hasher.Write(input)
+func aegisChecksumBytes(input []byte) Checksum {
+	hasher, err := NewChecksumHasher(ChecksumAEGIS128L)
 	if err != nil {
+		panic(err)
+	}
+	if _, err := hasher.Write(input); err != nil {
 		panic(err)
 	}
 	return hasher.Sum()
 }
 
-func ChecksumBytesWith(algorithm ChecksumAlgorithm, input []byte) (Checksum, error) {
+// ChecksumBytes computes the 128-bit digest of input using algorithm.
+func ChecksumBytes(algorithm ChecksumAlgorithm, input []byte) (Checksum, error) {
 	if !algorithm.Valid() {
 		return Checksum{}, ErrInvalidChecksumAlgorithm
 	}
 	if algorithm == ChecksumAEGIS128L {
-		return ChecksumBytes(input), nil
+		return aegisChecksumBytes(input), nil
 	}
 	state := [4]uint64{wySecret0, wySecret1, wySecret2, wySecret3}
 	totalLen := uint64(len(input))

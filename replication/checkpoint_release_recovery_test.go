@@ -39,7 +39,7 @@ func checkpointWithUnrecordedRelease(t testing.TB) (*Replica, *crashStorage, uin
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, reason := protocol.DecodeHeader(checkpoint.Header[:], config.Group, uint32(cluster.MessageSizeMax), 3)
+	root, reason := protocol.DecodeHeader(checkpoint.Header[:], config.Group, uint32(cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatal(reason)
 	}

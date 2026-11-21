@@ -28,7 +28,7 @@ func TestReplaceLostReplicaFencesAdvancesPipelineAndFormatsFutureView(t *testing
 		t.Fatalf("noops = %d, want %d", client.noops, format.Cluster.PipelineMax-1)
 	}
 	storage.Crash()
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestReplaceLostReplicaCrashSelectsOnlyDurableReplacementQuorum(t *testing.T
 			}
 			storage.Crash()
 			durableCopies := validSequenceCopyCount(storage, validation, 1)
-			store, openErr := OpenSuperblockStore(storage, validation)
+			store, openErr := openSuperblockStore(storage, validation)
 			if durableCopies < int(writeQuorum) {
 				if !errors.Is(openErr, ErrUnformatted) {
 					t.Fatalf("durable copies %d: open error = %v, want %v", durableCopies, openErr, ErrUnformatted)

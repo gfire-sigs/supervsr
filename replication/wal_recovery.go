@@ -12,27 +12,27 @@ var ErrWALRecovery = errors.New("replication: WAL recovery failed")
 
 // WALRecoveryView is the head selected when LogView was durably installed.
 // Later prepares in that log view are not bounded by HeadOp.
-type WALRecoveryView struct {
+type walRecoveryView struct {
 	LogView protocol.View
 	HeadOp  protocol.Op
 }
 
-type WALRecoveryReport struct {
+type walRecoveryReport struct {
 	HeadOp       protocol.Op
 	HeadHeader   protocol.Header
 	FaultySlots  uint32
 	UntrustedMax protocol.Op
 }
 
-func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, installed WALRecoveryView) (WALRecoveryReport, error) {
+func (wal *walJournal) Recover(checkpoint CheckpointState, commitMax protocol.Op, installed walRecoveryView) (walRecoveryReport, error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	if err := wal.storage.ReadAt(wal.headerRing, wal.layout.HeaderBase); err != nil {
-		return WALRecoveryReport{}, errors.Join(ErrWALRecovery, err)
+		return walRecoveryReport{}, errors.Join(ErrWALRecovery, err)
 	}
 	count := len(wal.slots)
-	headerCandidates := make([]WALCandidate, count)
-	prepareCandidates := make([]WALCandidate, count)
+	headerCandidates := make([]walCandidate, count)
+	prepareCandidates := make([]walCandidate, count)
 	prepareHeaders := make([][protocol.HeaderSize]byte, count)
 	untrustedMax := checkpoint.PrepareOp()
 	for slot := range count {
@@ -42,10 +42,10 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 		clear(wal.prepareBuffer)
 		offset, ok := wal.prepareOffset(uint64(slot))
 		if !ok {
-			return WALRecoveryReport{}, ErrWALRecovery
+			return walRecoveryReport{}, ErrWALRecovery
 		}
 		if err := wal.storage.ReadAt(wal.prepareBuffer, offset); err != nil {
-			return WALRecoveryReport{}, errors.Join(ErrWALRecovery, err)
+			return walRecoveryReport{}, errors.Join(ErrWALRecovery, err)
 		}
 		candidate, encoded := wal.decodeRecoveryPrepare(wal.prepareBuffer, uint64(slot))
 		prepareCandidates[slot] = candidate
@@ -54,13 +54,13 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 	}
 	prepareMax, ok := wal.prepareMaximum(checkpoint.PrepareOp())
 	if !ok {
-		return WALRecoveryReport{}, ErrWALRecovery
+		return walRecoveryReport{}, ErrWALRecovery
 	}
 	repairHeaders := false
 	faulty := uint32(0)
 	firstFaulty := -1
 	for slot := range count {
-		context := WALRecoveryContext{
+		context := walRecoveryContext{
 			PhysicalSlot: uint64(slot),
 			JournalSlots: wal.config.JournalSlots,
 			RetainedMin:  checkpoint.PrepareOp(),
@@ -68,21 +68,21 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 			UntrustedMax: untrustedMax,
 			Installed:    installed,
 		}
-		decision := ClassifyWALSlot(headerCandidates[slot], prepareCandidates[slot], context)
+		decision := classifyWALSlot(headerCandidates[slot], prepareCandidates[slot], context)
 		switch decision {
-		case WALRecoveryClean:
+		case walRecoveryClean:
 			wal.installRecoveredSlot(slot, prepareHeaders[slot], prepareCandidates[slot], false)
-		case WALRecoveryCleanEmpty:
+		case walRecoveryCleanEmpty:
 			wal.installReservedSlot(slot)
-		case WALRecoveryLocalRepair:
+		case walRecoveryLocalRepair:
 			wal.installRecoveredSlot(slot, prepareHeaders[slot], prepareCandidates[slot], false)
 			copy(wal.headerRing[slot*protocol.HeaderSize:(slot+1)*protocol.HeaderSize], prepareHeaders[slot][:])
 			repairHeaders = true
-		case WALRecoveryTruncate:
+		case walRecoveryTruncate:
 			wal.installReservedSlot(slot)
 			copy(wal.headerRing[slot*protocol.HeaderSize:(slot+1)*protocol.HeaderSize], wal.slots[slot].Authoritative[:])
 			repairHeaders = true
-		case WALRecoveryRemoteRepair:
+		case walRecoveryRemoteRepair:
 			wal.installReservedSlot(slot)
 			wal.slots[slot].Dirty = true
 			wal.slots[slot].Faulty = true
@@ -90,26 +90,26 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 			if firstFaulty == -1 {
 				firstFaulty = slot
 			}
-		case WALRecoveryFail:
-			return WALRecoveryReport{}, fmt.Errorf("%w: impossible physical slot %d", ErrWALRecovery, slot)
+		case walRecoveryFail:
+			return walRecoveryReport{}, fmt.Errorf("%w: impossible physical slot %d", ErrWALRecovery, slot)
 		default:
-			return WALRecoveryReport{}, ErrWALRecovery
+			return walRecoveryReport{}, ErrWALRecovery
 		}
 	}
 	if faulty != 0 && wal.memberCount == 1 {
-		return WALRecoveryReport{}, fmt.Errorf("%w: %d faulty slots, first physical slot %d header=%+v prepare=%+v", ErrWALUncertainSolo, faulty, firstFaulty, headerCandidates[firstFaulty], prepareCandidates[firstFaulty])
+		return walRecoveryReport{}, fmt.Errorf("%w: %d faulty slots, first physical slot %d header=%+v prepare=%+v", ErrWALUncertainSolo, faulty, firstFaulty, headerCandidates[firstFaulty], prepareCandidates[firstFaulty])
 	}
 	if repairHeaders {
 		if err := wal.storage.WriteAt(wal.headerRing, wal.layout.HeaderBase); err != nil {
-			return WALRecoveryReport{}, errors.Join(ErrWALRecovery, err)
+			return walRecoveryReport{}, errors.Join(ErrWALRecovery, err)
 		}
 		if err := wal.storage.Sync(); err != nil {
-			return WALRecoveryReport{}, errors.Join(ErrWALRecovery, err)
+			return walRecoveryReport{}, errors.Join(ErrWALRecovery, err)
 		}
 	}
-	head, reason := protocol.DecodeHeaderWith(checkpoint.Header[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	head, reason := protocol.DecodeHeader(checkpoint.Header[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || head.Command != protocol.CommandPrepare {
-		return WALRecoveryReport{}, ErrWALRecovery
+		return walRecoveryReport{}, ErrWALRecovery
 	}
 	headOp := checkpoint.PrepareOp()
 	for next := headOp + 1; next <= untrustedMax; next++ {
@@ -118,7 +118,7 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 		if !recovered.Inhabited || recovered.Op != next {
 			break
 		}
-		candidate, reason := protocol.DecodeHeaderWith(recovered.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+		candidate, reason := protocol.DecodeHeader(recovered.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || prepareParent(&candidate) != head.HeaderChecksum {
 			break
 		}
@@ -126,12 +126,12 @@ func (wal *WAL) Recover(checkpoint CheckpointState, commitMax protocol.Op, insta
 		headOp = next
 	}
 	if commitMax > headOp && faulty == 0 {
-		return WALRecoveryReport{}, ErrWALRecovery
+		return walRecoveryReport{}, ErrWALRecovery
 	}
-	return WALRecoveryReport{HeadOp: headOp, HeadHeader: head, FaultySlots: faulty, UntrustedMax: untrustedMax}, nil
+	return walRecoveryReport{HeadOp: headOp, HeadHeader: head, FaultySlots: faulty, UntrustedMax: untrustedMax}, nil
 }
 
-func (wal *WAL) ReadPrepare(op protocol.Op, destination []byte) ([]byte, error) {
+func (wal *walJournal) ReadPrepare(op protocol.Op, destination []byte) ([]byte, error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	if uint64(len(destination)) < wal.layout.PrepareStride {
@@ -155,24 +155,24 @@ func (wal *WAL) ReadPrepare(op protocol.Op, destination []byte) ([]byte, error) 
 		return nil, ErrInvalidWAL
 	}
 	frame := physical[:size:size]
-	header, _, reason := protocol.DecodeFrameWith(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	header, _, reason := protocol.DecodeFrame(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare || prepareOp(&header) != op {
 		return nil, ErrInvalidWAL
 	}
 	return frame, nil
 }
-func (wal *WAL) RecoveredHeader(op protocol.Op) (protocol.Header, bool) {
+func (wal *walJournal) RecoveredHeader(op protocol.Op) (protocol.Header, bool) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	slot := &wal.slots[uint64(op)%wal.config.JournalSlots]
 	if !slot.Inhabited || slot.Op != op || slot.Faulty {
 		return protocol.Header{}, false
 	}
-	header, reason := protocol.DecodeHeaderWith(slot.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	header, reason := protocol.DecodeHeader(slot.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	return header, reason == protocol.RejectNone
 }
 
-func (wal *WAL) JoinEvidence(op protocol.Op) (protocol.Header, bool, bool) {
+func (wal *walJournal) JoinEvidence(op protocol.Op) (protocol.Header, bool, bool) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	slot := &wal.slots[uint64(op)%wal.config.JournalSlots]
@@ -182,7 +182,7 @@ func (wal *WAL) JoinEvidence(op protocol.Op) (protocol.Header, bool, bool) {
 	if !slot.Inhabited || slot.Op != op {
 		return protocol.Header{}, false, true
 	}
-	header, reason := protocol.DecodeHeaderWith(slot.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	header, reason := protocol.DecodeHeader(slot.Authoritative[:], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return protocol.Header{}, false, false
 	}
@@ -191,7 +191,7 @@ func (wal *WAL) JoinEvidence(op protocol.Op) (protocol.Header, bool, bool) {
 
 // DiscardAfter invalidates the cache only after the caller has drained writes
 // and durably installed a view whose canonical head excludes this suffix.
-func (wal *WAL) DiscardAfter(head protocol.Op) {
+func (wal *walJournal) DiscardAfter(head protocol.Op) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 	for index := range wal.slots {
@@ -205,51 +205,51 @@ func (wal *WAL) DiscardAfter(head protocol.Op) {
 	}
 }
 
-func (wal *WAL) decodeRecoveryHeader(encoded []byte, physical uint64) WALCandidate {
-	header, reason := protocol.DecodeHeaderWith(encoded, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+func (wal *walJournal) decodeRecoveryHeader(encoded []byte, physical uint64) walCandidate {
+	header, reason := protocol.DecodeHeader(encoded, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
-		return WALCandidate{Kind: WALCandidateInvalid}
+		return walCandidate{Kind: walCandidateInvalid}
 	}
 	return recoveryCandidate(header, physical)
 }
 
-func (wal *WAL) decodeRecoveryPrepare(physical []byte, slot uint64) (WALCandidate, [protocol.HeaderSize]byte) {
+func (wal *walJournal) decodeRecoveryPrepare(physical []byte, slot uint64) (walCandidate, [protocol.HeaderSize]byte) {
 	var encoded [protocol.HeaderSize]byte
 	if allZeroBytes(physical) {
-		reserved, err := ReservedPrepareHeaderWith(wal.group, protocol.Op(slot), wal.memberCount, uint32(wal.config.MessageSizeMax), wal.config.ChecksumAlgorithm)
+		reserved, err := reservedPrepareHeader(wal.group, protocol.Op(slot), wal.memberCount, uint32(wal.config.MessageSizeMax), wal.config.ChecksumAlgorithm)
 		if err != nil {
-			return WALCandidate{Kind: WALCandidateInvalid}, encoded
+			return walCandidate{Kind: walCandidateInvalid}, encoded
 		}
-		return WALCandidate{Kind: WALCandidateReserved, Op: protocol.Op(slot)}, reserved
+		return walCandidate{Kind: walCandidateReserved, Op: protocol.Op(slot)}, reserved
 	}
 	if len(physical) < protocol.HeaderSize {
-		return WALCandidate{Kind: WALCandidateInvalid}, encoded
+		return walCandidate{Kind: walCandidateInvalid}, encoded
 	}
 	size := binary.LittleEndian.Uint32(physical[96:100])
 	if size < protocol.HeaderSize || uint64(size) > wal.layout.PrepareStride || !allZeroBytes(physical[size:]) {
-		return WALCandidate{Kind: WALCandidateInvalid}, encoded
+		return walCandidate{Kind: walCandidateInvalid}, encoded
 	}
-	header, _, reason := protocol.DecodeFrameWith(physical[:size], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
+	header, _, reason := protocol.DecodeFrame(physical[:size], wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
-		return WALCandidate{Kind: WALCandidateInvalid}, encoded
+		return walCandidate{Kind: walCandidateInvalid}, encoded
 	}
 	copy(encoded[:], physical[:protocol.HeaderSize])
 	return recoveryCandidate(header, slot), encoded
 }
 
-func recoveryCandidate(header protocol.Header, physical uint64) WALCandidate {
+func recoveryCandidate(header protocol.Header, physical uint64) walCandidate {
 	op := prepareOp(&header)
 	operation := prepareOperation(&header)
 	if operation == protocol.OperationReserved {
 		if uint64(op) != physical {
-			return WALCandidate{Kind: WALCandidateInvalid}
+			return walCandidate{Kind: walCandidateInvalid}
 		}
-		return WALCandidate{Kind: WALCandidateReserved, Op: op, HeaderChecksum: header.HeaderChecksum, BodyChecksum: header.BodyChecksum}
+		return walCandidate{Kind: walCandidateReserved, Op: op, HeaderChecksum: header.HeaderChecksum, BodyChecksum: header.BodyChecksum}
 	}
-	return WALCandidate{Kind: WALCandidateOrdinary, Op: op, View: header.View, HeaderChecksum: header.HeaderChecksum, BodyChecksum: header.BodyChecksum}
+	return walCandidate{Kind: walCandidateOrdinary, Op: op, View: header.View, HeaderChecksum: header.HeaderChecksum, BodyChecksum: header.BodyChecksum}
 }
 
-func (wal *WAL) installRecoveredSlot(slot int, encoded [protocol.HeaderSize]byte, candidate WALCandidate, faulty bool) {
+func (wal *walJournal) installRecoveredSlot(slot int, encoded [protocol.HeaderSize]byte, candidate walCandidate, faulty bool) {
 	recovered := &wal.slots[slot]
 	recovered.Authoritative = encoded
 	recovered.Redundant = encoded
@@ -260,8 +260,8 @@ func (wal *WAL) installRecoveredSlot(slot int, encoded [protocol.HeaderSize]byte
 	recovered.Faulty = faulty
 }
 
-func (wal *WAL) installReservedSlot(slot int) {
-	reserved, err := ReservedPrepareHeaderWith(wal.group, protocol.Op(slot), wal.memberCount, uint32(wal.config.MessageSizeMax), wal.config.ChecksumAlgorithm)
+func (wal *walJournal) installReservedSlot(slot int) {
+	reserved, err := reservedPrepareHeader(wal.group, protocol.Op(slot), wal.memberCount, uint32(wal.config.MessageSizeMax), wal.config.ChecksumAlgorithm)
 	if err != nil {
 		panic(err)
 	}
@@ -275,7 +275,7 @@ func (wal *WAL) installReservedSlot(slot int) {
 	recovered.Faulty = false
 }
 
-func (wal *WAL) prepareOffset(slot uint64) (uint64, bool) {
+func (wal *walJournal) prepareOffset(slot uint64) (uint64, bool) {
 	offset, ok := checkedMul(slot, wal.layout.PrepareStride)
 	if ok {
 		offset, ok = checkedAdd(wal.layout.PrepareBase, offset)
@@ -283,7 +283,7 @@ func (wal *WAL) prepareOffset(slot uint64) (uint64, bool) {
 	return offset, ok
 }
 
-func (wal *WAL) prepareMaximum(checkpoint protocol.Op) (protocol.Op, bool) {
+func (wal *walJournal) prepareMaximum(checkpoint protocol.Op) (protocol.Op, bool) {
 	interval, ok := wal.config.CheckpointInterval()
 	if !ok {
 		return 0, false
@@ -303,8 +303,8 @@ func (wal *WAL) prepareMaximum(checkpoint protocol.Op) (protocol.Op, bool) {
 	return protocol.Op(maximum), ok
 }
 
-func maxCandidateOp(current protocol.Op, candidate WALCandidate) protocol.Op {
-	if candidate.Kind == WALCandidateOrdinary && candidate.Op > current {
+func maxCandidateOp(current protocol.Op, candidate walCandidate) protocol.Op {
+	if candidate.Kind == walCandidateOrdinary && candidate.Op > current {
 		return candidate.Op
 	}
 	return current

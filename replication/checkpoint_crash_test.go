@@ -71,11 +71,11 @@ func runCheckpointCrashCase(t testing.TB, failAt int, expectFailure bool) int {
 	cancel()
 	storage.Crash()
 
-	validation := SuperblockValidation{
+	validation := superblockValidation{
 		Group: config.Group, Membership: config.Membership,
 		ConfigurationChecksum: config.Cluster.Fingerprint(), Cluster: config.Cluster,
 	}
-	store, err := OpenSuperblockStore(storage, validation)
+	store, err := openSuperblockStore(storage, validation)
 	if err != nil {
 		t.Fatal(err)
 	}
