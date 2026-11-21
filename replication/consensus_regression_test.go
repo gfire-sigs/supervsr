@@ -497,3 +497,355 @@ func TestHandleViewSupersedesStaleRepairView(t *testing.T) {
 		t.Fatalf("superseded recovery progress = %+v", got)
 	}
 }
+
+func encodeTestViewBody(t testing.TB, replica *Replica, headers ...protocol.Header) []byte {
+	t.Helper()
+	body := make([]byte, CheckpointStateSize+len(headers)*protocol.HeaderSize)
+	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+		t.Fatal(err)
+	}
+	for index := range headers {
+		start := CheckpointStateSize + index*protocol.HeaderSize
+		if err := protocol.EncodeHeader(body[start:start+protocol.HeaderSize], &headers[index], protocol.ChecksumAEGIS128L); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return body
+}
+
+func makeTestViewHeader(replica *Replica, view protocol.View, head, commit protocol.Op, nonce protocol.Nonce) protocol.Header {
+	header := protocol.Header{
+		Group:   replica.config.Group,
+		View:    view,
+		Author:  replica.membership.Primary(view),
+		Command: protocol.CommandView,
+	}
+	copy(header.Fields[:16], nonce[:])
+	binary.LittleEndian.PutUint64(header.Fields[16:24], uint64(head))
+	binary.LittleEndian.PutUint64(header.Fields[24:32], uint64(commit))
+	binary.LittleEndian.PutUint64(header.Fields[32:40], uint64(replica.checkpoint.PrepareOp()))
+	return header
+}
+
+func consensusProcessUntilNormal(t testing.TB, replica *Replica) {
+	t.Helper()
+	for range 16 {
+		if replica.Snapshot().Status == StatusNormal {
+			return
+		}
+		consensusProcess(t, replica)
+	}
+}
+
+func consensusPulseWithCommit(t testing.TB, replica *Replica, parent protocol.Header, op, commit protocol.Op, view protocol.View) (*Message, protocol.Header) {
+	t.Helper()
+	message, err := replica.frames.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := protocol.Header{Group: replica.config.Group, View: view, Release: 1, Protocol: protocol.ProtocolVersion, Command: protocol.CommandPrepare, Author: replica.membership.Primary(view)}
+	copy(header.Fields[:16], parent.HeaderChecksum[:])
+	copy(header.Fields[64:80], replica.checkpointID[:])
+	binary.LittleEndian.PutUint64(header.Fields[96:104], uint64(op))
+	binary.LittleEndian.PutUint64(header.Fields[104:112], uint64(commit))
+	binary.LittleEndian.PutUint64(header.Fields[112:120], uint64(op)+100)
+	header.Fields[124] = byte(protocol.OperationPulse)
+	if err := message.Seal(&header, protocol.ChecksumAEGIS128L); err != nil {
+		t.Fatal(err)
+	}
+	return message, header
+}
+
+func TestRepairWindowPreservesAckedSameViewSuffix(t *testing.T) {
+	replica, bus := consensusBackup(t)
+	root := consensusRoot(t, replica)
+
+	headers := make([]protocol.Header, 6)
+	headers[0] = root
+	for op := protocol.Op(1); op <= 4; op++ {
+		message, header := consensusPulse(t, replica, headers[op-1], op, 0)
+		if !replica.handlePrepare(message, header, replica.deps.Clock.Now()) {
+			message.Release()
+			t.Fatalf("prepare %d rejected", op)
+		}
+		headers[op] = header
+		consensusProcess(t, replica)
+	}
+	if got := replica.Snapshot(); got.HeadOp != 4 || got.CommitMin != 0 || got.PipelineLen != 4 {
+		t.Fatalf("unexpected pre-catchup state: %+v", got)
+	}
+	if acks := countConsensusCommand(t, replica, bus, protocol.CommandPrepareOK); acks != 4 {
+		t.Fatalf("prepareOK count = %d, want 4", acks)
+	}
+
+	msg5, hdr5 := consensusPulseWithCommit(t, replica, headers[4], 5, 3, 0)
+	headers[5] = hdr5
+	if replica.handlePrepare(msg5, hdr5, replica.deps.Clock.Now()) {
+		t.Fatal("advanced prepare unexpectedly accepted before commit catchup")
+	}
+	msg5.Release()
+
+	var nonce protocol.Nonce
+	for _, frame := range bus.replicaMessages() {
+		decoded, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
+		if reason == protocol.RejectNone && decoded.Command == protocol.CommandGetView {
+			copy(nonce[:], decoded.Fields[:16])
+		}
+	}
+	if nonce == (protocol.Nonce{}) {
+		t.Fatal("expected CommandGetView with non-zero nonce")
+	}
+
+	viewBody := encodeTestViewBody(t, replica, headers[5], headers[4], headers[3], headers[2], root)
+	replica.handleView(makeTestViewHeader(replica, 0, 5, 3, nonce), viewBody)
+	consensusProcess(t, replica)
+
+	got := replica.Snapshot()
+	if got.Status != StatusNormal || got.CommitMin != 3 || got.CommitMax != 3 {
+		t.Fatalf("same-view catchup status/commit mismatch: %+v", got)
+	}
+	if got.HeadOp != 4 || got.PipelineLen != 1 {
+		t.Fatalf("same-view catchup discarded acked suffix: %+v", got)
+	}
+	if checksum, found := replica.DurableChecksum(4); !found || checksum != headers[4].HeaderChecksum {
+		t.Fatalf("acked op 4 discarded or corrupted: found=%t checksum=%x want=%x", found, checksum, headers[4].HeaderChecksum)
+	}
+
+	retryMsg5, retryHdr5 := consensusPulseWithCommit(t, replica, headers[4], 5, 3, 0)
+	if !replica.handlePrepare(retryMsg5, retryHdr5, replica.deps.Clock.Now()) {
+		retryMsg5.Release()
+		t.Fatal("post-catchup prepare 5 rejected")
+	}
+	consensusProcess(t, replica)
+	if got := replica.Snapshot(); got.HeadOp != 5 || got.CommitMin != 3 {
+		t.Fatalf("post-catchup state = %+v", got)
+	}
+}
+
+func TestRepairWindowDoesNotStampLogViewBeforeCanonicalHead(t *testing.T) {
+	replica, bus := consensusBackup(t)
+	root := consensusRoot(t, replica)
+
+	frames := make([]*Message, 6)
+	headers := make([]protocol.Header, 6)
+	headers[0] = root
+	for op := protocol.Op(1); op <= 5; op++ {
+		msg, hdr := consensusPulse(t, replica, headers[op-1], op, 2)
+		frames[op] = msg
+		headers[op] = hdr
+	}
+	t.Cleanup(func() {
+		for op := 1; op <= 5; op++ {
+			if frames[op] != nil {
+				frames[op].Release()
+			}
+		}
+	})
+
+	viewBody := encodeTestViewBody(t, replica, headers[5], headers[4], headers[3], headers[2], root)
+	replica.handleView(makeTestViewHeader(replica, 3, 5, 4, protocol.Nonce{}), viewBody)
+	if !replica.repairViewValid || !replica.repairViewPartial || replica.repairViewHead != 4 {
+		t.Fatalf("expected partial repair window up to 4: valid=%t partial=%t head=%d", replica.repairViewValid, replica.repairViewPartial, replica.repairViewHead)
+	}
+
+	hdrBody := make([]byte, 4*protocol.HeaderSize)
+	for index := range 4 {
+		if err := protocol.EncodeHeader(hdrBody[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], &headers[index+1], protocol.ChecksumAEGIS128L); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replica.handleHeaders(protocol.Header{Group: replica.config.Group, Author: 0, Command: protocol.CommandHeaders}, hdrBody)
+
+	for op := protocol.Op(1); op <= 4; op++ {
+		replica.continueRecoveringView(uint64(op) * 100)
+		msg := frames[op]
+		frames[op] = nil
+		if !replica.handleRepairPrepare(msg, headers[op], replica.deps.Clock.Now()) {
+			msg.Release()
+			t.Fatalf("repair prepare %d rejected", op)
+		}
+		consensusProcess(t, replica)
+	}
+	consensusProcess(t, replica)
+
+	partial := replica.Snapshot()
+	if partial.CommitMin != 4 || partial.CommitMax != 4 || partial.HeadOp != 4 {
+		t.Fatalf("partial window execution mismatch: %+v", partial)
+	}
+	if partial.View != 3 || partial.DurableView != 3 || partial.LogView != 0 || partial.Status != StatusViewChange {
+		t.Fatalf("partial window stamped premature LogView or Normal status: %+v", partial)
+	}
+
+	sentJoin := false
+	for _, frame := range bus.replicaMessages() {
+		decoded, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 3, protocol.ChecksumAEGIS128L)
+		if reason == protocol.RejectNone && decoded.Command == protocol.CommandJoinView && decoded.View == 3 {
+			logView := protocol.View(binary.LittleEndian.Uint32(decoded.Fields[56:60]))
+			if logView != 0 {
+				t.Fatalf("partial window JoinView advertised premature logView=%d", logView)
+			}
+			sentJoin = true
+		}
+	}
+	if !sentJoin {
+		t.Fatal("expected CommandJoinView in view 3 after partial repair window")
+	}
+
+	// Because LogView remained 0, a subsequent view change preserves sender 2's higher-logView op 5.
+	joinProbe, _, _, _ := canonicalFixture(t)
+	joinProbe.view = 4
+	installJoinRecord(joinProbe, 1, 4, 4, []protocol.Header{headers[4], headers[3], headers[2], headers[1], root}, 0b11111, 0)
+	installJoinRecord(joinProbe, 2, 5, 4, []protocol.Header{headers[5], headers[4], headers[3], headers[2], headers[1]}, 0b11111, 0)
+	joinProbe.joins[2].logView = 2
+	selCommit, selHead, _, selResolved := joinProbe.selectCanonicalSuffix()
+	if !selResolved || selCommit != 4 || selHead != 5 {
+		t.Fatalf("view-4 selection lost higher-logView op 5: commit=%d head=%d resolved=%t", selCommit, selHead, selResolved)
+	}
+
+	replica.handleView(makeTestViewHeader(replica, 3, 5, 4, protocol.Nonce{}), viewBody)
+	replica.continueRecoveringView(600)
+	msg5 := frames[5]
+	frames[5] = nil
+	if !replica.handleRepairPrepare(msg5, headers[5], replica.deps.Clock.Now()) {
+		msg5.Release()
+		t.Fatal("repair prepare 5 rejected")
+	}
+	consensusProcessUntilNormal(t, replica)
+
+	installed := replica.Snapshot()
+	if installed.Status != StatusNormal || installed.View != 3 || installed.DurableView != 3 || installed.LogView != 3 {
+		t.Fatalf("full canonical head did not install view 3: %+v", installed)
+	}
+	if installed.HeadOp != 5 || installed.CommitMin != 4 {
+		t.Fatalf("full canonical head progress mismatch: %+v", installed)
+	}
+}
+
+func TestLaggingPrimarySelectCanonicalSuffixBridgesCommittedGap(t *testing.T) {
+	config, _ := threeReplicaFormat(t)
+	config.Membership.LocalMember = config.Membership.Members[2]
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	storage := &crashStorage{}
+	if err := Format(context.Background(), FormatConfig{Group: config.Group, Membership: config.Membership, Cluster: config.Cluster, CurrentRelease: 1}, FormatDependencies{Storage: storage}); err != nil {
+		t.Fatal(err)
+	}
+	storage.Crash()
+	machine := &testStateMachine{capacities: StateMachineCapacities{
+		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+	}}
+	replica, err := Open(context.Background(), config, Dependencies{
+		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
+		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeReplica(t, replica) })
+
+	root := consensusRoot(t, replica)
+	m1, h1 := consensusPulse(t, replica, root, 1, 0)
+	if !replica.handlePrepare(m1, h1, replica.deps.Clock.Now()) {
+		m1.Release()
+		t.Fatal("prepare 1 rejected")
+	}
+	consensusProcess(t, replica)
+	replica.commitMax = 1
+	consensusProcess(t, replica)
+
+	// Install view 2 where local replica 2 is primary, then prepare divergent uncommitted 2..3.
+	view2Body := encodeTestViewBody(t, replica, h1, root)
+	replica.handleView(makeTestViewHeader(replica, 2, 1, 1, protocol.Nonce{}), view2Body)
+	consensusProcessUntilNormal(t, replica)
+	if got := replica.Snapshot(); got.Status != StatusNormal || got.View != 2 || got.LogView != 2 || !replica.isPrimary() {
+		t.Fatalf("failed to install view 2 on primary 2: %+v", got)
+	}
+
+	m2Old, h2Old := consensusPulse(t, replica, h1, 2, 2)
+	if !replica.acceptPrepare(m2Old, h2Old) {
+		m2Old.Release()
+		t.Fatal("h2_old rejected")
+	}
+	consensusProcess(t, replica)
+	m3Old, h3Old := consensusPulse(t, replica, h2Old, 3, 2)
+	if !replica.acceptPrepare(m3Old, h3Old) {
+		m3Old.Release()
+		t.Fatal("h3_old rejected")
+	}
+	consensusProcess(t, replica)
+
+	// Enter view 5 (primary is also replica 2) with CommitMin=1, HeadOp=3.
+	replica.beginViewChange(5)
+	consensusProcess(t, replica)
+	preJoin := replica.Snapshot()
+	if preJoin.Status != StatusViewChange || preJoin.View != 5 || preJoin.DurableView != 5 {
+		t.Fatalf("unexpected view 5 view state: %+v", preJoin)
+	}
+	if preJoin.CommitMin != 1 || preJoin.HeadOp != 3 {
+		t.Fatalf("unexpected view 5 log progress: %+v", preJoin)
+	}
+
+	m2Can, h2Can := consensusPulse(t, replica, h1, 2, 4)
+	m3Can, h3Can := consensusPulse(t, replica, h2Can, 3, 4)
+	m4Can, h4Can := consensusPulse(t, replica, h3Can, 4, 4)
+	canonicalMsgs := []*Message{m2Can, m3Can, m4Can}
+	canonicalHdrs := []protocol.Header{h2Can, h3Can, h4Can}
+	t.Cleanup(func() {
+		for _, m := range canonicalMsgs {
+			if m != nil {
+				m.Release()
+			}
+		}
+	})
+
+	joinHdrs := []protocol.Header{h4Can, h3Can, h2Can, h1, root}
+	joinBody := make([]byte, len(joinHdrs)*protocol.HeaderSize)
+	for index := range joinHdrs {
+		start := index * protocol.HeaderSize
+		if err := protocol.EncodeHeader(joinBody[start:start+protocol.HeaderSize], &joinHdrs[index], protocol.ChecksumAEGIS128L); err != nil {
+			t.Fatal(err)
+		}
+	}
+	joinHeader := protocol.Header{Group: replica.config.Group, View: 5, Protocol: protocol.ProtocolVersion, Command: protocol.CommandJoinView, Author: 0}
+	binary.LittleEndian.PutUint16(joinHeader.Fields[0:2], 0b11111)
+	binary.LittleEndian.PutUint64(joinHeader.Fields[32:40], 4)
+	binary.LittleEndian.PutUint64(joinHeader.Fields[40:48], 4)
+	binary.LittleEndian.PutUint32(joinHeader.Fields[56:60], 4)
+	replica.handleJoinView(joinHeader, joinBody)
+
+	if replica.status != StatusRecoveringHead || !replica.repairViewValid {
+		t.Fatalf("lagging primary did not enter RecoveringHead: status=%d valid=%t", replica.status, replica.repairViewValid)
+	}
+	if replica.repairViewAncestor != 1 || replica.repairViewCommit != 4 || replica.repairViewHead != 4 {
+		t.Fatalf("lagging primary did not bridge canonical gap: anc=%d commit=%d head=%d",
+			replica.repairViewAncestor, replica.repairViewCommit, replica.repairViewHead)
+	}
+
+	for index := range canonicalMsgs {
+		replica.continueRecoveringView(uint64(index+1) * 100)
+		msg := canonicalMsgs[index]
+		canonicalMsgs[index] = nil
+		if !replica.handleRepairPrepare(msg, canonicalHdrs[index], replica.deps.Clock.Now()) {
+			msg.Release()
+			t.Fatalf("canonical repair prepare %x rejected", canonicalHdrs[index].HeaderChecksum[:4])
+		}
+		consensusProcess(t, replica)
+	}
+	consensusProcessUntilNormal(t, replica)
+
+	got := replica.Snapshot()
+	if got.Status != StatusNormal || got.View != 5 || got.DurableView != 5 || got.LogView != 5 {
+		t.Fatalf("bridged canonical view state mismatch: %+v", got)
+	}
+	if got.CommitMin != 4 || got.HeadOp != 4 {
+		t.Fatalf("bridged canonical view progress mismatch: %+v", got)
+	}
+	for index, expected := range canonicalHdrs {
+		op := protocol.Op(index + 2)
+		if checksum, found := replica.DurableChecksum(op); !found || checksum != expected.HeaderChecksum {
+			t.Fatalf("op %d checksum mismatch: found=%t got=%x want=%x", op, found, checksum, expected.HeaderChecksum)
+		}
+	}
+}

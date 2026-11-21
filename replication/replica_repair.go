@@ -491,6 +491,7 @@ func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op
 	if windowHead <= replica.commitMin {
 		return false
 	}
+	priorHead := max(replica.headOp, replica.repairViewPriorHead)
 	replica.clearRepairView()
 	clear(replica.canonicalHeaders)
 	replica.status = StatusRecoveringHead
@@ -500,7 +501,9 @@ func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op
 	replica.repairViewCommit = windowHead
 	replica.repairViewHead = windowHead
 	replica.repairViewAncestor = replica.commitMin
+	replica.repairViewPriorHead = priorHead
 	replica.repairViewWindow = true
+	replica.repairViewPartial = true
 	replica.commitMax = max(replica.commitMax, commit)
 	replica.repairHeadersLast = 0
 	replica.requestRepairWindowHeaders(replica.deps.Clock.Now().Monotonic)
@@ -596,6 +599,15 @@ func (replica *Replica) finishRecoveringView() {
 			}
 		}
 		replica.advanceCommit()
+		if replica.commitMin < replica.repairViewCommit || replica.commitInFlight() || replica.releaseActivation != 0 {
+			return
+		}
+	}
+	if replica.commitInFlight() || replica.releaseActivation != 0 {
+		return
+	}
+	if replica.repairViewPartial {
+		replica.finishPartialRepairWindow()
 		return
 	}
 	if err := replica.persistView(true, replica.repairViewCommit, replica.repairViewHead, replica.canonicalHeaders[:replica.repairViewCount]); err != nil {
@@ -606,6 +618,98 @@ func (replica *Replica) finishRecoveringView() {
 	replica.repairViewRebuilt = false
 	replica.repairHeader = protocol.Header{}
 	replica.repairHeaderValid = false
+}
+
+func (replica *Replica) finishPartialRepairWindow() {
+	targetView := replica.repairView
+	priorHead := replica.repairViewPriorHead
+	now := replica.deps.Clock.Now().Monotonic
+	if replica.commitMin < replica.commitMax {
+		if !replica.beginRepairWindow(targetView, replica.commitMax) {
+			replica.fail(ErrReplicaInvariant)
+		}
+		return
+	}
+	replica.clearRepairView()
+	if replica.stateSync.head > replica.commitMin && replica.stateSync.view == targetView && replica.stateSync.count > 0 {
+		headers := replica.stateSync.headers[:replica.stateSync.count]
+		if replica.validRecoveringView(targetView, replica.stateSync.commit, replica.stateSync.head, headers) {
+			replica.status = StatusRecoveringHead
+			replica.recordRecoveringView(targetView, replica.stateSync.commit, replica.stateSync.head, headers)
+			return
+		}
+	}
+	if !replica.stateSync.repairing {
+		replica.restoreDurableSuffix(priorHead)
+	}
+	if uint8(replica.local) >= replica.membership.ActiveCount || replica.stateSync.repairing || replica.wal.HasFaultySlots() {
+		replica.status = StatusRecoveringHead
+		replica.requestView(targetView, now)
+		return
+	}
+	replica.status = StatusViewChange
+	replica.exitViewBits = 0
+	replica.invalidateReleaseReports()
+	replica.joinViewBits = 0
+	clear(replica.joins)
+	replica.timers.join.Reset()
+	count := replica.collectLocalSuffix(replica.canonicalHeaders)
+	durableCommit := max(replica.superblocks.Current().State.CommitMax, min(replica.commitMax, replica.durableHeadOp()))
+	if err := replica.persistView(false, durableCommit, replica.headOp, replica.canonicalHeaders[:count]); err != nil {
+		replica.fail(err)
+		return
+	}
+}
+
+func (replica *Replica) restoreDurableSuffix(priorHead protocol.Op) {
+	limit, ok := checkedAdd(uint64(replica.commitMin), uint64(len(replica.pipeline)))
+	if !ok || priorHead <= replica.headOp {
+		return
+	}
+	target := min(priorHead, protocol.Op(limit))
+	if target <= replica.headOp {
+		return
+	}
+	buffer, err := NewAlignedBuffer(replica.wal.Layout().PrepareStride, SectorSize)
+	if err != nil {
+		return
+	}
+	memberCount := replica.membership.ActiveCount + replica.membership.StandbyCount
+	for op := replica.headOp + 1; op <= target; op++ {
+		candidate, found := replica.wal.RecoveredHeader(op)
+		if !found || prepareParent(&candidate) != replica.headChecksum {
+			return
+		}
+		frame, readErr := replica.wal.ReadPrepare(op, buffer)
+		if readErr != nil {
+			return
+		}
+		header, body, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), memberCount, replica.config.Cluster.ChecksumAlgorithm)
+		if reason != protocol.RejectNone || header.HeaderChecksum != candidate.HeaderChecksum {
+			return
+		}
+		message, acquireErr := replica.frames.Acquire(uint32(len(body)))
+		if acquireErr != nil {
+			return
+		}
+		messageBody, bodyErr := message.Body()
+		if bodyErr != nil {
+			message.Release()
+			return
+		}
+		copy(messageBody, body)
+		if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) != nil {
+			message.Release()
+			return
+		}
+		entry, pushed := replica.pushPipeline(message, header)
+		if !pushed {
+			message.Release()
+			return
+		}
+		entry.durable = true
+		replica.lastPrepareTimestamp = max(replica.lastPrepareTimestamp, prepareTimestamp(&header))
+	}
 }
 
 func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {

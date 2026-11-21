@@ -639,6 +639,7 @@ func (replica *Replica) resumeStateSyncLog() {
 			}
 			return
 		}
+		replica.clearRepairView()
 		clear(replica.canonicalHeaders)
 		copy(replica.canonicalHeaders, replica.stateSync.headers[:replica.stateSync.count])
 		replica.status = StatusRecoveringHead

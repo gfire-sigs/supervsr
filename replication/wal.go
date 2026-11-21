@@ -145,6 +145,17 @@ func (wal *walJournal) Layout() WALLayout {
 	return wal.layout
 }
 
+func (wal *walJournal) HasFaultySlots() bool {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	for index := range wal.slots {
+		if wal.slots[index].Faulty {
+			return true
+		}
+	}
+	return false
+}
+
 func (wal *walJournal) Append(frame []byte, reusableThrough protocol.Op) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()

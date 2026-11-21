@@ -184,7 +184,7 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 	next.ParentChecksum = next.Checksum
 	next.Sequence++
 	next.State.Checkpoint = checkpoint
-	next.State.CommitMax = replica.commitMax
+	next.State.CommitMax = max(next.State.CommitMax, min(replica.commitMax, replica.durableHeadOp()))
 	if replica.syncRangeRepaired {
 		next.State.SyncMin = 0
 		next.State.SyncMax = 0

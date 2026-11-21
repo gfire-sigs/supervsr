@@ -237,8 +237,10 @@ type Replica struct {
 	repairViewCommit       protocol.Op
 	repairViewHead         protocol.Op
 	repairViewAncestor     protocol.Op
+	repairViewPriorHead    protocol.Op
 	repairViewRebuilt      bool
 	repairViewWindow       bool
+	repairViewPartial      bool
 	repairViewCount        int
 	repairFrames           []*Message
 	releaseHistory         []protocol.Release
@@ -941,6 +943,18 @@ func (replica *Replica) popPipeline() {
 	*entry = pipelineEntry{generation: generation}
 	replica.pipelineHead = (replica.pipelineHead + 1) % uint32(len(replica.pipeline))
 	replica.pipelineLen--
+}
+
+func (replica *Replica) durableHeadOp() protocol.Op {
+	head := replica.commitMin
+	for offset := range replica.pipelineLen {
+		entry := replica.pipelineEntry(offset)
+		if !entry.durable {
+			break
+		}
+		head = max(head, prepareOp(&entry.header))
+	}
+	return head
 }
 
 func (replica *Replica) checkInvariants() error {
