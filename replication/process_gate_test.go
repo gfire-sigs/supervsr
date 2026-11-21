@@ -65,6 +65,7 @@ type processWireMessage struct {
 	Op      uint64            `json:"op,omitempty"`
 	View    uint32            `json:"view,omitempty"`
 	Error   string            `json:"error,omitempty"`
+	Summary string            `json:"summary,omitempty"`
 	Release protocol.Release  `json:"release,omitempty"`
 }
 
@@ -365,9 +366,10 @@ func runReplicaProcessHelper() error {
 	executor := &processReleaseExecutor{current: release, mode: os.Getenv(processReplicaUpgrade), emitter: emitter, exit: make(chan struct{})}
 	bus := &processReplicaBus{index: index, activeCount: 3, gate: gate, emitter: emitter}
 	logger := zerolog.Nop()
+	metrics := &ReplicaMetrics{}
 	replica, err := Open(context.Background(), config, Dependencies{
 		Storage: gatedStorage, MessageBus: bus, Clock: newProcessGateClock(), Entropy: bytes.NewReader(bytes.Repeat([]byte{byte(index) + 1}, 32)),
-		StateMachine: machine, Logger: &logger, ReleaseExecutor: executor,
+		StateMachine: machine, Metrics: metrics, Logger: &logger, ReleaseExecutor: executor,
 	})
 	if err != nil {
 		_ = storage.Close()
@@ -411,6 +413,23 @@ func runReplicaProcessHelper() error {
 		switch command.Kind {
 		case "handoff_exit":
 			close(executor.exit)
+		case "inspect":
+			snap := replica.Snapshot()
+			ms := metrics.Snapshot()
+			summary := fmt.Sprintf(
+				"status=%d view=%d/%d/%d op=%d/%d/%d cp=%d(r%d) pipe=%d stage=%d primary=%d accepting=%t rej=%d drop=%d prep=%d/%d ack=%d commit=%d vc=%d ioerr=%d bp=%d stall=%d",
+				snap.Status, snap.View, snap.DurableView, snap.LogView,
+				snap.CommitMin, snap.CommitMax, snap.HeadOp,
+				snap.Checkpoint.PrepareOp(), snap.Checkpoint.Release,
+				snap.PipelineLen, snap.CommitStage, snap.Primary,
+				replica.accepting.Load(),
+				ms.FramesRejected, ms.RequestsDropped, ms.PreparesCreated, ms.PreparesDurable,
+				ms.PrepareAcks, ms.OperationsCommitted, ms.ViewChanges,
+				ms.StorageFailures, ms.EventBackpressure, ms.RepairStalls,
+			)
+			if err := emitter.emit(processWireMessage{Kind: "inspected", From: uint8(index), Summary: summary}); err != nil {
+				return err
+			}
 		case "arm":
 			gate.arm(command.Stage)
 			if err := emitter.emit(processWireMessage{Kind: "armed", Stage: command.Stage, From: uint8(index)}); err != nil {
@@ -672,6 +691,9 @@ type processClusterHarness struct {
 	lastReplyFrom  protocol.ReplicaIndex
 	lastReplyView  protocol.View
 	handoff        [3]processWireMessage
+	inspected      [3]string
+	recentFrames   [32]string
+	recentNext     int
 }
 
 func newProcessClusterHarness(t testing.TB) *processClusterHarness {
@@ -741,9 +763,12 @@ func (cluster *processClusterHarness) route(event processReplicaEvent) {
 		cluster.stage = message
 	case "handoff":
 		cluster.handoff[index] = message
+	case "inspected":
+		cluster.inspected[index] = message.Summary
 	case "release_rejected_frame":
 		cluster.t.Logf("replica %d rejected transport frame during release activation: %s", index, message.Error)
 	case "replica_frame":
+		cluster.recordReplicaFrame(uint8(index), message.To, message.Frame)
 		if cluster.dropFromActive && index == cluster.dropFrom && protocol.ReplicaIndex(message.To) != index {
 			return
 		}
@@ -791,7 +816,11 @@ func (cluster *processClusterHarness) wait(timeout time.Duration, ready func() b
 			if cluster.clientEvents != nil {
 				replies = len(cluster.clientEvents.replies)
 			}
-			cluster.t.Fatalf("process gate timed out: stage=%s replies=%d ready=%v counters=%s handoff=%+v stderr=%s", cluster.stage.Stage, replies, cluster.ready, cluster.countersSummary(), cluster.handoff, cluster.stderr())
+			inspected := cluster.collectInspection()
+			cluster.t.Fatalf(
+				"process gate timed out: stage=%s replies=%d ready=%v counters=%s handoff=%+v snapshots=%q recent=%v stderr=%s",
+				cluster.stage.Stage, replies, cluster.ready, cluster.countersSummary(), cluster.handoff, inspected, cluster.recentFramesSummary(), cluster.stderr(),
+			)
 		}
 	}
 }
@@ -858,6 +887,94 @@ func (cluster *processClusterHarness) countersSummary() string {
 		parts[index] = fmt.Sprintf("%d:%d", index, state.Counter)
 	}
 	return fmt.Sprintf("[%s %s %s]", parts[0], parts[1], parts[2])
+}
+
+func (cluster *processClusterHarness) recordReplicaFrame(from, to uint8, frame []byte) {
+	entry := fmt.Sprintf("%d->%d(len=%d)", from, to, len(frame))
+	if len(frame) >= protocol.HeaderSize {
+		header, reason := protocol.DecodeHeader(
+			frame[:protocol.HeaderSize],
+			processGateGroup(),
+			uint32(processGateClusterConfig().MessageSizeMax),
+			3,
+			protocol.ChecksumAEGIS128L,
+		)
+		if reason != protocol.RejectNone {
+			entry = fmt.Sprintf("%d->%d(rej=%d)", from, to, reason)
+		} else {
+			entry = formatTraceHeader(from, to, header)
+		}
+	}
+	cluster.recentFrames[cluster.recentNext%len(cluster.recentFrames)] = entry
+	cluster.recentNext++
+}
+
+func formatTraceHeader(from, to uint8, header protocol.Header) string {
+	switch header.Command {
+	case protocol.CommandPrepare, protocol.CommandPrepareOK:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d op=%d c=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[96:104]), binary.LittleEndian.Uint64(header.Fields[104:112]))
+	case protocol.CommandCommit:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d c=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[56:64]))
+	case protocol.CommandView:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d h=%d c=%d cp=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[16:24]), binary.LittleEndian.Uint64(header.Fields[24:32]), binary.LittleEndian.Uint64(header.Fields[32:40]))
+	case protocol.CommandJoinView:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d h=%d c=%d lv=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[32:40]), binary.LittleEndian.Uint64(header.Fields[40:48]), binary.LittleEndian.Uint32(header.Fields[56:60]))
+	case protocol.CommandGetPrepare:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d op=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[32:40]))
+	case protocol.CommandGetHeaders:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d s=%d e=%d)", from, to, header.Command, header.View, header.Release, binary.LittleEndian.Uint64(header.Fields[0:8]), binary.LittleEndian.Uint64(header.Fields[8:16]))
+	default:
+		return fmt.Sprintf("%d->%d(cmd=%d v=%d r=%d)", from, to, header.Command, header.View, header.Release)
+	}
+}
+
+func (cluster *processClusterHarness) collectInspection() [3]string {
+	var pending [3]bool
+	for index, process := range cluster.processes {
+		cluster.inspected[index] = ""
+		if process == nil {
+			cluster.inspected[index] = "nil"
+			continue
+		}
+		if err := process.send(processWireMessage{Kind: "inspect"}); err != nil {
+			cluster.inspected[index] = fmt.Sprintf("send_err=%v", err)
+			continue
+		}
+		pending[index] = true
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for pending[0] || pending[1] || pending[2] {
+		select {
+		case event := <-cluster.events:
+			index := event.process.index
+			if event.message.Kind == "inspected" && event.process == cluster.processes[index] {
+				pending[index] = false
+			}
+			cluster.route(event)
+		case <-deadline.C:
+			for index := range pending {
+				if pending[index] {
+					cluster.inspected[index] = "timeout"
+				}
+			}
+			return cluster.inspected
+		}
+	}
+	return cluster.inspected
+}
+
+func (cluster *processClusterHarness) recentFramesSummary() []string {
+	total := min(cluster.recentNext, len(cluster.recentFrames))
+	result := make([]string, total)
+	start := 0
+	if cluster.recentNext > len(cluster.recentFrames) {
+		start = cluster.recentNext % len(cluster.recentFrames)
+	}
+	for index := range total {
+		result[index] = cluster.recentFrames[(start+index)%len(cluster.recentFrames)]
+	}
+	return result
 }
 
 func (cluster *processClusterHarness) waitApplied(key string) {
