@@ -416,3 +416,84 @@ func TestCheckpointProgressReleasesWithheldPrepareAcknowledgement(t *testing.T) 
 		t.Fatalf("idle processing repeated acknowledgement: %d", got)
 	}
 }
+
+func TestHandleViewSupersedesStaleRepairView(t *testing.T) {
+	replica, _ := consensusBackup(t)
+	root := consensusRoot(t, replica)
+	encodeViewBody := func(headers ...protocol.Header) []byte {
+		body := make([]byte, CheckpointStateSize+len(headers)*protocol.HeaderSize)
+		if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+			t.Fatal(err)
+		}
+		for index := range headers {
+			start := CheckpointStateSize + index*protocol.HeaderSize
+			if err := protocol.EncodeHeader(body[start:start+protocol.HeaderSize], &headers[index], protocol.ChecksumAEGIS128L); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return body
+	}
+	makeViewHeader := func(view protocol.View, head, commit protocol.Op) protocol.Header {
+		header := protocol.Header{
+			Group:   replica.config.Group,
+			View:    view,
+			Author:  replica.membership.Primary(view),
+			Command: protocol.CommandView,
+		}
+		binary.LittleEndian.PutUint64(header.Fields[16:24], uint64(head))
+		binary.LittleEndian.PutUint64(header.Fields[24:32], uint64(commit))
+		return header
+	}
+
+	staleMsg, staleFirst := consensusPulse(t, replica, root, 1, 2)
+	staleMsg.Release()
+	replica.handleView(makeViewHeader(2, 1, 0), encodeViewBody(staleFirst, root))
+	if replica.status != StatusRecoveringHead || !replica.repairViewValid || replica.repairView != 2 {
+		t.Fatalf("initial repair state status=%d valid=%t repairView=%d", replica.status, replica.repairViewValid, replica.repairView)
+	}
+	if replica.canonicalHeaders[0].HeaderChecksum != staleFirst.HeaderChecksum {
+		t.Fatal("initial repair view did not install canonical header")
+	}
+
+	badSecondMsg, badSecond := consensusPulse(t, replica, staleFirst, 2, 3)
+	badSecondMsg.Release()
+	replica.handleView(makeViewHeader(3, 2, 1), encodeViewBody(badSecond, root))
+	if replica.repairView != 2 || replica.canonicalHeaders[0].HeaderChecksum != staleFirst.HeaderChecksum {
+		t.Fatalf("rejected higher view mutated repair state: repairView=%d", replica.repairView)
+	}
+
+	sameViewMsg, sameViewAlt := consensusPulse(t, replica, root, 1, 2)
+	sameViewMsg.Release()
+	replica.handleView(makeViewHeader(2, 1, 1), encodeViewBody(sameViewAlt, root))
+	if replica.repairView != 2 || replica.canonicalHeaders[0].HeaderChecksum != staleFirst.HeaderChecksum {
+		t.Fatalf("same-view response overwrote active repair view: repairView=%d", replica.repairView)
+	}
+
+	replacementMsg, replacement := consensusPulse(t, replica, root, 1, 3)
+	replica.handleView(makeViewHeader(3, 1, 1), encodeViewBody(replacement, root))
+	if !replica.repairViewValid || replica.repairView != 3 {
+		t.Fatalf("higher view did not supersede stale repair view: valid=%t repairView=%d", replica.repairViewValid, replica.repairView)
+	}
+	if replica.canonicalHeaders[0].HeaderChecksum != replacement.HeaderChecksum {
+		t.Fatal("superseding view did not install replacement header")
+	}
+
+	replica.continueRecoveringView(20)
+	if !replica.handleRepairPrepare(replacementMsg, replacement, replica.deps.Clock.Now()) {
+		replacementMsg.Release()
+		t.Fatal("replacement prepare rejected")
+	}
+	for range 8 {
+		if replica.Snapshot().Status == StatusNormal {
+			break
+		}
+		consensusProcess(t, replica)
+	}
+	got := replica.Snapshot()
+	if got.Status != StatusNormal || got.View != 3 || got.DurableView != 3 || got.LogView != 3 {
+		t.Fatalf("superseded recovery view state = %+v", got)
+	}
+	if got.HeadOp != 1 || got.CommitMin != 1 || got.CommitMax != 1 {
+		t.Fatalf("superseded recovery progress = %+v", got)
+	}
+}

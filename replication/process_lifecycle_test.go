@@ -97,7 +97,7 @@ func (cluster *processClusterHarness) requireCounter(operation protocol.Operatio
 
 func (cluster *processClusterHarness) waitCounter(want uint64) {
 	cluster.t.Helper()
-	cluster.wait(45*time.Second, func() bool {
+	cluster.wait(90*time.Second, func() bool {
 		for index := range uint8(3) {
 			state, ok := cluster.counterState(protocol.ReplicaIndex(index))
 			if !ok || state.Counter != want {

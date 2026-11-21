@@ -50,13 +50,13 @@ func (replica *Replica) stateSyncAwaitingOpen() bool {
 	return replica.stateSync.repairing && !replica.stateSync.repliesPending
 }
 
-func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol.View, commit, head protocol.Op, headers []protocol.Header) {
+func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol.View, commit, head protocol.Op, headers []protocol.Header) bool {
 	if replica.stateSync.stage != syncStageIdle || replica.stateSync.opening || replica.stateSync.replayRunning || checkpoint.PrepareOp() <= replica.checkpoint.PrepareOp() {
-		return
+		return false
 	}
 	if len(headers) == 0 || len(headers) > len(replica.stateSync.headers) || head < checkpoint.PrepareOp() || commit < checkpoint.PrepareOp() || head < commit {
 		replica.fail(ErrReplicaInvariant)
-		return
+		return false
 	}
 	clear(replica.stateSync.headers)
 	copy(replica.stateSync.headers, headers)
@@ -73,6 +73,7 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	replica.stateSync.persistDone = false
 	replica.stateSync.resumeRecovery = false
 	replica.stateSync.repliesPending = false
+	replica.clearRepairView()
 	replica.status = StatusRecovering
 	replica.releaseQueuedRequests()
 	if replica.stage == CommitStageIdle {
@@ -80,6 +81,7 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	} else {
 		replica.stateSync.stage = syncStageCancelingCommit
 	}
+	return true
 }
 
 func (replica *Replica) dispatchStateSync() {

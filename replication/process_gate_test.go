@@ -791,7 +791,7 @@ func (cluster *processClusterHarness) wait(timeout time.Duration, ready func() b
 			if cluster.clientEvents != nil {
 				replies = len(cluster.clientEvents.replies)
 			}
-			cluster.t.Fatalf("process gate timed out: stage=%s replies=%d ready=%v handoff=%+v stderr=%s", cluster.stage.Stage, replies, cluster.ready, cluster.handoff, cluster.stderr())
+			cluster.t.Fatalf("process gate timed out: stage=%s replies=%d ready=%v counters=%s handoff=%+v stderr=%s", cluster.stage.Stage, replies, cluster.ready, cluster.countersSummary(), cluster.handoff, cluster.stderr())
 		}
 	}
 }
@@ -845,6 +845,19 @@ func (cluster *processClusterHarness) counterState(index protocol.ReplicaIndex) 
 		return processCounterState{}, false
 	}
 	return state, true
+}
+
+func (cluster *processClusterHarness) countersSummary() string {
+	var parts [3]string
+	for index := range uint8(3) {
+		state, ok := cluster.counterState(protocol.ReplicaIndex(index))
+		if !ok {
+			parts[index] = fmt.Sprintf("%d:none", index)
+			continue
+		}
+		parts[index] = fmt.Sprintf("%d:%d", index, state.Counter)
+	}
+	return fmt.Sprintf("[%s %s %s]", parts[0], parts[1], parts[2])
 }
 
 func (cluster *processClusterHarness) waitApplied(key string) {

@@ -57,12 +57,12 @@ func TestCanonicalRecoveryRequiresDurableLocalEntry(t *testing.T) {
 	replica.canonicalHeaders[0] = first
 	replica.canonicalHeaders[1] = root
 
-	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 0 {
+	if ancestor, found := replica.recoveringCommonAncestor(replica.canonicalHeaders[:2]); !found || ancestor != 0 {
 		t.Fatalf("non-durable recovery ancestor = %d, found %t", ancestor, found)
 	}
 
 	replica.pipeline[0].durable = true
-	if ancestor, found := replica.recoveringCommonAncestor(2); !found || ancestor != 1 {
+	if ancestor, found := replica.recoveringCommonAncestor(replica.canonicalHeaders[:2]); !found || ancestor != 1 {
 		t.Fatalf("durable recovery ancestor = %d, found %t", ancestor, found)
 	}
 }

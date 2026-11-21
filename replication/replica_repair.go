@@ -479,6 +479,9 @@ func (replica *Replica) canonicalRepairHeader(candidate protocol.Header) bool {
 }
 
 func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op) bool {
+	if replica.commitInFlight() {
+		return false
+	}
 	limit, ok := checkedAdd(uint64(replica.commitMin), uint64(len(replica.pipeline)))
 	if !ok {
 		replica.fail(ErrReplicaInvariant)
@@ -488,25 +491,16 @@ func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op
 	if windowHead <= replica.commitMin {
 		return false
 	}
-	for index := range replica.repairFrames {
-		if replica.repairFrames[index] != nil {
-			replica.repairFrames[index].Release()
-			replica.repairFrames[index] = nil
-		}
-	}
+	replica.clearRepairView()
 	clear(replica.canonicalHeaders)
-	replica.repairBudget.Reset()
-	replica.repairHeader = protocol.Header{}
-	replica.repairHeaderValid = false
 	replica.status = StatusRecoveringHead
+	replica.releaseQueuedRequests()
 	replica.repairViewValid = true
 	replica.repairView = view
 	replica.repairViewCommit = windowHead
 	replica.repairViewHead = windowHead
 	replica.repairViewAncestor = replica.commitMin
-	replica.repairViewRebuilt = false
 	replica.repairViewWindow = true
-	replica.repairViewCount = 0
 	replica.commitMax = max(replica.commitMax, commit)
 	replica.repairHeadersLast = 0
 	replica.requestRepairWindowHeaders(replica.deps.Clock.Now().Monotonic)
