@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -291,10 +292,27 @@ func (machine *processCounterMachine) persist() error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, machine.path); err != nil {
+	if err := renameProcessCounter(temporary, machine.path); err != nil {
 		return err
 	}
 	return syncParentDir(filepath.Dir(machine.path))
+}
+
+func renameProcessCounter(source, destination string) error {
+	err := os.Rename(source, destination)
+	if err == nil || runtime.GOOS != "windows" {
+		return err
+	}
+	timer := time.NewTimer(2 * time.Millisecond)
+	defer timer.Stop()
+	for range 25 {
+		<-timer.C
+		if err = os.Rename(source, destination); err == nil {
+			return nil
+		}
+		timer.Reset(2 * time.Millisecond)
+	}
+	return err
 }
 
 func encodeProcessCounter(reply []byte, value uint64) (int, error) {

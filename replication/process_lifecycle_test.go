@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,19 +99,8 @@ func (cluster *processClusterHarness) waitCounter(want uint64) {
 	cluster.t.Helper()
 	cluster.wait(45*time.Second, func() bool {
 		for index := range uint8(3) {
-			path := processGateCounterPath(cluster.directory, protocol.ReplicaIndex(index))
-			encoded, err := os.ReadFile(path)
-			if errors.Is(err, os.ErrNotExist) {
-				return false
-			}
-			if err != nil {
-				cluster.t.Fatalf("read counter %d: %v", index, err)
-			}
-			var state processCounterState
-			if err := json.Unmarshal(encoded, &state); err != nil {
-				cluster.t.Fatalf("decode counter %d: %v", index, err)
-			}
-			if state.Counter != want {
+			state, ok := cluster.counterState(protocol.ReplicaIndex(index))
+			if !ok || state.Counter != want {
 				return false
 			}
 		}
