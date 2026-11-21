@@ -1,10 +1,10 @@
-module github.com/gfire-sigs/supervsr
+module z.gfire.dev/supervsr
 
-go 1.27
+go 1.27.4
 
 require (
 	github.com/rs/zerolog v1.35.1
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.50.0
 )
 
 require (

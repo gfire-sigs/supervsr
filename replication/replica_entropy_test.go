@@ -7,7 +7,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestReplicaRecoveryNonceUsesRestartEntropy(t *testing.T) {

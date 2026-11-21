@@ -3,7 +3,7 @@ package replication
 import (
 	"errors"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func checkpointAfter(cluster ClusterConfig, current protocol.Op) (protocol.Op, bool) {

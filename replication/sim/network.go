@@ -4,8 +4,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var ErrNetworkBackpressure = errors.New("simulation: network queue exhausted")

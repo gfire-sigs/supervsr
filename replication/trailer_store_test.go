@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestTrailerStoreRoundTripsMultipleBlocksBackward(t *testing.T) {

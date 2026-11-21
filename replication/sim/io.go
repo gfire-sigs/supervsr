@@ -3,8 +3,8 @@ package sim
 import (
 	"errors"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var ErrStaleIO = errors.New("simulation: IO event belongs to an old replica incarnation")

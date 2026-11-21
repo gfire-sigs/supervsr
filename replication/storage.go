@@ -28,6 +28,7 @@ type Storage interface {
 }
 
 type FileStorage struct {
+	mu     sync.RWMutex
 	file   *os.File
 	path   string
 	direct bool
@@ -55,6 +56,8 @@ func OpenFileStorage(path string, create, direct bool) (*FileStorage, error) {
 }
 
 func (storage *FileStorage) ReadAt(buffer []byte, offset uint64) error {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
 	if err := storage.validateIO(buffer, offset); err != nil {
 		return err
 	}
@@ -69,6 +72,8 @@ func (storage *FileStorage) ReadAt(buffer []byte, offset uint64) error {
 }
 
 func (storage *FileStorage) WriteAt(buffer []byte, offset uint64) error {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
 	if err := storage.validateIO(buffer, offset); err != nil {
 		return err
 	}
@@ -83,6 +88,8 @@ func (storage *FileStorage) WriteAt(buffer []byte, offset uint64) error {
 }
 
 func (storage *FileStorage) Sync() error {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
 	if storage.file == nil {
 		return ErrStorageClosed
 	}
@@ -93,6 +100,8 @@ func (storage *FileStorage) Sync() error {
 }
 
 func (storage *FileStorage) Resize(size uint64) error {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
 	if storage.file == nil {
 		return ErrStorageClosed
 	}
@@ -109,6 +118,8 @@ func (storage *FileStorage) Resize(size uint64) error {
 }
 
 func (storage *FileStorage) Size() (uint64, error) {
+	storage.mu.RLock()
+	defer storage.mu.RUnlock()
 	if storage.file == nil {
 		return 0, ErrStorageClosed
 	}
@@ -134,6 +145,8 @@ func (storage *FileStorage) SyncParent() error {
 
 func (storage *FileStorage) Close() error {
 	storage.closeOnce.Do(func() {
+		storage.mu.Lock()
+		defer storage.mu.Unlock()
 		if storage.file == nil {
 			return
 		}

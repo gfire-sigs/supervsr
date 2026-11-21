@@ -3,7 +3,7 @@ package replication
 import (
 	"sync/atomic"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 type Message = protocol.Frame

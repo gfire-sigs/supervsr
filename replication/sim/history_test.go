@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication"
+	"z.gfire.dev/supervsr/replication"
 )
 
 func ledgerReply(token, value uint64) []byte {

@@ -6,8 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 type MachineFactory func(protocol.ReplicaIndex) replication.StateMachine

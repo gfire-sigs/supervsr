@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -9,10 +10,11 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
 	"github.com/rs/zerolog"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestSnapshotJSONRoundTripDeterministic(t *testing.T) {
@@ -298,4 +300,35 @@ func persistCurrentSnapshot(t *testing.T, machine *kvMachine, op protocol.Op) {
 
 func newSnapshotTestMachine(directory string) *kvMachine {
 	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, zerolog.Nop())
+}
+
+func TestClientEventsNonBlockingAndRequestCorrelated(t *testing.T) {
+	events := &clientEvents{notify: make(chan struct{}, 1)}
+	for request := protocol.RequestNo(1); request <= 4; request++ {
+		events.Reply(replication.ClientReply{Request: request, Body: []byte{resultOK}})
+	}
+
+	cluster := &localCluster{
+		process:      replication.DefaultProcessConfig(),
+		clientEvents: events,
+		transport:    &localTransport{},
+	}
+	reply, err := cluster.awaitReply(context.Background(), 200*time.Millisecond, 4)
+	if err != nil {
+		t.Fatalf("awaitReply(4): %v", err)
+	}
+	if reply.Request != 4 {
+		t.Fatalf("reply request = %d, want 4", reply.Request)
+	}
+
+	events.Reply(replication.ClientReply{Request: 4, Body: []byte{resultOK}})
+	if _, err := cluster.awaitReply(context.Background(), 50*time.Millisecond, 5); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stale reply error = %v, want %v", err, context.DeadlineExceeded)
+	}
+
+	events.Evicted(protocol.EvictionInvalidBody)
+	events.Evicted(protocol.EvictionNoSession)
+	if _, err := cluster.awaitReply(context.Background(), 50*time.Millisecond, 5); !errors.Is(err, errClientEvicted) {
+		t.Fatalf("evicted error = %v, want %v", err, errClientEvicted)
+	}
 }

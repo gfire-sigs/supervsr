@@ -9,8 +9,6 @@ on:
         description: Run only one seed once, without the other CI jobs
         type: boolean
         default: false
-  schedule:
-    - cron: '23 3 * * *'
 
 permissions:
   contents: read
@@ -32,12 +30,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-26.04, macos-26]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
       - name: Check formatting
@@ -45,7 +43,7 @@ jobs:
       - name: Static analysis
         run: |
           go vet ./...
-          go install github.com/gosuda/JustGoodPractices/cmd/gojgp@v1.1.1
+          go install github.com/gosuda/JustGoodPractices/cmd/gojgp@v1.3.0
           gojgp lint ./...
       - name: Test including deterministic fault campaigns
         run: go test -count=1 -timeout=20m ./...
@@ -58,12 +56,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-26.04, macos-26]
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
       - name: Check races outside the separately gated seed campaign
@@ -71,8 +69,8 @@ jobs:
 
   simulation:
     name: Simulation seed sweep (${{ matrix.shard }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
     timeout-minutes: ${{ inputs.short_seed_sweep && 5 || 45 }}
     strategy:
       fail-fast: false
@@ -82,7 +80,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
       - name: Exercise recoverable fault campaigns
@@ -103,7 +101,7 @@ jobs:
   tla:
     name: TLA+ (${{ matrix.config }})
     if: ${{ !inputs.short_seed_sweep }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -120,7 +118,7 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: formal
-      - uses: actions/setup-java@v6.0.0
+      - uses: actions/setup-java@v6.3.0
         with:
           distribution: temurin
           java-version: '21'
@@ -144,7 +142,7 @@ jobs:
             -metadir "$RUNNER_TEMP/tlc-states" "$TLA_MODULE.tla" 2>&1 | tee tlc.log
       - name: Preserve model checking output
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: tlc-${{ matrix.config }}
           path: formal/tlc.log

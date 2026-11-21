@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
 	"github.com/rs/zerolog"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 const (

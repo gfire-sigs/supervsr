@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
+
+var errConditionDidNotConverge = errors.New("simulation: condition did not converge")
 
 func TestStorageCrashDiscardsVolatileAndPreservesTornSyncPrefix(t *testing.T) {
 	storage := NewStorage()
@@ -1152,7 +1154,7 @@ func runUntil(cluster *Cluster, limit int, condition func(*Cluster) bool) error 
 			return err
 		}
 	}
-	return errors.New("simulation: condition did not converge")
+	return errConditionDidNotConverge
 }
 
 func currentPrimary(t testing.TB, cluster *Cluster) protocol.ReplicaIndex {

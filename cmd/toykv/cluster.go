@@ -13,14 +13,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
 	"github.com/rs/zerolog"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 const metadataVersion = 1
 
-var errClusterMetadata = errors.New("toykv: invalid cluster metadata")
+var (
+	errClusterMetadata = errors.New("toykv: invalid cluster metadata")
+	errInvalidTimeout  = errors.New("timeout must be positive")
+	errClientEvicted   = errors.New("toykv: client evicted")
+)
 
 type diskMetadata struct {
 	Version int      `json:"version"`
@@ -47,17 +51,35 @@ func (clock realClock) Now() replication.TimeSample {
 }
 
 type clientEvents struct {
-	replies chan replication.ClientReply
-	evicted chan protocol.EvictionReason
+	mu       sync.Mutex
+	notify   chan struct{}
+	reply    replication.ClientReply
+	hasReply bool
+	evicted  bool
+	reason   protocol.EvictionReason
 }
 
 func (events *clientEvents) Reply(reply replication.ClientReply) {
 	reply.Body = append([]byte(nil), reply.Body...)
-	events.replies <- reply
+	events.mu.Lock()
+	events.reply = reply
+	events.hasReply = true
+	events.mu.Unlock()
+	select {
+	case events.notify <- struct{}{}:
+	default:
+	}
 }
 
 func (events *clientEvents) Evicted(reason protocol.EvictionReason) {
-	events.evicted <- reason
+	events.mu.Lock()
+	events.evicted = true
+	events.reason = reason
+	events.mu.Unlock()
+	select {
+	case events.notify <- struct{}{}:
+	default:
+	}
 }
 
 type localTransport struct {
@@ -178,7 +200,7 @@ func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*loc
 		return nil, fmt.Errorf("replicas must be between 1 and %d", replication.ActiveMax)
 	}
 	if opts.commandTimeout <= 0 {
-		return nil, errors.New("timeout must be positive")
+		return nil, errInvalidTimeout
 	}
 	if err := os.MkdirAll(opts.dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
@@ -340,7 +362,7 @@ func (cluster *localCluster) RegisterClient(ctx context.Context, timeout time.Du
 			return err
 		}
 	}
-	events := &clientEvents{replies: make(chan replication.ClientReply, 1), evicted: make(chan protocol.EvictionReason, 1)}
+	events := &clientEvents{notify: make(chan struct{}, 1)}
 	client, err := replication.NewClient(replication.ClientConfig{
 		Group: cluster.group, ID: id, Release: 1, ActiveCount: uint8(len(cluster.replicas)),
 		MessageSizeMax: uint32(cluster.config.MessageSizeMax), Process: cluster.process,
@@ -360,7 +382,7 @@ func (cluster *localCluster) RegisterClient(ctx context.Context, timeout time.Du
 	if err != nil {
 		return err
 	}
-	_, err = cluster.awaitReply(ctx, timeout)
+	_, err = cluster.awaitReply(ctx, timeout, 0)
 	return err
 }
 
@@ -429,25 +451,42 @@ func statusResult(body []byte, success string) (string, error) {
 func (cluster *localCluster) request(ctx context.Context, timeout time.Duration, operation protocol.Operation, body []byte) (replication.ClientReply, error) {
 	cluster.transport.clientMu.Lock()
 	err := cluster.client.Submit(operation, body)
+	var expected protocol.RequestNo
+	if err == nil {
+		expected = cluster.client.RequestNo()
+	}
 	cluster.transport.clientMu.Unlock()
 	if err != nil {
 		return replication.ClientReply{}, err
 	}
-	return cluster.awaitReply(ctx, timeout)
+	return cluster.awaitReply(ctx, timeout, expected)
 }
 
-func (cluster *localCluster) awaitReply(ctx context.Context, timeout time.Duration) (replication.ClientReply, error) {
+func (cluster *localCluster) awaitReply(ctx context.Context, timeout time.Duration, expected protocol.RequestNo) (replication.ClientReply, error) {
 	deadline := time.NewTimer(timeout)
 	ticker := time.NewTicker(cluster.process.Tick)
 	defer deadline.Stop()
 	defer ticker.Stop()
 	for {
-		select {
-		case reply := <-cluster.clientEvents.replies:
+		cluster.clientEvents.mu.Lock()
+		if cluster.clientEvents.evicted {
+			reason := cluster.clientEvents.reason
+			cluster.clientEvents.mu.Unlock()
+			return replication.ClientReply{}, fmt.Errorf("%w: %d", errClientEvicted, reason)
+		}
+		if cluster.clientEvents.hasReply && cluster.clientEvents.reply.Request == expected {
+			reply := cluster.clientEvents.reply
+			cluster.clientEvents.hasReply = false
+			cluster.clientEvents.mu.Unlock()
 			return reply, nil
-		case reason := <-cluster.clientEvents.evicted:
-			return replication.ClientReply{}, fmt.Errorf("client evicted: %d", reason)
+		}
+		cluster.clientEvents.mu.Unlock()
+		select {
+		case <-cluster.clientEvents.notify:
 		case <-ticker.C:
+			if cluster.client == nil {
+				continue
+			}
 			cluster.transport.clientMu.Lock()
 			err := cluster.client.Tick()
 			cluster.transport.clientMu.Unlock()
@@ -520,8 +559,11 @@ func loadOrCreateIdentity(directory string, replicas uint8) (clusterIdentity, er
 	if err := json.Unmarshal(encoded, &metadata); err != nil {
 		return clusterIdentity{}, errors.Join(errClusterMetadata, err)
 	}
-	if metadata.Version != metadataVersion || len(metadata.Members) != int(replicas) {
+	if metadata.Version != metadataVersion {
 		return clusterIdentity{}, errClusterMetadata
+	}
+	if len(metadata.Members) != int(replicas) {
+		return clusterIdentity{}, fmt.Errorf("%w: replica count %d does not match existing cluster of %d", errClusterMetadata, replicas, len(metadata.Members))
 	}
 	groupBytes, err := hex.DecodeString(metadata.Group)
 	if err != nil || len(groupBytes) != len(protocol.GroupID{}) {

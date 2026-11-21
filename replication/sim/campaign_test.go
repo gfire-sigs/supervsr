@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 // The fault/restoration schedule follows https://apple.github.io/foundationdb/testing.html

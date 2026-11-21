@@ -3,7 +3,7 @@ package replication
 import (
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestCheckpointPreparationIncludesOwnTrailerReservations(t *testing.T) {

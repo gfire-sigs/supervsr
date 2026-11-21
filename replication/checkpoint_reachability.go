@@ -5,7 +5,7 @@ import (
 	"errors"
 	"slices"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 type checkpointGraphNode struct {

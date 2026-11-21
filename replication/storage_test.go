@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -93,5 +94,51 @@ func TestAlignedBufferAlignmentAndBounds(t *testing.T) {
 		if _, err := NewAlignedBuffer(input[0], input[1]); !errors.Is(err, ErrStorageAlignment) {
 			t.Fatalf("NewAlignedBuffer(%d,%d) error = %v", input[0], input[1], err)
 		}
+	}
+}
+
+func TestFileStorageConcurrentCloseAndIO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.data")
+	storage, err := OpenFileStorage(path, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Resize(SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{0x42}, SectorSize)
+	if err := storage.WriteAt(payload, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	var workers sync.WaitGroup
+	start := make(chan struct{})
+	for range 4 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			buffer := make([]byte, SectorSize)
+			for range 64 {
+				if err := storage.ReadAt(buffer, 0); err != nil && !errors.Is(err, ErrStorageClosed) {
+					t.Errorf("unexpected read error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		if err := storage.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+	close(start)
+	workers.Wait()
+
+	if err := storage.ReadAt(make([]byte, SectorSize), 0); !errors.Is(err, ErrStorageClosed) {
+		t.Fatalf("read after close = %v, want %v", err, ErrStorageClosed)
 	}
 }

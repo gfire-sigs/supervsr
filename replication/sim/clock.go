@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication"
+	"z.gfire.dev/supervsr/replication"
 )
 
 const clockRate = uint64(1_000_000)

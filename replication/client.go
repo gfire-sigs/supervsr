@@ -6,7 +6,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var (

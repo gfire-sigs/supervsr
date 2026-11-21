@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestWALRecoverInstalledViewExcludesOnlyOlderTail(t *testing.T) {

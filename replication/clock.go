@@ -4,7 +4,7 @@ import (
 	"errors"
 	"math"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var ErrClockSample = errors.New("replication: invalid cluster clock sample")

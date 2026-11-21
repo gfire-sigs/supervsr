@@ -12,7 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var (
@@ -254,6 +254,8 @@ type Replica struct {
 	accepting          atomic.Bool
 	submitters         atomic.Int64
 	runState           atomic.Uint32
+	loopMu             sync.RWMutex
+	publishedSnapshot  atomic.Pointer[ReplicaSnapshot]
 	stopOnce           sync.Once
 	stop               chan struct{}
 	done               chan struct{}
@@ -525,6 +527,25 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 }
 
 func (replica *Replica) Snapshot() ReplicaSnapshot {
+	if replica.runState.Load() == 1 {
+		if current := replica.publishedSnapshot.Load(); current != nil {
+			return *current
+		}
+	}
+	replica.loopMu.RLock()
+	defer replica.loopMu.RUnlock()
+	if replica.runState.Load() == 1 {
+		return *replica.publishedSnapshot.Load()
+	}
+	return replica.computeSnapshot()
+}
+
+func (replica *Replica) publishSnapshot() {
+	snapshot := replica.computeSnapshot()
+	replica.publishedSnapshot.Store(&snapshot)
+}
+
+func (replica *Replica) computeSnapshot() ReplicaSnapshot {
 	commitStage := CommitStageIdle
 	prepareWritePending := false
 	committing := false
@@ -589,14 +610,25 @@ func (replica *Replica) enqueueSMCompletion(completion *SMCompletion) error {
 }
 
 func (replica *Replica) Run(ctx context.Context) (runErr error) {
-	if !replica.runState.CompareAndSwap(0, 1) {
+	replica.loopMu.Lock()
+	if replica.runState.Load() != 0 {
+		replica.loopMu.Unlock()
 		return ErrReplicaRunning
 	}
+	replica.publishSnapshot()
+	if !replica.runState.CompareAndSwap(0, 1) {
+		replica.loopMu.Unlock()
+		return ErrReplicaRunning
+	}
+	replica.loopMu.Unlock()
 	defer func() {
 		replica.accepting.Store(false)
 		replica.startShutdown()
 		<-replica.done
+		replica.loopMu.Lock()
+		replica.publishSnapshot()
 		replica.runState.Store(2)
+		replica.loopMu.Unlock()
 		if runErr == nil {
 			runErr = replica.shutdownErr
 		}
@@ -617,6 +649,7 @@ func (replica *Replica) Run(ctx context.Context) (runErr error) {
 		case <-ticker.C:
 			if !replica.stateSync.replayRunning {
 				replica.handleTick(replica.deps.Clock.Now())
+				replica.publishSnapshot()
 			}
 		}
 	}
@@ -636,6 +669,11 @@ func (replica *Replica) Process(limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
+	defer func() {
+		if replica.runState.Load() == 1 {
+			replica.publishSnapshot()
+		}
+	}()
 	if replica.releaseActivation != 0 {
 		return replica.processReleaseActivation(limit)
 	}
@@ -884,7 +922,7 @@ func (replica *Replica) popPipeline() {
 }
 
 func (replica *Replica) checkInvariants() error {
-	return validateReplicaSnapshot(replica.Snapshot(), replica.config.Cluster, replica.local)
+	return validateReplicaSnapshot(replica.computeSnapshot(), replica.config.Cluster, replica.local)
 }
 
 func (replica *Replica) isPrimary() bool {

@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 // These faults are injected above FileStorage, not produced by kernel ENOSPC,

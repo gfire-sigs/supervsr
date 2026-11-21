@@ -15,12 +15,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 const processReleaseExitCode = 23
 
-var errProcessHandoffInjected = errors.New("injected release executor handoff failure")
+var (
+	errProcessHandoffInjected         = errors.New("injected release executor handoff failure")
+	errLostProcessNotOwned            = errors.New("lost process was not owned by replacement fence")
+	errOldMemberTerminationUnobserved = errors.New("old member termination was not observed")
+)
 
 // Both advertised releases use this executable; this exercises handoff, not binary compatibility.
 type processReleaseExecutor struct {
@@ -206,7 +210,7 @@ func (fence *processReplacementFence) VerifyReplacementFence(ctx context.Context
 	}
 	old := fence.cluster.processes[fence.index]
 	if old == nil {
-		return errors.New("lost process was not owned by replacement fence")
+		return errLostProcessNotOwned
 	}
 	fence.cluster.processes[fence.index] = nil
 	fence.cluster.ready[fence.index] = false
@@ -214,7 +218,7 @@ func (fence *processReplacementFence) VerifyReplacementFence(ctx context.Context
 		return fmt.Errorf("terminate old member: %w", err)
 	}
 	if old.command.ProcessState == nil || old.command.ProcessState.Success() {
-		return errors.New("old member termination was not observed")
+		return errOldMemberTerminationUnobserved
 	}
 	for _, path := range []string{processGateReplicaPath(fence.cluster.directory, fence.index), processGateCounterPath(fence.cluster.directory, fence.index)} {
 		if err := os.Rename(path, filepath.Join(fence.quarantine, filepath.Base(path))); err != nil {

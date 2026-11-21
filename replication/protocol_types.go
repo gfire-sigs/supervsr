@@ -1,6 +1,6 @@
 package replication
 
-import "github.com/gfire-sigs/supervsr/replication/protocol"
+import "z.gfire.dev/supervsr/replication/protocol"
 
 type (
 	GroupID      = protocol.GroupID

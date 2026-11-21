@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestClockSynchronizerFindsTightIntersectingInterval(t *testing.T) {

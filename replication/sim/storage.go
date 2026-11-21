@@ -5,7 +5,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/gfire-sigs/supervsr/replication"
+	"z.gfire.dev/supervsr/replication"
 )
 
 var ErrInjectedFault = errors.New("simulation: injected fault")

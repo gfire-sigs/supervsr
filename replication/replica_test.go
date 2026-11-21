@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 func TestReplicaSoloRegistrationApplicationAndDuplicateReply(t *testing.T) {
@@ -1274,4 +1274,122 @@ func (machine *testStateMachine) StartReset(completion *SMCompletion) (StartResu
 func (machine *testStateMachine) Close() error {
 	machine.closes.Add(1)
 	return nil
+}
+
+type notifyingCaptureBus struct {
+	*captureBus
+	clientReady chan struct{}
+}
+
+func (bus *notifyingCaptureBus) SendClient(client protocol.ClientID, message *Message) {
+	bus.captureBus.SendClient(client, message)
+	select {
+	case bus.clientReady <- struct{}{}:
+	default:
+	}
+}
+
+func TestReplicaSnapshotConcurrentWithRun(t *testing.T) {
+	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	bus := &notifyingCaptureBus{captureBus: &captureBus{}, clientReady: make(chan struct{}, 1)}
+	machine := &testStateMachine{capacities: StateMachineCapacities{
+		RequestBytes:  uint32(config.Cluster.ApplicationBatchSizeMax),
+		ReplyBytes:    uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax:   uint32(config.Cluster.PipelineMax),
+		CheckpointMax: 1,
+	}}
+	replica, err := newReplica(config, Dependencies{
+		Storage:      storage,
+		MessageBus:   bus,
+		Clock:        fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
+		StateMachine: machine,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- replica.Run(runCtx)
+	}()
+
+	stopReaders := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					snapshot := replica.Snapshot()
+					if snapshot.CommitMin > snapshot.HeadOp || snapshot.Primary != 0 {
+						t.Errorf("inconsistent snapshot: %+v", snapshot)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	pool, err := protocol.NewFramePool(4, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.ClientID{9}
+	registration := makeClientRequest(t, pool, config.Group, client, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	if err := replica.Submit(registration); err != nil {
+		t.Fatal(err)
+	}
+	waitCaptureClientCount(t, bus, 1)
+	regHeader, _, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+	if reason != protocol.RejectNone {
+		t.Fatalf("registration decode reason=%v", reason)
+	}
+	session := protocol.Session(replyCommit(&regHeader))
+	parent := replyContext(&regHeader)
+	for seq := protocol.RequestNo(1); seq <= 5; seq++ {
+		req := makeClientRequest(t, pool, config.Group, client, session, seq, parent, protocol.OperationApplicationMin, []byte("ping"))
+		if err := replica.Submit(req); err != nil {
+			t.Fatal(err)
+		}
+		waitCaptureClientCount(t, bus, int(seq)+1)
+		replyHeader, _, replyReason := protocol.DecodeFrame(bus.clientMessage(t, int(seq)), config.Group, uint32(config.Cluster.MessageSizeMax), 1)
+		if replyReason != protocol.RejectNone {
+			t.Fatalf("reply %d decode reason=%v", seq, replyReason)
+		}
+		parent = replyContext(&replyHeader)
+	}
+
+	close(stopReaders)
+	readers.Wait()
+	cancelRun()
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelClose()
+	if err := replica.Close(closeCtx); err != nil {
+		t.Fatalf("close replica: %v", err)
+	}
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("replica.Run error: %v", err)
+	}
+	if snapshot := replica.Snapshot(); snapshot.CommitMin < 6 {
+		t.Fatalf("final snapshot commit=%d, want >= 6", snapshot.CommitMin)
+	}
+}
+
+func waitCaptureClientCount(t testing.TB, bus *notifyingCaptureBus, want int) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for bus.clientCount() < want {
+		select {
+		case <-bus.clientReady:
+		case <-deadline.C:
+			t.Fatalf("client messages=%d, want >= %d", bus.clientCount(), want)
+		}
+	}
 }

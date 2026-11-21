@@ -8,8 +8,8 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 type ledgerClient struct {

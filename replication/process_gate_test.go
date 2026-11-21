@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gfire-sigs/supervsr/replication/protocol"
 	"github.com/rs/zerolog"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 const (

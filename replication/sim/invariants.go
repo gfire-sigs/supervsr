@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/gfire-sigs/supervsr/replication"
-	"github.com/gfire-sigs/supervsr/replication/protocol"
+	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var ErrInvariant = errors.New("simulation: global invariant violated")

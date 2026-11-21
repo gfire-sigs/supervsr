@@ -15,6 +15,13 @@ import (
 	"github.com/rs/zerolog"
 )
 
+var (
+	errUsagePut       = errors.New("usage: put KEY VALUE")
+	errUsageGet       = errors.New("usage: get KEY")
+	errUsageDelete    = errors.New("usage: delete KEY")
+	errUnknownCommand = errors.New("commands: put, get, delete, quit")
+)
+
 type options struct {
 	dataDir        string
 	replicas       uint
@@ -132,23 +139,23 @@ func executeLine(ctx context.Context, cluster *localCluster, timeout time.Durati
 	case "put":
 		key, value, found := strings.Cut(strings.TrimSpace(rest), " ")
 		if !found || key == "" {
-			return "", errors.New("usage: put KEY VALUE")
+			return "", errUsagePut
 		}
 		return cluster.Put(ctx, timeout, key, value)
 	case "get":
 		key := strings.TrimSpace(rest)
 		if key == "" || strings.ContainsRune(key, ' ') {
-			return "", errors.New("usage: get KEY")
+			return "", errUsageGet
 		}
 		return cluster.Get(ctx, timeout, key)
 	case "delete", "del":
 		key := strings.TrimSpace(rest)
 		if key == "" || strings.ContainsRune(key, ' ') {
-			return "", errors.New("usage: delete KEY")
+			return "", errUsageDelete
 		}
 		return cluster.Delete(ctx, timeout, key)
 	default:
-		return "", errors.New("commands: put, get, delete, quit")
+		return "", errUnknownCommand
 	}
 }
 
