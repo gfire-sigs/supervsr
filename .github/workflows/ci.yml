@@ -24,7 +24,7 @@ defaults:
 jobs:
   go:
     name: Go (${{ matrix.os }})
-    if: ${{ !inputs.short_seed_sweep }}
+    if: github.event_name != 'workflow_dispatch' || !inputs.short_seed_sweep
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -50,7 +50,7 @@ jobs:
 
   race:
     name: Race (${{ matrix.os }})
-    if: ${{ !inputs.short_seed_sweep }}
+    if: github.event_name != 'workflow_dispatch' || !inputs.short_seed_sweep
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -100,7 +100,7 @@ jobs:
 
   tla:
     name: TLA+ (${{ matrix.config }})
-    if: ${{ !inputs.short_seed_sweep }}
+    if: github.event_name != 'workflow_dispatch' || !inputs.short_seed_sweep
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
