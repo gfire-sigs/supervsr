@@ -10,7 +10,7 @@ import (
 
 var ErrWALRecovery = errors.New("replication: WAL recovery failed")
 
-// WALRecoveryView is the head selected when LogView was durably installed.
+// walRecoveryView is the head selected when LogView was durably installed.
 // Later prepares in that log view are not bounded by HeadOp.
 type walRecoveryView struct {
 	LogView protocol.View

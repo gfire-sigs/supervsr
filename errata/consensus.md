@@ -1,11 +1,12 @@
 # Consensus and catchup corrections
 
-Affected specification sections: 8.2–8.4, 11, 12.3–12.4, 13.1–13.3, 16.1.1, 16.4–16.6, and 17.1–17.3.
+Affected specification sections: 8.2-8.4, 11, 12.3-12.4, 13.1-13.3, 16.1.1, 16.4-16.6, and 17.1-17.3.
 
 - Select uncommitted candidates only from the maximal reported `LogView`. Older logs may fill the committed prefix, but cannot resurrect an excluded suffix. An explicit tail contributes its positional operation to the committed lower bound. Count an exact `Present` copy independently of a NACK; implicit negatives require the documented older-log evidence. Faulty blank entries remain uncertainty.
 - A checkpoint header appended after a bounded suffix is an anchor, not an adjacent prepare. Validate the contiguous suffix and prove any omitted interval is committed before accepting it. Preserve the locally committed prefix; never truncate it to rebuild an uncommitted FIFO.
 - Install one canonical head, checksum, timestamp, and pipeline. Drain old appends before repair/replacement; clear old quorum bits. Persist the installed log before normal admission or acknowledgements, then discard obsolete WAL cache entries. Reboot exclusion of the durable rejected tail is described in the WAL errata.
 - Higher-view Prepare/Commit evidence requests a nonce-bound View from the evidence view's primary. Recovering-head Ping/Join evidence does likewise. A normal lagging backup or standby can request and accept a same-view response. Validate response nonces before checkpoint observation, state sync, or repair-window mutation. Reset prior-primary commit-heartbeat ordering on installation.
+- Non-voting standbys (`local >= ActiveCount`) never send `ExitView` on timeout (`handleExitTimeout`) or enter `StatusViewChange`. `handleExitView` and `handleJoinView` reject standby senders (`Author >= ActiveCount`) before advancing view. `StatusRecovering`, active state sync, and `repairViewValid` defer view-change entry (`canEnterViewChange`) so `durableView` never exceeds `stateSync.view` or `repairView` before recovery settles; higher-view control frames during `StatusRecovering` request a `View` instead.
 - A durable exact duplicate Prepare resends PrepareOK. Both duplicate handling and delayed append completions obey normal/durable-log-view, active-member, and checkpoint-safe acknowledgement bounds.
 - Event-loop processing continues an accepted canonical installation without requiring a timer tick. Checkpoint publication reconsiders withheld local acknowledgements once per entry/view, including the primary's own durable copy; advancing the safety bound must not leave an already-completed append permanently unacknowledged.
 - Registrations can evict sessions at commit. Defer application admission behind pending registrations and revalidate queued requests after those registrations execute; receiving a request never mutates the committed session table.
@@ -26,5 +27,10 @@ Regression coverage in `replication/consensus_regression_test.go`:
 - `TestViewNonceRejectedBeforeRepairWindowMutation`
 - `TestRegistrationAdmissionCannotEvictPendingApplicationSession`
 - `TestCheckpointProgressReleasesWithheldPrepareAcknowledgement`
+
+Additional view-change and campaign regression coverage:
+
+- `TestStandbyAndRecoveringIgnoreExitViewAndStateSyncView` (`replication/view_change_test.go`)
+- `TestLongCampaignSeed2261` (`replication/sim/long_campaign_test.go`)
 
 Existing integration coverage: `TestUpgradeHandoffReopensAtTargetRelease` and `TestClusterSustainedTrafficReachesConfiguredPipeline`.

@@ -1,6 +1,6 @@
 # WAL recovery corrections
 
-## Sections 10.2–10.3: corruption is not crash-order proof
+## Sections 10.2-10.3: corruption is not crash-order proof
 
 An intact redundant header with a missing or corrupt full prepare does not establish that the append was interrupted before acknowledgement. The same bytes can result from corruption after both append barriers and `PrepareOK`. Neither the latest operation number nor a write-concurrency window distinguishes those histories.
 
@@ -12,11 +12,11 @@ This is deliberately less available after an ambiguous solo crash: an unacknowle
 
 A durably installed log view excludes valid operations beyond its selected head only when their prepare view is older than the installed log view. Appends from the installed or a later view may legitimately extend that head. An excluded old header does not identify a corrupt counterpart: that counterpart may belong to a newer acknowledged append whose redundant header became stale. If either candidate is invalid, retain uncertainty rather than truncate on the other candidate's old view alone.
 
-After append and repair I/O drains and the new view is durable, `WAL.DiscardAfter` invalidates the rejected in-memory suffix and header-sector cache without event-loop storage I/O. Restart uses the durable installed-view proof to avoid resurrecting old full prepares.
+After append and repair I/O drains and the new view is durable, `walJournal.DiscardAfter` invalidates the rejected in-memory suffix and header-sector cache without event-loop storage I/O. Restart uses the durable installed-view proof to avoid resurrecting old full prepares.
 
 ## Compatibility
 
-No wire or disk layout changes. `WAL.Recover` replaces its unused process-configuration argument with `WALRecoveryView{LogView, HeadOp}`. The zero value supplies no installed-view exclusion proof. Open derives this proof from the durable view headers; ordinary callers must not invent a head bound. Persisted interrupted state sync uses the checkpoint as the immediate recovery commit bound while retaining the durable commit target for subsequent repair.
+No wire or disk layout changes. `walJournal.Recover` uses an internal `walRecoveryView{LogView, HeadOp}` exclusion bound. The zero value supplies no installed-view exclusion proof. Open derives this proof from the durable view headers; ordinary callers must not invent a head bound. Persisted interrupted state sync uses the checkpoint as the immediate recovery commit bound while retaining the durable commit target for subsequent repair.
 
 `TestWALRecoverStaleExcludedHeaderCannotHideCurrentCorruption` combines a stale
 older-view redundant header with a corrupted current-view full header. Recovery

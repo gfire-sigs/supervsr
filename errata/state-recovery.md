@@ -21,9 +21,15 @@ These boundaries are exercised by the persistent ledger and controlled long camp
 A crash can persist sync intent while leaving the old checkpoint selected.
 Persisted view-change suffixes are not complete wire `View` proofs. Restart keeps
 the stored log view, reopens the selected checkpoint, and either replays verified
-WAL or requests a fresh canonical View. If the intended newer checkpoint has not
-been installed, checkpoint selection continues while old content is repaired.
-`TestInterruptedViewPersistenceRecoverySeed6` preserves the exposed boundary.
+WAL or requests a fresh canonical View. When interrupted synchronization replays an
+intact WAL (`FaultySlots == 0` and `HeadOp >= stateSync.commit`), it computes the
+replay target via `recoveredCommitTarget` (including `prepareCommit(&HeadHeader)`
+and `HeadOp - PipelineMax`) and advances `CommitMax = max(durable.State.CommitMax, commitMin)`
+before loading the remaining suffix so `loadOpenSuffix` stays within
+`PipelineMax`. If the intended newer checkpoint has not been installed,
+checkpoint selection continues while old content is repaired.
+`TestInterruptedViewPersistenceRecoverySeed6` and `TestLongCampaignSeed2247`
+preserve the exposed boundaries.
 
 When state synchronization durably installs a checkpoint for a different release,
 the replica drains and invokes the release executor before interpreting that

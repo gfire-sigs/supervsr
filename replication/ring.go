@@ -19,7 +19,7 @@ type ringSequence struct {
 	_     [cacheLineSize - 8]byte
 }
 
-// MPSCRing is a bounded, nonblocking multi-producer, single-consumer queue.
+// mpscRing is a bounded, nonblocking multi-producer, single-consumer queue.
 // It allocates its slots at construction and retains no references after pop.
 type mpscRing[T any] struct {
 	enqueue ringCursor

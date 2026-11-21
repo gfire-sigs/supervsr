@@ -310,7 +310,7 @@ VSR_LONG_SEED_START=1 VSR_LONG_SEED_COUNT=2 go test ./replication/sim -run '^Tes
 ### Verification scope and limits
 
 - CI ([ci.yml](.github/workflows/ci.yml)) runs `go vet`, `gojgp lint`, and all Go tests on `ubuntu-26.04`, `macos-26`, and `windows-2025`, `-race` on `ubuntu-26.04` and `macos-26` (excluding `TestFoundationDBFaultCampaign`, whose initial full race run exceeded 15 minutes), and three TLA+ configurations (`MPSCRing`, `VSR`, `VSRConsensus`).
-- TLA+/TLC runs only in CI; finite model bounds do not establish refinement of the Go implementation.
+- TLA+/TLC runs only in CI; finite model bounds do not establish refinement of the Go implementation. `MPSCRing.tla` models `mpscRing` 1:1, whereas `VSR.tla` models active voting replicas across `normal`, `view-change`, and `crashed` states; `StatusRecovering`, `StatusRecoveringHead`, non-voting standbys, checkpoint compaction, and state sync are verified by `replication/sim` rather than TLC.
 - `TestFoundationDBFaultCampaign` exercises swizzle-clogging, correlated reboots, overlapping stalls, and 14 storage fault modes below the first checkpoint; `TestLongDeterministicFaultCampaign` crosses at least eight checkpoint boundaries and four journal wraps per seed against a non-idempotent `LedgerMachine` and bounded history oracle.
 - With `sim.Config.ControlledIO`, `PendingIO` and `AdvanceIO` drive queued `IOEngine` work deterministically, while `Format`, `Open`, and synchronous state-machine block calls stay immediate.
 - `FileStorage` fault tests inject errors over real files; they do not simulate physical power loss or prove a device's `fsync` contract. Process tests exercise replacement, backup/restore, and release handoff using a single executable rather than mixed-version binaries.
