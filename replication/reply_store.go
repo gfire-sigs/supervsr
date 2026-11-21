@@ -12,19 +12,20 @@ import (
 var ErrInvalidReplyStore = errors.New("replication: invalid durable reply")
 
 type ReplyStore struct {
-	mu          sync.Mutex
-	storage     Storage
-	layout      WALLayout
-	clientsMax  uint32
-	group       protocol.GroupID
-	memberCount uint8
-	buffer      []byte
-	ioActive    bool
+	mu                sync.Mutex
+	storage           Storage
+	layout            WALLayout
+	clientsMax        uint32
+	group             protocol.GroupID
+	memberCount       uint8
+	checksumAlgorithm ChecksumAlgorithm
+	buffer            []byte
+	ioActive          bool
 }
 
 func NewReplyStore(storage Storage, config ClusterConfig, group protocol.GroupID, memberCount uint8) (*ReplyStore, error) {
 	layout, ok := DeriveWALLayout(config)
-	if !ok || config.ClientsMax == 0 || config.ClientsMax > uint64(^uint32(0)) || memberCount == 0 {
+	if !ok || config.ClientsMax == 0 || config.ClientsMax > uint64(^uint32(0)) || memberCount == 0 || !config.ChecksumAlgorithm.Valid() {
 		return nil, ErrInvalidReplyStore
 	}
 	buffer, err := NewAlignedBuffer(layout.ReplyStride, SectorSize)
@@ -32,12 +33,13 @@ func NewReplyStore(storage Storage, config ClusterConfig, group protocol.GroupID
 		return nil, err
 	}
 	return &ReplyStore{
-		storage:     storage,
-		layout:      layout,
-		clientsMax:  uint32(config.ClientsMax),
-		group:       group,
-		memberCount: memberCount,
-		buffer:      buffer,
+		storage:           storage,
+		layout:            layout,
+		clientsMax:        uint32(config.ClientsMax),
+		group:             group,
+		memberCount:       memberCount,
+		checksumAlgorithm: config.ChecksumAlgorithm,
+		buffer:            buffer,
 	}, nil
 }
 
@@ -99,8 +101,9 @@ func (store *ReplyStore) beginIO(sequence *ioSequence, operation *IOOperation) e
 	if uint64(len(frame)) > store.layout.ReplyStride {
 		return ErrInvalidReplyStore
 	}
-	header, body, reason := protocol.DecodeFrame(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount)
-	if reason != protocol.RejectNone || header.Command != protocol.CommandReply || protocol.ChecksumBytes(body) != header.BodyChecksum {
+	header, body, reason := protocol.DecodeFrameWith(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount, store.checksumAlgorithm)
+	bodyChecksum, err := protocol.ChecksumBytesWith(store.checksumAlgorithm, body)
+	if reason != protocol.RejectNone || header.Command != protocol.CommandReply || err != nil || bodyChecksum != header.BodyChecksum {
 		return ErrInvalidReplyStore
 	}
 	clear(store.buffer)
@@ -128,7 +131,7 @@ func (store *ReplyStore) advanceIO(sequence *ioSequence, operation *IOOperation)
 		return ErrInvalidReplyStore
 	}
 	frame := physical[:size:size]
-	header, _, reason := protocol.DecodeFrame(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount)
+	header, _, reason := protocol.DecodeFrameWith(frame, store.group, uint32(store.layout.ReplyStride), store.memberCount, store.checksumAlgorithm)
 	expected := &operation.ExpectedHeader
 	if reason != protocol.RejectNone || header.Command != protocol.CommandReply || header.HeaderChecksum != expected.HeaderChecksum || replyClient(&header) != replyClient(expected) || replyOp(&header) != replyOp(expected) {
 		return ErrInvalidReplyStore

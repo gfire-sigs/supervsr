@@ -364,7 +364,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial Repl
 	if metrics == nil {
 		metrics = &ReplicaMetrics{}
 	}
-	checkpointID, err := initial.Checkpoint.ID()
+	checkpointID, err := initial.Checkpoint.IDWith(config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		_ = ioEngine.Close(context.Background())
 		return nil, err

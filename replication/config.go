@@ -54,6 +54,7 @@ type ClusterConfig struct {
 	TableCoalescingThresholdPercent uint64
 	ReleaseHistoryMax               uint64
 	StorageScansMax                 uint64
+	ChecksumAlgorithm               ChecksumAlgorithm
 }
 
 func DefaultClusterConfig() ClusterConfig {
@@ -168,6 +169,9 @@ func (cfg ClusterConfig) Validate(activeCount, standbyCount uint8) error {
 	if !ok || uint16(quorums.Replication)+uint16(quorums.ViewChange) <= uint16(activeCount) || uint16(quorums.Replication)+uint16(quorums.Negative) <= uint16(activeCount) {
 		return invalid("ReplicationQuorumMax", "derived quorums do not intersect")
 	}
+	if !cfg.ChecksumAlgorithm.Valid() {
+		return invalid("ChecksumAlgorithm", "must be AEGIS128L or Wyhash128")
+	}
 	if _, ok := cfg.BlockBase(); !ok {
 		return invalid("storage layout", "derived offsets overflow")
 	}
@@ -203,7 +207,24 @@ func (cfg ClusterConfig) FingerprintEncoding() [136]byte {
 
 func (cfg ClusterConfig) Fingerprint() protocol.Checksum {
 	encoded := cfg.FingerprintEncoding()
-	return protocol.ChecksumBytes(encoded[:])
+	if cfg.ChecksumAlgorithm == ChecksumAEGIS128L {
+		return protocol.ChecksumBytes(encoded[:])
+	}
+	if !cfg.ChecksumAlgorithm.Valid() {
+		return protocol.Checksum{}
+	}
+	var withAlgorithm [137]byte
+	copy(withAlgorithm[:], encoded[:])
+	withAlgorithm[136] = byte(cfg.ChecksumAlgorithm)
+	return mustChecksumBytes(cfg.ChecksumAlgorithm, withAlgorithm[:])
+}
+
+func mustChecksumBytes(algorithm ChecksumAlgorithm, input []byte) protocol.Checksum {
+	checksum, err := protocol.ChecksumBytesWith(algorithm, input)
+	if err != nil {
+		panic(err)
+	}
+	return checksum
 }
 
 func (cfg ClusterConfig) CheckpointInterval() (uint64, bool) {
@@ -303,6 +324,7 @@ type ProcessConfig struct {
 	ClockEpochMax           time.Duration
 	ClockWindowMin          time.Duration
 	ClockWindowMax          time.Duration
+	RequireHardwareChecksum bool
 }
 
 func DefaultProcessConfig() ProcessConfig {
@@ -363,6 +385,9 @@ func (cfg ProcessConfig) Validate(cluster ClusterConfig) error {
 	blockBase, ok := cluster.BlockBase()
 	if !ok || cfg.StorageSizeLimit < blockBase || (cfg.StorageSizeLimit-blockBase)%cluster.BlockSize != 0 {
 		return invalid("StorageSizeLimit", "must cover BlockBase in whole block extents")
+	}
+	if cfg.RequireHardwareChecksum && !protocol.HardwareChecksumAvailable() {
+		return ErrHardwareChecksumUnavailable
 	}
 	return nil
 }

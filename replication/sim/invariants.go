@@ -238,7 +238,7 @@ func compareCommits(left, right int, leftCommits, rightCommits []Commit) error {
 }
 
 func (cluster *Cluster) checkDurableReply(frame []byte) error {
-	reply, _, reason := protocol.DecodeFrame(frame, cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)))
+	reply, _, reason := protocol.DecodeFrameWith(frame, cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)), cluster.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || reply.Command != protocol.CommandReply {
 		return fmt.Errorf("%w: accepted reply has no valid wire identity", ErrInvariant)
 	}
@@ -307,7 +307,7 @@ func (cluster *Cluster) durablePrepareForReply(index int, reply protocol.Header)
 	if size < protocol.HeaderSize || uint64(size) > uint64(len(cluster.proofBuffer)) {
 		return protocol.Checksum{}, false
 	}
-	header, _, reason := protocol.DecodeFrame(cluster.proofBuffer[:size], cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)))
+	header, _, reason := protocol.DecodeFrameWith(cluster.proofBuffer[:size], cluster.config.Group, uint32(cluster.config.Cluster.MessageSizeMax), uint8(len(cluster.nodes)), cluster.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return protocol.Checksum{}, false
 	}

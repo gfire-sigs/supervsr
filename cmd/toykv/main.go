@@ -13,13 +13,15 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var (
-	errUsagePut       = errors.New("usage: put KEY VALUE")
-	errUsageGet       = errors.New("usage: get KEY")
-	errUsageDelete    = errors.New("usage: delete KEY")
-	errUnknownCommand = errors.New("commands: put, get, delete, quit")
+	errUsagePut            = errors.New("usage: put KEY VALUE")
+	errUsageGet            = errors.New("usage: get KEY")
+	errUsageDelete         = errors.New("usage: delete KEY")
+	errUnknownCommand      = errors.New("commands: put, get, delete, quit")
+	errInvalidChecksumMode = errors.New("checksum must be aegis or wyhash")
 )
 
 type options struct {
@@ -29,6 +31,7 @@ type options struct {
 	directIO       bool
 	prettyLogs     bool
 	logLevel       string
+	checksumMode   string
 }
 
 func main() {
@@ -79,8 +82,27 @@ func parseFlags() options {
 	flag.BoolVar(&cfg.directIO, "direct-io", false, "enable direct I/O for replica files")
 	flag.BoolVar(&cfg.prettyLogs, "pretty-logs", false, "render human-readable logs")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "zerolog level")
+	flag.StringVar(&cfg.checksumMode, "checksum", "aegis", "checksum algorithm: aegis or wyhash")
 	flag.Parse()
 	return cfg
+}
+
+func parseChecksumMode(mode string) (protocol.ChecksumAlgorithm, string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "aegis", "aegis128l":
+		return protocol.ChecksumAEGIS128L, "aegis", nil
+	case "wyhash", "wyhash128":
+		return protocol.ChecksumWyhash128, "wyhash", nil
+	default:
+		return 0, "", errInvalidChecksumMode
+	}
+}
+
+func checksumModeName(algorithm protocol.ChecksumAlgorithm) string {
+	if algorithm == protocol.ChecksumWyhash128 {
+		return "wyhash"
+	}
+	return "aegis"
 }
 
 func newLogger(cfg options) (zerolog.Logger, error) {

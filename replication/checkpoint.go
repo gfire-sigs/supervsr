@@ -41,12 +41,13 @@ type CheckpointState struct {
 }
 
 type CheckpointValidation struct {
-	Group          protocol.GroupID
-	MessageSizeMax uint32
-	MemberCount    uint8
-	BlockBase      uint64
-	BlockSize      uint64
-	ClientsMax     uint64
+	Group             protocol.GroupID
+	MessageSizeMax    uint32
+	MemberCount       uint8
+	BlockBase         uint64
+	BlockSize         uint64
+	ClientsMax        uint64
+	ChecksumAlgorithm ChecksumAlgorithm
 }
 
 func (state *CheckpointState) Encode(destination []byte) error {
@@ -117,7 +118,7 @@ func DecodeCheckpointState(source []byte, validation CheckpointValidation) (Chec
 }
 
 func (state *CheckpointState) Validate(validation CheckpointValidation) error {
-	header, reason := protocol.DecodeHeader(state.Header[:], validation.Group, validation.MessageSizeMax, validation.MemberCount)
+	header, reason := protocol.DecodeHeaderWith(state.Header[:], validation.Group, validation.MessageSizeMax, validation.MemberCount, validation.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidCheckpoint
 	}
@@ -125,7 +126,10 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 		return ErrInvalidCheckpoint
 	}
 	blockCount := (state.LogicalStorageSize - validation.BlockBase) / validation.BlockSize
-	emptyChecksum := protocol.ChecksumBytes(nil)
+	emptyChecksum, err := protocol.ChecksumBytesWith(validation.ChecksumAlgorithm, nil)
+	if err != nil {
+		return ErrInvalidCheckpoint
+	}
 	if !validEWAHTrailerReference(state.AcquiredTrailerLastAddress, state.AcquiredTrailerEncodedSize, state.AcquiredTrailerLastChecksum, state.AcquiredAggregateChecksum, emptyChecksum, blockCount) {
 		return ErrInvalidCheckpoint
 	}
@@ -152,11 +156,19 @@ func (state *CheckpointState) Validate(validation CheckpointValidation) error {
 }
 
 func (state *CheckpointState) ID() (protocol.CheckpointID, error) {
+	return state.IDWith(ChecksumAEGIS128L)
+}
+
+func (state *CheckpointState) IDWith(algorithm ChecksumAlgorithm) (protocol.CheckpointID, error) {
 	var encoded [CheckpointStateSize]byte
 	if err := state.Encode(encoded[:]); err != nil {
 		return protocol.CheckpointID{}, err
 	}
-	return protocol.CheckpointID(protocol.ChecksumBytes(encoded[:])), nil
+	checksum, err := protocol.ChecksumBytesWith(algorithm, encoded[:])
+	if err != nil {
+		return protocol.CheckpointID{}, err
+	}
+	return protocol.CheckpointID(checksum), nil
 }
 
 func (state *CheckpointState) PrepareOp() protocol.Op {

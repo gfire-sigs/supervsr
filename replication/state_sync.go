@@ -345,7 +345,7 @@ func (replica *Replica) stateSyncSuperblock() (Superblock, error) {
 	clear(next.ViewHeaders[:])
 	for index := range replica.stateSync.count {
 		header := replica.stateSync.headers[index]
-		if err := protocol.EncodeHeader(next.ViewHeaders[index][:], &header); err != nil {
+		if err := protocol.EncodeHeaderWith(next.ViewHeaders[index][:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			return Superblock{}, err
 		}
 	}
@@ -371,7 +371,7 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.stateSync.repliesPending = false
 	replica.syncRangeRepaired = false
 	target := replica.stateSync.checkpoint
-	checkpointID, err := target.ID()
+	checkpointID, err := target.IDWith(replica.config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		replica.fail(err)
 		return
@@ -383,7 +383,7 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.commitMin = target.PrepareOp()
 	replica.commitMax = replica.stateSync.commit
 	replica.headOp = target.PrepareOp()
-	header, reason := protocol.DecodeHeader(target.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	header, reason := protocol.DecodeHeaderWith(target.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		replica.fail(ErrInvalidCheckpoint)
 		return
@@ -459,7 +459,7 @@ func (replica *Replica) queueStateSyncTrailer(reference BlockReference, blockTyp
 }
 
 func (replica *Replica) continueStateSyncBlocks(completed *blockRepairTarget, physical []byte) {
-	frame, header, ok := decodeRepairFrame(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	frame, header, ok := decodeRepairFrameWith(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok {
 		replica.fail(ErrInvalidBlock)
 		return
@@ -541,6 +541,7 @@ func (replica *Replica) finishStateSyncBlocks() {
 		ActiveCount:             replica.membership.ActiveCount,
 		MessageSizeMax:          uint32(replica.config.Cluster.MessageSizeMax),
 		ApplicationReplySizeMax: uint32(replica.config.Cluster.ApplicationReplySizeMax),
+		ChecksumAlgorithm:       replica.config.Cluster.ChecksumAlgorithm,
 	})
 	if err != nil {
 		replica.fail(err)

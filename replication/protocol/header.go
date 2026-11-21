@@ -51,6 +51,10 @@ type Header struct {
 }
 
 func EncodeHeader(destination []byte, header *Header) error {
+	return EncodeHeaderWith(destination, header, ChecksumAEGIS128L)
+}
+
+func EncodeHeaderWith(destination []byte, header *Header, algorithm ChecksumAlgorithm) error {
 	if len(destination) != HeaderSize || header.Size < HeaderSize || header.Protocol != ProtocolVersion || header.Epoch != 0 || !header.Command.IsDefined() {
 		return ErrFrameEncoding
 	}
@@ -65,18 +69,27 @@ func EncodeHeader(destination []byte, header *Header) error {
 	destination[114] = byte(header.Command)
 	destination[115] = byte(header.Author)
 	copy(destination[128:256], header.Fields[:])
-	header.HeaderChecksum = ChecksumBytes(destination[HeaderChecksumFrom:])
+	checksum, err := ChecksumBytesWith(algorithm, destination[HeaderChecksumFrom:])
+	if err != nil {
+		return errors.Join(ErrFrameEncoding, err)
+	}
+	header.HeaderChecksum = checksum
 	copy(destination[:16], header.HeaderChecksum[:])
 	return nil
 }
 
 func DecodeHeader(source []byte, expectedGroup GroupID, messageSizeMax uint32, memberCount uint8) (Header, RejectReason) {
+	return DecodeHeaderWith(source, expectedGroup, messageSizeMax, memberCount, ChecksumAEGIS128L)
+}
+
+func DecodeHeaderWith(source []byte, expectedGroup GroupID, messageSizeMax uint32, memberCount uint8, algorithm ChecksumAlgorithm) (Header, RejectReason) {
 	if len(source) != HeaderSize {
 		return Header{}, RejectHeaderLength
 	}
 	var expectedChecksum Checksum
 	copy(expectedChecksum[:], source[:16])
-	if ChecksumBytes(source[HeaderChecksumFrom:]) != expectedChecksum {
+	computedChecksum, err := ChecksumBytesWith(algorithm, source[HeaderChecksumFrom:])
+	if err != nil || computedChecksum != expectedChecksum {
 		return Header{}, RejectHeaderChecksum
 	}
 	if !allZero(source[16:32]) {
@@ -126,20 +139,29 @@ func DecodeHeader(source []byte, expectedGroup GroupID, messageSizeMax uint32, m
 }
 
 func ValidateBody(header *Header, body []byte) RejectReason {
+	return ValidateBodyWith(header, body, ChecksumAEGIS128L)
+}
+
+func ValidateBodyWith(header *Header, body []byte, algorithm ChecksumAlgorithm) RejectReason {
 	if uint64(len(body))+HeaderSize != uint64(header.Size) {
 		return RejectBodyLength
 	}
-	if ChecksumBytes(body) != header.BodyChecksum {
+	computedChecksum, err := ChecksumBytesWith(algorithm, body)
+	if err != nil || computedChecksum != header.BodyChecksum {
 		return RejectBodyChecksum
 	}
 	return RejectNone
 }
 
 func DecodeFrame(frame []byte, expectedGroup GroupID, messageSizeMax uint32, memberCount uint8) (Header, []byte, RejectReason) {
+	return DecodeFrameWith(frame, expectedGroup, messageSizeMax, memberCount, ChecksumAEGIS128L)
+}
+
+func DecodeFrameWith(frame []byte, expectedGroup GroupID, messageSizeMax uint32, memberCount uint8, algorithm ChecksumAlgorithm) (Header, []byte, RejectReason) {
 	if len(frame) < HeaderSize {
 		return Header{}, nil, RejectHeaderLength
 	}
-	header, reason := DecodeHeader(frame[:HeaderSize], expectedGroup, messageSizeMax, memberCount)
+	header, reason := DecodeHeaderWith(frame[:HeaderSize], expectedGroup, messageSizeMax, memberCount, algorithm)
 	if reason != RejectNone {
 		return Header{}, nil, reason
 	}
@@ -147,19 +169,27 @@ func DecodeFrame(frame []byte, expectedGroup GroupID, messageSizeMax uint32, mem
 		return Header{}, nil, RejectBodyLength
 	}
 	body := frame[HeaderSize:header.Size:header.Size]
-	if reason := ValidateBody(&header, body); reason != RejectNone {
+	if reason := ValidateBodyWith(&header, body, algorithm); reason != RejectNone {
 		return Header{}, nil, reason
 	}
 	return header, body, RejectNone
 }
 
 func SealFrame(frame []byte, header *Header) error {
+	return SealFrameWith(frame, header, ChecksumAEGIS128L)
+}
+
+func SealFrameWith(frame []byte, header *Header, algorithm ChecksumAlgorithm) error {
 	if len(frame) < HeaderSize || len(frame) > int(^uint32(0)) {
 		return ErrFrameEncoding
 	}
+	checksum, err := ChecksumBytesWith(algorithm, frame[HeaderSize:])
+	if err != nil {
+		return errors.Join(ErrFrameEncoding, err)
+	}
 	header.Size = uint32(len(frame))
-	header.BodyChecksum = ChecksumBytes(frame[HeaderSize:])
-	return EncodeHeader(frame[:HeaderSize], header)
+	header.BodyChecksum = checksum
+	return EncodeHeaderWith(frame[:HeaderSize], header, algorithm)
 }
 
 func (command Command) IsDefined() bool {

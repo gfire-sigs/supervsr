@@ -24,3 +24,21 @@ func durableSync(file *os.File) error {
 func preallocateFile(file *os.File, size int64) error {
 	return unix.Fallocate(int(file.Fd()), 0, 0, size)
 }
+
+func openStorageFile(path string, create, direct bool) (*os.File, error) {
+	file, err := openStandardStorageFile(path, create, 0)
+	if err != nil {
+		return nil, err
+	}
+	if direct {
+		if err := configureDirectIO(file); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+	}
+	return file, nil
+}
+
+func syncParentDir(dir string) error {
+	return syncParentDirectoryFD(dir)
+}

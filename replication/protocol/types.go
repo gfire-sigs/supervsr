@@ -90,6 +90,28 @@ const (
 
 type BlockType uint8
 
+type ChecksumAlgorithm uint8
+
+const (
+	ChecksumAEGIS128L ChecksumAlgorithm = 0
+	ChecksumWyhash128 ChecksumAlgorithm = 1
+)
+
+func (algorithm ChecksumAlgorithm) Valid() bool {
+	return algorithm == ChecksumAEGIS128L || algorithm == ChecksumWyhash128
+}
+
+func (algorithm ChecksumAlgorithm) String() string {
+	switch algorithm {
+	case ChecksumAEGIS128L:
+		return "aegis128l"
+	case ChecksumWyhash128:
+		return "wyhash128"
+	default:
+		return "unknown"
+	}
+}
+
 func (checksum Checksum) IsZero() bool {
 	return checksum == Checksum{}
 }

@@ -13,7 +13,7 @@ func (replica *Replica) handleMessage(message *Message) bool {
 		replica.metrics.framesRejected.Add(1)
 		return false
 	}
-	header, body, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	header, body, reason := protocol.DecodeFrameWith(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		replica.metrics.framesRejected.Add(1)
 		if reason == protocol.RejectCommand {
@@ -88,6 +88,7 @@ func (replica *Replica) validationContext(source protocol.FrameSource, sender pr
 		RepairRequestsMax:       replica.config.Process.RepairRequestsMax,
 		CurrentRelease:          replica.config.CurrentRelease, ClientReleaseMin: replica.config.ClientReleaseMin,
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
+		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 }
 
@@ -282,7 +283,7 @@ func (replica *Replica) sendEviction(client protocol.ClientID, reason protocol.E
 	}
 	copy(header.Fields[:16], client[:])
 	header.Fields[127] = byte(reason)
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendClient(client, message)
 	}
 	message.Release()
@@ -300,7 +301,7 @@ func (replica *Replica) handleClientPing(ping protocol.Header) {
 	copy(header.Fields[:8], ping.Fields[16:24])
 	var client protocol.ClientID
 	copy(client[:], ping.Fields[:16])
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendClient(client, message)
 	}
 	message.Release()
@@ -350,7 +351,7 @@ func (replica *Replica) createPrepare(request protocol.Header, requestBody []byt
 	binary.LittleEndian.PutUint64(header.Fields[112:120], timestamp)
 	copy(header.Fields[120:124], request.Fields[64:68])
 	header.Fields[124] = byte(operation)
-	if err := prepare.Seal(&header); err != nil {
+	if err := prepare.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		prepare.Release()
 		return err
 	}
@@ -522,7 +523,7 @@ func (replica *Replica) sendPrepareOK(entry *pipelineEntry) {
 	copy(header.Fields[96:104], entry.header.Fields[96:104])
 	binary.LittleEndian.PutUint64(header.Fields[104:112], uint64(replica.commitMin))
 	copy(header.Fields[112:125], entry.header.Fields[112:125])
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		message.Release()
 		replica.fail(err)
 		return
@@ -838,8 +839,12 @@ func (replica *Replica) buildReplyHeader(entry *pipelineEntry, reply *Message, r
 	if err != nil {
 		return protocol.Header{}, err
 	}
+	bodyChecksum, err := protocol.ChecksumBytesWith(replica.config.Cluster.ChecksumAlgorithm, body[:replyLength])
+	if err != nil {
+		return protocol.Header{}, err
+	}
 	header := protocol.Header{
-		BodyChecksum: protocol.ChecksumBytes(body[:replyLength]),
+		BodyChecksum: bodyChecksum,
 		Group:        replica.config.Group,
 		Size:         protocol.HeaderSize + replyLength,
 		View:         entry.header.View,
@@ -855,12 +860,15 @@ func (replica *Replica) buildReplyHeader(entry *pipelineEntry, reply *Message, r
 	copy(header.Fields[96:104], entry.header.Fields[112:120])
 	copy(header.Fields[104:109], entry.header.Fields[120:125])
 	var encoded [protocol.HeaderSize]byte
-	if err := protocol.EncodeHeader(encoded[:], &header); err != nil {
+	if err := protocol.EncodeHeaderWith(encoded[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		return protocol.Header{}, err
 	}
-	context := protocol.ChecksumBytes(encoded[protocol.HeaderChecksumFrom:])
+	context, err := protocol.ChecksumBytesWith(replica.config.Cluster.ChecksumAlgorithm, encoded[protocol.HeaderChecksumFrom:])
+	if err != nil {
+		return protocol.Header{}, err
+	}
 	copy(header.Fields[32:48], context[:])
-	if err := reply.Seal(&header); err != nil {
+	if err := reply.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		return protocol.Header{}, err
 	}
 	return header, nil
@@ -936,7 +944,7 @@ func (replica *Replica) sendHeaderOnlyCachedReply(client protocol.ClientID, head
 	}
 	header.View = replica.logView
 	header.Author = replica.membership.Primary(header.View)
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		message.Release()
 		return
 	}
@@ -968,7 +976,7 @@ func (replica *Replica) finishDuplicateRead(read *duplicateRead, completion IOCo
 	copy(body, completion.Buffer[protocol.HeaderSize:completion.Size])
 	header.View = replica.logView
 	header.Author = replica.membership.Primary(header.View)
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		message.Release()
 		return
 	}
@@ -1000,7 +1008,7 @@ func (replica *Replica) dequeueRequest() {
 		queued.message.Release()
 		return
 	}
-	header, body, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	header, body, reason := protocol.DecodeFrameWith(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || !replica.handleRequest(queued.message, header, body, queued.time) {
 		queued.message.Release()
 	}
@@ -1022,7 +1030,7 @@ func (replica *Replica) pipelineConflict(client protocol.ClientID, request proto
 		if err != nil {
 			continue
 		}
-		header, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		header, _, reason := protocol.DecodeFrameWith(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		queuedRequestNo := protocol.RequestNo(binary.LittleEndian.Uint32(header.Fields[64:68]))
 		if reason == protocol.RejectNone && requestClient(&header) == client && queuedRequestNo == request {
 			if header.HeaderChecksum != checksum {

@@ -59,7 +59,7 @@ func (store *BlockStore) Write(address, snapshot uint64, blockType protocol.Bloc
 	binary.LittleEndian.PutUint64(header.Fields[104:112], snapshot)
 	header.Fields[112] = byte(blockType)
 	frame := store.scratch[:protocol.HeaderSize+len(body)]
-	if err := protocol.SealFrame(frame, &header); err != nil {
+	if err := protocol.SealFrameWith(frame, &header, store.cluster.ChecksumAlgorithm); err != nil {
 		return BlockReference{}, errors.Join(ErrInvalidBlock, err)
 	}
 	if err := store.storage.WriteAt(store.scratch, offset); err != nil {
@@ -83,7 +83,7 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	if err := store.storage.ReadAt(store.scratch, offset); err != nil {
 		return BlockReadResult{}, err
 	}
-	header, reason := protocol.DecodeHeader(store.scratch[:protocol.HeaderSize], store.group, uint32(store.cluster.BlockSize), 1)
+	header, reason := protocol.DecodeHeaderWith(store.scratch[:protocol.HeaderSize], store.group, uint32(store.cluster.BlockSize), 1, store.cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandBlock || header.HeaderChecksum != reference.Checksum {
 		return BlockReadResult{}, fmt.Errorf(
 			"%w: address %d checksum %s found %s command %d rejection %d",
@@ -93,7 +93,7 @@ func (store *BlockStore) Read(reference BlockReference, blockType protocol.Block
 	if header.Size > uint32(store.cluster.BlockSize) || !allZeroBytes(store.scratch[header.Size:]) {
 		return BlockReadResult{}, ErrInvalidBlock
 	}
-	header, body, reason := protocol.DecodeFrame(store.scratch[:header.Size], store.group, uint32(store.cluster.BlockSize), 1)
+	header, body, reason := protocol.DecodeFrameWith(store.scratch[:header.Size], store.group, uint32(store.cluster.BlockSize), 1, store.cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Release == 0 || header.Release > store.release {
 		return BlockReadResult{}, ErrInvalidBlock
 	}

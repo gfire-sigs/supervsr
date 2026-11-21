@@ -294,11 +294,7 @@ func (machine *processCounterMachine) persist() error {
 	if err := os.Rename(temporary, machine.path); err != nil {
 		return err
 	}
-	directory, err := os.Open(filepath.Dir(machine.path))
-	if err != nil {
-		return err
-	}
-	return errors.Join(directory.Sync(), directory.Close())
+	return syncParentDir(filepath.Dir(machine.path))
 }
 
 func encodeProcessCounter(reply []byte, value uint64) (int, error) {

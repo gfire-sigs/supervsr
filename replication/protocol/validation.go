@@ -17,6 +17,7 @@ type ValidationContext struct {
 	ClientReleaseMin        Release
 	Group                   GroupID
 	MessageSizeMax          uint32
+	ChecksumAlgorithm       ChecksumAlgorithm
 }
 
 func ValidateSemantics(header *Header, body []byte, context ValidationContext) RejectReason {
@@ -299,7 +300,7 @@ func validateEmbeddedPrepareHeaders(body []byte, context ValidationContext, allo
 		if allowBlank && allZero(encoded) {
 			continue
 		}
-		header, reason := DecodeHeader(encoded, context.Group, context.MessageSizeMax, context.MemberCount)
+		header, reason := DecodeHeaderWith(encoded, context.Group, context.MessageSizeMax, context.MemberCount, context.ChecksumAlgorithm)
 		if reason != RejectNone || header.Command != CommandPrepare {
 			return RejectBodyShape
 		}

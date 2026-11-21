@@ -278,7 +278,7 @@ func (replica *Replica) sendGetBlocks(peer protocol.ReplicaIndex, references []B
 		binary.LittleEndian.PutUint64(body[offset+16:offset+24], reference.Address)
 	}
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetBlocks, Author: replica.local}
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	}
 	message.Release()
@@ -305,7 +305,7 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 			continue
 		}
 		clear(operation.buffer)
-		if err := protocol.EncodeHeader(operation.buffer[:protocol.HeaderSize], &header); err != nil {
+		if err := protocol.EncodeHeaderWith(operation.buffer[:protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			return
 		}
 		copy(operation.buffer[protocol.HeaderSize:], body)
@@ -414,7 +414,7 @@ func (replica *Replica) finishBlockRepairRead(operation *blockRepairIO, target *
 		target.state = blockRepairMissing
 		return
 	}
-	frame, header, ok := decodeRepairFrame(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	frame, header, ok := decodeRepairFrameWith(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok || !replica.validRequestedBlock(target, header, frame[protocol.HeaderSize:]) || !allZeroBytes(operation.buffer[len(frame):]) {
 		target.state = blockRepairMissing
 		return
@@ -458,7 +458,7 @@ func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *
 func (replica *Replica) blockRepairCompleted(target *blockRepairTarget, physical []byte) {
 	completed := *target
 	*target = blockRepairTarget{}
-	frame, header, ok := decodeRepairFrame(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	frame, header, ok := decodeRepairFrameWith(physical, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok {
 		replica.fail(ErrInvalidBlock)
 		return

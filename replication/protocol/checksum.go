@@ -4,9 +4,20 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"math/bits"
 )
 
-var ErrChecksumLengthOverflow = errors.New("protocol: checksum input length overflow")
+var (
+	ErrChecksumLengthOverflow   = errors.New("protocol: checksum input length overflow")
+	ErrInvalidChecksumAlgorithm = errors.New("protocol: invalid checksum algorithm")
+)
+
+const (
+	wySecret0 uint64 = 0x2d358dccaa6c78a5
+	wySecret1 uint64 = 0x8bb84b93962eacc9
+	wySecret2 uint64 = 0x4b33a62ed433d4a3
+	wySecret3 uint64 = 0x4d5a2da51de1aa47
+)
 
 const checksumInputBytesMax = math.MaxUint64 / 8
 
@@ -35,10 +46,12 @@ var (
 )
 
 type ChecksumHasher struct {
-	state    [8][16]byte
-	buffer   [32]byte
-	buffered uint8
-	length   uint64
+	algorithm ChecksumAlgorithm
+	state     [8][16]byte
+	wyState   [4]uint64
+	buffer    [32]byte
+	buffered  uint8
+	length    uint64
 }
 
 func NewChecksumHasher() ChecksumHasher {
@@ -47,8 +60,31 @@ func NewChecksumHasher() ChecksumHasher {
 	return hasher
 }
 
+func NewChecksumHasherWith(algorithm ChecksumAlgorithm) (ChecksumHasher, error) {
+	var hasher ChecksumHasher
+	if err := hasher.ResetWith(algorithm); err != nil {
+		return ChecksumHasher{}, err
+	}
+	return hasher, nil
+}
+
 func (hasher *ChecksumHasher) Reset() {
-	*hasher = ChecksumHasher{}
+	algorithm := hasher.algorithm
+	if !algorithm.Valid() {
+		algorithm = ChecksumAEGIS128L
+	}
+	_ = hasher.ResetWith(algorithm)
+}
+
+func (hasher *ChecksumHasher) ResetWith(algorithm ChecksumAlgorithm) error {
+	if !algorithm.Valid() {
+		return ErrInvalidChecksumAlgorithm
+	}
+	*hasher = ChecksumHasher{algorithm: algorithm}
+	if algorithm == ChecksumWyhash128 {
+		hasher.wyState = [4]uint64{wySecret0, wySecret1, wySecret2, wySecret3}
+		return nil
+	}
 	hasher.state[1] = aegisConstant0
 	hasher.state[2] = aegisConstant1
 	hasher.state[3] = aegisConstant0
@@ -58,6 +94,7 @@ func (hasher *ChecksumHasher) Reset() {
 	for range 10 {
 		hasher.update([16]byte{}, [16]byte{})
 	}
+	return nil
 }
 
 func (hasher *ChecksumHasher) Write(input []byte) (int, error) {
@@ -75,15 +112,12 @@ func (hasher *ChecksumHasher) Write(input []byte) (int, error) {
 		if copied < needed {
 			return inputLength, nil
 		}
-		hasher.update(
-			[16]byte(hasher.buffer[:16]),
-			[16]byte(hasher.buffer[16:]),
-		)
+		hasher.consumeBlock(hasher.buffer[:])
 		hasher.buffered = 0
 	}
 
 	for len(input) >= 32 {
-		hasher.update([16]byte(input[:16]), [16]byte(input[16:32]))
+		hasher.consumeBlock(input[:32])
 		input = input[32:]
 	}
 	if len(input) != 0 {
@@ -93,6 +127,9 @@ func (hasher *ChecksumHasher) Write(input []byte) (int, error) {
 }
 
 func (hasher ChecksumHasher) Sum() Checksum {
+	if hasher.algorithm == ChecksumWyhash128 {
+		return wyFinalize(hasher.wyState, hasher.buffer[:hasher.buffered], hasher.length)
+	}
 	if hasher.buffered != 0 {
 		clear(hasher.buffer[hasher.buffered:])
 		hasher.update([16]byte(hasher.buffer[:16]), [16]byte(hasher.buffer[16:]))
@@ -124,6 +161,65 @@ func ChecksumBytes(input []byte) Checksum {
 		panic(err)
 	}
 	return hasher.Sum()
+}
+
+func ChecksumBytesWith(algorithm ChecksumAlgorithm, input []byte) (Checksum, error) {
+	if !algorithm.Valid() {
+		return Checksum{}, ErrInvalidChecksumAlgorithm
+	}
+	if algorithm == ChecksumAEGIS128L {
+		return ChecksumBytes(input), nil
+	}
+	state := [4]uint64{wySecret0, wySecret1, wySecret2, wySecret3}
+	totalLen := uint64(len(input))
+	for len(input) >= 32 {
+		wyUpdateBlock(&state, input[:32])
+		input = input[32:]
+	}
+	return wyFinalize(state, input, totalLen), nil
+}
+
+func (hasher *ChecksumHasher) consumeBlock(block []byte) {
+	if hasher.algorithm == ChecksumWyhash128 {
+		wyUpdateBlock(&hasher.wyState, block)
+		return
+	}
+	hasher.update([16]byte(block[:16]), [16]byte(block[16:32]))
+}
+
+func wyMix(left, right uint64) uint64 {
+	high, low := bits.Mul64(left, right)
+	return high ^ low
+}
+
+func wyUpdateBlock(state *[4]uint64, block []byte) {
+	r0 := binary.LittleEndian.Uint64(block[0:8])
+	r1 := binary.LittleEndian.Uint64(block[8:16])
+	r2 := binary.LittleEndian.Uint64(block[16:24])
+	r3 := binary.LittleEndian.Uint64(block[24:32])
+	state[0] = wyMix(r0^wySecret1, r1^state[0]^state[1])
+	state[1] = wyMix(r2^wySecret2, r3^state[1]^state[2])
+	state[2] = wyMix(r1^wySecret3, r2^state[2]^state[3])
+	state[3] = wyMix(r3^wySecret0, r0^state[3]^state[0])
+}
+
+func wyFinalize(state [4]uint64, tail []byte, totalLen uint64) Checksum {
+	var padded [32]byte
+	copy(padded[:], tail)
+	wyUpdateBlock(&state, padded[:])
+	a := wyMix(state[0]^wySecret0, totalLen^wySecret1)
+	b := wyMix(state[1]^wySecret2, state[2]^wySecret3)
+	c := wyMix(state[3]^wySecret1, a^b)
+	low := wyMix(a^c^wySecret2, state[0]^state[1]^totalLen)
+	high := wyMix(b^c^wySecret3, state[2]^state[3]^(totalLen*wySecret0))
+	if low == 0 && high == 0 {
+		// Preserve the non-zero invariant required by WAL and block references.
+		low = 1
+	}
+	var checksum Checksum
+	binary.LittleEndian.PutUint64(checksum[:8], low)
+	binary.LittleEndian.PutUint64(checksum[8:], high)
+	return checksum
 }
 
 func (hasher *ChecksumHasher) update(input0, input1 [16]byte) {

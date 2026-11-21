@@ -50,7 +50,7 @@ func TestFileStorageDurabilityAndExactIO(t *testing.T) {
 }
 
 func TestDirectStorageRequiresAlignedBuffers(t *testing.T) {
-	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
 		t.Skip("direct I/O hook unavailable")
 	}
 	path := filepath.Join(t.TempDir(), "direct.data")

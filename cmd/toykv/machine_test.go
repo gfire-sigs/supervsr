@@ -299,7 +299,7 @@ func persistCurrentSnapshot(t *testing.T, machine *kvMachine, op protocol.Op) {
 }
 
 func newSnapshotTestMachine(directory string) *kvMachine {
-	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, zerolog.Nop())
+	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, protocol.ChecksumAEGIS128L, zerolog.Nop())
 }
 
 func TestClientEventsNonBlockingAndRequestCorrelated(t *testing.T) {

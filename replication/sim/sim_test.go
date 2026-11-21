@@ -1264,3 +1264,82 @@ func compactMemberSnapshots(cluster *Cluster, members uint8) []string {
 	}
 	return states
 }
+
+func TestClusterWyhash128CommitsViewChangesAndCheckpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	config := DefaultConfig(3)
+	config.Cluster.ChecksumAlgorithm = replication.ChecksumWyhash128
+	config.Cluster.JournalSlots = 32
+	config.Cluster.CompactionOps = 8
+	interval, ok := config.Cluster.CheckpointInterval()
+	if !ok {
+		t.Fatal("checkpoint interval invalid")
+	}
+	cluster, err := NewCluster(ctx, config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	events := &clientEvents{}
+	client, err := cluster.AddClient(protocol.ClientID{9}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disconnect and crash primary to force a view change under ChecksumWyhash128.
+	primary := currentPrimary(t, cluster)
+	if err := cluster.Network().Disconnect(primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Crash(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 4_000, liveReplicasAgree); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	if err := cluster.Restart(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Network().Reconnect(primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 4_000, replicasAgree); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+
+	for index := range int(interval + config.Cluster.CompactionOps) {
+		if err := client.Submit(protocol.OperationApplicationMin, []byte{byte(index)}); err != nil {
+			t.Fatalf("submit %d: %v", index, err)
+		}
+		want := index + 2
+		if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == want }); err != nil {
+			t.Fatalf("reply %d: %v snapshots=%v", index, err, clusterSnapshots(cluster))
+		}
+	}
+	if err := runUntil(cluster, 4_000, func(cluster *Cluster) bool {
+		if !replicasAgree(cluster) {
+			return false
+		}
+		snapshot, ok := cluster.Snapshot(0)
+		return ok && snapshot.View > 0 && snapshot.Checkpoint.PrepareOp() > 0
+	}); err != nil {
+		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	if err := cluster.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -129,3 +129,120 @@ func BenchmarkChecksum1KiB(b *testing.B) {
 		_ = ChecksumBytes(input)
 	}
 }
+
+func TestWyhash128ChunkingIsCanonical(t *testing.T) {
+	input := make([]byte, 4097)
+	for index := range input {
+		input[index] = byte(index*131 + 17)
+	}
+	want, err := ChecksumBytesWith(ChecksumWyhash128, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for chunkSize := 1; chunkSize <= 65; chunkSize++ {
+		hasher, err := NewChecksumHasherWith(ChecksumWyhash128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for offset := 0; offset < len(input); offset += chunkSize {
+			limit := min(offset+chunkSize, len(input))
+			if _, err := hasher.Write(input[offset:limit]); err != nil {
+				t.Fatalf("chunk size %d: %v", chunkSize, err)
+			}
+		}
+		if got := hasher.Sum(); got != want {
+			t.Fatalf("chunk size %d checksum = %x, want %x", chunkSize, got, want)
+		}
+	}
+}
+
+func TestWyhash128SumDoesNotConsumeHasher(t *testing.T) {
+	hasher, err := NewChecksumHasherWith(ChecksumWyhash128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hasher.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	first := hasher.Sum()
+	if _, err := hasher.Write([]byte(" second")); err != nil {
+		t.Fatal(err)
+	}
+	second := hasher.Sum()
+	wantFirst, err := ChecksumBytesWith(ChecksumWyhash128, []byte("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecond, err := ChecksumBytesWith(ChecksumWyhash128, []byte("first second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != wantFirst {
+		t.Fatalf("first checksum = %x, want %x", first, wantFirst)
+	}
+	if second != wantSecond {
+		t.Fatalf("second checksum = %x, want %x", second, wantSecond)
+	}
+}
+
+func TestWyhash128DistinctNonZeroAndRejectsInvalidAlgorithm(t *testing.T) {
+	empty, err := ChecksumBytesWith(ChecksumWyhash128, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.IsZero() {
+		t.Fatal("empty wyhash128 checksum unexpectedly zero")
+	}
+	zeroBytes, err := ChecksumBytesWith(ChecksumWyhash128, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zeroBytes.IsZero() || zeroBytes == empty {
+		t.Fatalf("zeroBytes = %x, empty = %x", zeroBytes, empty)
+	}
+	flipped := make([]byte, 32)
+	flipped[31] = 1
+	altered, err := ChecksumBytesWith(ChecksumWyhash128, flipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if altered == zeroBytes {
+		t.Fatal("single-bit flip produced identical wyhash128 checksum")
+	}
+
+	if _, err := ChecksumBytesWith(ChecksumAlgorithm(99), flipped); !errors.Is(err, ErrInvalidChecksumAlgorithm) {
+		t.Fatalf("ChecksumBytesWith(99) err = %v, want %v", err, ErrInvalidChecksumAlgorithm)
+	}
+	if _, err := NewChecksumHasherWith(ChecksumAlgorithm(99)); !errors.Is(err, ErrInvalidChecksumAlgorithm) {
+		t.Fatalf("NewChecksumHasherWith(99) err = %v, want %v", err, ErrInvalidChecksumAlgorithm)
+	}
+}
+
+func TestWyhash128SteadyStateHasNoAllocations(t *testing.T) {
+	input := make([]byte, 1024)
+	allocations := testing.AllocsPerRun(10_000, func() {
+		if _, err := ChecksumBytesWith(ChecksumWyhash128, input); err != nil {
+			bFail(t, err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("allocations per wyhash128 checksum = %f, want 0", allocations)
+	}
+}
+
+func bFail(t *testing.T, err error) {
+	t.Helper()
+	t.Fatal(err)
+}
+
+func BenchmarkChecksumWyhash1281KiB(b *testing.B) {
+	input := make([]byte, 1024)
+	b.SetBytes(int64(len(input)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ChecksumBytesWith(ChecksumWyhash128, input); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

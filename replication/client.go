@@ -36,12 +36,13 @@ type ClientEvents interface {
 }
 
 type ClientConfig struct {
-	Group          protocol.GroupID
-	ID             protocol.ClientID
-	Release        protocol.Release
-	ActiveCount    uint8
-	MessageSizeMax uint32
-	Process        ProcessConfig
+	Group             protocol.GroupID
+	ID                protocol.ClientID
+	Release           protocol.Release
+	ActiveCount       uint8
+	MessageSizeMax    uint32
+	ChecksumAlgorithm ChecksumAlgorithm
+	Process           ProcessConfig
 }
 
 type clientInflight struct {
@@ -76,6 +77,9 @@ type Client struct {
 
 func NewClient(config ClientConfig, bus MessageBus, clock Clock, entropy io.Reader, events ClientEvents) (*Client, error) {
 	if config.Group.IsZero() || config.ID.IsZero() || config.Release == 0 || config.ActiveCount == 0 || config.ActiveCount > ActiveMax {
+		return nil, ErrInvalidConfiguration
+	}
+	if !config.ChecksumAlgorithm.Valid() {
 		return nil, ErrInvalidConfiguration
 	}
 	if bus == nil || clock == nil || entropy == nil || events == nil || config.MessageSizeMax < protocol.HeaderSize+256 {
@@ -174,7 +178,7 @@ func (client *Client) send(operation protocol.Operation, request protocol.Reques
 	binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(client.session))
 	binary.LittleEndian.PutUint32(header.Fields[64:68], uint32(request))
 	header.Fields[68] = byte(operation)
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, client.config.ChecksumAlgorithm); err != nil {
 		message.Release()
 		return err
 	}
@@ -202,7 +206,7 @@ func (client *Client) HandleFrame(sender protocol.ReplicaIndex, frame []byte) {
 	if client.state == ClientClosed || uint8(sender) >= client.config.ActiveCount {
 		return
 	}
-	header, body, reason := protocol.DecodeFrame(frame, client.config.Group, client.config.MessageSizeMax, client.config.ActiveCount)
+	header, body, reason := protocol.DecodeFrameWith(frame, client.config.Group, client.config.MessageSizeMax, client.config.ActiveCount, client.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return
 	}
@@ -212,6 +216,7 @@ func (client *Client) HandleFrame(sender protocol.ReplicaIndex, frame []byte) {
 		PipelineMax: 15, ReleaseHistoryMax: 1, ApplicationBatchSizeMax: client.config.MessageSizeMax - protocol.HeaderSize,
 		ApplicationReplySizeMax: client.config.MessageSizeMax - protocol.HeaderSize, RepairRequestsMax: 1,
 		CurrentRelease: protocol.Release(^uint32(0)), ClientReleaseMin: 1, Group: client.config.Group, MessageSizeMax: client.config.MessageSizeMax,
+		ChecksumAlgorithm: client.config.ChecksumAlgorithm,
 	}
 	if protocol.ValidateSemantics(&header, body, context) != protocol.RejectNone {
 		return
@@ -316,7 +321,7 @@ func (client *Client) sendPing() {
 	copy(header.Fields[:16], client.config.ID[:])
 	binary.LittleEndian.PutUint64(header.Fields[16:24], client.lastPing)
 	binary.LittleEndian.PutUint64(header.Fields[24:32], uint64(client.session))
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, client.config.ChecksumAlgorithm) == nil {
 		for member := range client.config.ActiveCount {
 			client.bus.SendReplica(protocol.ReplicaIndex(member), message)
 		}

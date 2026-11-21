@@ -14,10 +14,11 @@ var (
 )
 
 type FormatConfig struct {
-	Group          protocol.GroupID
-	Membership     Membership
-	Cluster        ClusterConfig
-	CurrentRelease protocol.Release
+	Group                   protocol.GroupID
+	Membership              Membership
+	Cluster                 ClusterConfig
+	CurrentRelease          protocol.Release
+	RequireHardwareChecksum bool
 }
 
 type FormatDependencies struct {
@@ -55,7 +56,7 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 	if err != nil {
 		return err
 	}
-	root, err := rootPrepareHeader(cfg.Group, memberCount, uint32(cfg.Cluster.MessageSizeMax))
+	root, err := rootPrepareHeaderWith(cfg.Group, memberCount, uint32(cfg.Cluster.MessageSizeMax), cfg.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		return err
 	}
@@ -77,7 +78,10 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 		return err
 	}
 
-	emptyChecksum := protocol.ChecksumBytes(nil)
+	emptyChecksum, err := protocol.ChecksumBytesWith(cfg.Cluster.ChecksumAlgorithm, nil)
+	if err != nil {
+		return err
+	}
 	checkpoint := CheckpointState{
 		Header:                    root,
 		AcquiredAggregateChecksum: emptyChecksum,
@@ -140,7 +144,7 @@ func validateFormatConfig(cfg FormatConfig, dependencies FormatDependencies) err
 	if dependencies.Storage == nil {
 		return &ConfigError{Field: "Storage", Reason: "must be supplied"}
 	}
-	if !protocol.HardwareChecksumAvailable() {
+	if cfg.RequireHardwareChecksum && !protocol.HardwareChecksumAvailable() {
 		return ErrHardwareChecksumUnavailable
 	}
 	if cfg.Group.IsZero() || cfg.CurrentRelease == 0 {
@@ -172,6 +176,10 @@ func zeroStorage(ctx context.Context, storage Storage, size uint64) error {
 }
 
 func rootPrepareHeader(group protocol.GroupID, memberCount uint8, messageSizeMax uint32) ([protocol.HeaderSize]byte, error) {
+	return rootPrepareHeaderWith(group, memberCount, messageSizeMax, ChecksumAEGIS128L)
+}
+
+func rootPrepareHeaderWith(group protocol.GroupID, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
 	var encoded [protocol.HeaderSize]byte
 	header := protocol.Header{
 		Group:    group,
@@ -180,10 +188,10 @@ func rootPrepareHeader(group protocol.GroupID, memberCount uint8, messageSizeMax
 		Author:   0,
 	}
 	header.Fields[124] = byte(protocol.OperationRoot)
-	if err := protocol.SealFrame(encoded[:], &header); err != nil {
+	if err := protocol.SealFrameWith(encoded[:], &header, algorithm); err != nil {
 		return [protocol.HeaderSize]byte{}, err
 	}
-	if _, reason := protocol.DecodeHeader(encoded[:], group, messageSizeMax, memberCount); reason != protocol.RejectNone {
+	if _, reason := protocol.DecodeHeaderWith(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
 		return [protocol.HeaderSize]byte{}, ErrInvalidWAL
 	}
 	return encoded, nil

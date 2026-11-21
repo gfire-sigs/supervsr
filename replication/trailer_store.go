@@ -83,8 +83,13 @@ func (store *TrailerStore) WriteReserved(allocator *BlockAllocator, addresses []
 		previous = reference
 		cursor = end
 	}
+	aggregate, err := protocol.ChecksumBytesWith(store.blocks.cluster.ChecksumAlgorithm, encoded)
+	if err != nil {
+		store.rollback(allocator, addresses, published)
+		return TrailerReference{}, err
+	}
 	return TrailerReference{
-		Last: previous, Aggregate: protocol.ChecksumBytes(encoded), EncodedSize: uint64(len(encoded)),
+		Last: previous, Aggregate: aggregate, EncodedSize: uint64(len(encoded)),
 		BlockCount: uint32(len(addresses)), BlockType: blockType, Snapshot: snapshot,
 	}, nil
 }
@@ -119,7 +124,8 @@ func (store *TrailerStore) Read(reference TrailerReference, destination []byte) 
 		current = BlockReference{Checksum: previousChecksum, Address: previousAddress}
 	}
 	invalidEnd := cursor != 0 || current.Address != 0 || !current.Checksum.IsZero()
-	if invalidEnd || protocol.ChecksumBytes(destination) != reference.Aggregate {
+	aggregate, err := protocol.ChecksumBytesWith(store.blocks.cluster.ChecksumAlgorithm, destination)
+	if invalidEnd || err != nil || aggregate != reference.Aggregate {
 		return ErrInvalidBlock
 	}
 	return nil

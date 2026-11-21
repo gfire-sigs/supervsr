@@ -42,6 +42,7 @@ type SessionTableConfig struct {
 	ActiveCount             uint8
 	MessageSizeMax          uint32
 	ApplicationReplySizeMax uint32
+	ChecksumAlgorithm       ChecksumAlgorithm
 }
 
 type SessionRecord struct {
@@ -66,7 +67,7 @@ type SessionTable struct {
 }
 
 func NewSessionTable(config SessionTableConfig) (*SessionTable, error) {
-	if config.ClientsMax == 0 || config.ActiveCount == 0 || config.MessageSizeMax < protocol.HeaderSize || config.ApplicationReplySizeMax > config.MessageSizeMax-protocol.HeaderSize {
+	if config.ClientsMax == 0 || config.ActiveCount == 0 || config.MessageSizeMax < protocol.HeaderSize || config.ApplicationReplySizeMax > config.MessageSizeMax-protocol.HeaderSize || !config.ChecksumAlgorithm.Valid() {
 		return nil, ErrSessionCapacity
 	}
 	return &SessionTable{
@@ -227,19 +228,20 @@ func (table *SessionTable) EncodeTrailer(destination []byte) (protocol.Checksum,
 		}
 		header := record.Reply
 		start := slot * protocol.HeaderSize
-		if err := protocol.EncodeHeader(destination[start:start+protocol.HeaderSize], &header); err != nil || header.HeaderChecksum != record.Reply.HeaderChecksum {
+		if err := protocol.EncodeHeaderWith(destination[start:start+protocol.HeaderSize], &header, table.config.ChecksumAlgorithm); err != nil || header.HeaderChecksum != record.Reply.HeaderChecksum {
 			return protocol.Checksum{}, ErrSessionEncoding
 		}
 		binary.LittleEndian.PutUint64(destination[sessionsOffset+slot*8:], uint64(record.Session))
 	}
-	return protocol.ChecksumBytes(destination), nil
+	return protocol.ChecksumBytesWith(table.config.ChecksumAlgorithm, destination)
 }
 
 func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protocol.Checksum) error {
 	if len(source) != table.TrailerSize() {
 		return ErrSessionEncoding
 	}
-	if protocol.ChecksumBytes(source) != expectedChecksum {
+	computed, err := protocol.ChecksumBytesWith(table.config.ChecksumAlgorithm, source)
+	if err != nil || computed != expectedChecksum {
 		return ErrSessionChecksum
 	}
 	decoded := make([]SessionRecord, len(table.records))
@@ -254,7 +256,7 @@ func (table *SessionTable) DecodeTrailer(source []byte, expectedChecksum protoco
 			}
 			continue
 		}
-		header, reason := protocol.DecodeHeader(headerBytes, table.config.Group, table.config.MessageSizeMax, table.config.ActiveCount)
+		header, reason := protocol.DecodeHeaderWith(headerBytes, table.config.Group, table.config.MessageSizeMax, table.config.ActiveCount, table.config.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || table.validateOccupied(header, session) != nil {
 			return ErrSessionEncoding
 		}
@@ -324,7 +326,7 @@ func (table *SessionTable) validateOccupied(reply protocol.Header, session proto
 	}
 	var encoded [protocol.HeaderSize]byte
 	copyOfReply := reply
-	if err := protocol.EncodeHeader(encoded[:], &copyOfReply); err != nil || copyOfReply.HeaderChecksum != reply.HeaderChecksum {
+	if err := protocol.EncodeHeaderWith(encoded[:], &copyOfReply, table.config.ChecksumAlgorithm); err != nil || copyOfReply.HeaderChecksum != reply.HeaderChecksum {
 		return ErrSessionEncoding
 	}
 	context := protocol.ValidationContext{
@@ -337,6 +339,7 @@ func (table *SessionTable) validateOccupied(reply protocol.Header, session proto
 		CurrentRelease:          reply.Release,
 		Group:                   table.config.Group,
 		MessageSizeMax:          table.config.MessageSizeMax,
+		ChecksumAlgorithm:       table.config.ChecksumAlgorithm,
 	}
 	if protocol.ValidateSemantics(&reply, nil, context) != protocol.RejectNone {
 		return ErrSessionEncoding

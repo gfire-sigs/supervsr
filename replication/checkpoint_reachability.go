@@ -213,7 +213,7 @@ func (replica *Replica) checkpointApplicationState(manifest CheckpointManifest) 
 		return CheckpointState{}, ErrWALRecovery
 	}
 	var encodedHeader [protocol.HeaderSize]byte
-	if err := protocol.EncodeHeader(encodedHeader[:], &header); err != nil {
+	if err := protocol.EncodeHeaderWith(encodedHeader[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		return CheckpointState{}, err
 	}
 	state := replica.checkpoint
@@ -231,6 +231,7 @@ func (replica *Replica) checkpointApplicationState(manifest CheckpointManifest) 
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
 		MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
 		BlockSize:   replica.config.Cluster.BlockSize, ClientsMax: replica.config.Cluster.ClientsMax,
+		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
 	if err := state.Validate(validation); err != nil {

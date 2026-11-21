@@ -171,7 +171,7 @@ func (replica *Replica) finishScrubRead(operation *blockRepairIO, completion IOC
 		replica.fail(ErrBlockMissing)
 		return
 	}
-	frame, header, ok := decodeRepairFrame(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	frame, header, ok := decodeRepairFrameWith(operation.buffer, replica.config.Group, uint32(replica.config.Cluster.BlockSize), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok || !allZeroBytes(operation.buffer[len(frame):]) {
 		replica.queueKnownCorruptBlock(address, requirement, true)
 		return

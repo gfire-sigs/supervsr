@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-
-	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var (
@@ -23,8 +21,11 @@ type SuperblockStore struct {
 }
 
 func OpenSuperblockStore(storage Storage, validation SuperblockValidation, beforeRepair ...func(Superblock) error) (*SuperblockStore, error) {
-	if storage == nil || !protocol.HardwareChecksumAvailable() {
-		return nil, ErrHardwareChecksumUnavailable
+	if storage == nil {
+		return nil, ErrInvalidConfiguration
+	}
+	if !validation.Cluster.ChecksumAlgorithm.Valid() {
+		return nil, ErrIncompatibleConfiguration
 	}
 	if len(beforeRepair) > 1 || (len(beforeRepair) == 1 && beforeRepair[0] == nil) {
 		return nil, ErrInvalidConfiguration

@@ -1,7 +1,9 @@
 package replication
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"z.gfire.dev/supervsr/replication/protocol"
@@ -284,4 +286,146 @@ func encodeSuperblockCopies(t testing.TB, superblock Superblock, validation Supe
 func resealSuperblock(encoded []byte) {
 	checksum := protocol.ChecksumBytes(encoded[34:])
 	copy(encoded[:16], checksum[:])
+}
+
+func TestFormatAndOpenSuperblockStoreWithWyhash128(t *testing.T) {
+	cluster := DefaultClusterConfig()
+	cluster.ChecksumAlgorithm = ChecksumWyhash128
+	cluster.ClientsMax = 4
+	cluster.PipelineMax = 4
+	cluster.ViewChangeHeadersSuffixMax = 5
+	cluster.JournalSlots = 128
+	cluster.MessageSizeMax = 128 << 10
+	cluster.ApplicationBatchSizeMax = cluster.MessageSizeMax - protocol.HeaderSize
+	cluster.ApplicationReplySizeMax = cluster.MessageSizeMax - protocol.HeaderSize
+	cluster.BlockSize = 128 << 10
+	cluster.CompactionOps = 16
+
+	membership := Membership{
+		Members:     [MembersMax]protocol.MemberID{{1}, {2}, {3}},
+		ActiveCount: 3,
+		LocalMember: protocol.MemberID{1},
+	}
+	group := protocol.GroupID{7}
+	path := filepath.Join(t.TempDir(), "wyhash.vsr")
+
+	formatStorage, err := OpenFileStorage(path, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Format(context.Background(), FormatConfig{
+		Group:          group,
+		Membership:     membership,
+		Cluster:        cluster,
+		CurrentRelease: 1,
+	}, FormatDependencies{Storage: formatStorage}); err != nil {
+		_ = formatStorage.Close()
+		t.Fatal(err)
+	}
+	if err := formatStorage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	storage, err := OpenFileStorage(path, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := storage.Close(); closeErr != nil {
+			t.Errorf("close: %v", closeErr)
+		}
+	}()
+
+	validation := SuperblockValidation{
+		Group:                 group,
+		Membership:            membership,
+		ConfigurationChecksum: cluster.Fingerprint(),
+		Cluster:               cluster,
+	}
+	store, err := OpenSuperblockStore(storage, validation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Current().ConfigurationChecksum != cluster.Fingerprint() {
+		t.Fatalf("fingerprint = %x, want %x", store.Current().ConfigurationChecksum, cluster.Fingerprint())
+	}
+
+	// Opening the same file with AEGIS128L must report ErrIncompatibleConfiguration.
+	aegisCluster := cluster
+	aegisCluster.ChecksumAlgorithm = ChecksumAEGIS128L
+	if aegisCluster.Fingerprint() == cluster.Fingerprint() {
+		t.Fatal("AEGIS128L and Wyhash128 fingerprints collided")
+	}
+	aegisValidation := SuperblockValidation{
+		Group:                 group,
+		Membership:            membership,
+		ConfigurationChecksum: aegisCluster.Fingerprint(),
+		Cluster:               aegisCluster,
+	}
+	if _, err := OpenSuperblockStore(storage, aegisValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
+		t.Fatalf("mismatched checksum algorithm error = %v, want %v", err, ErrIncompatibleConfiguration)
+	}
+}
+
+func TestSuperblockAEGIS128LRejectedUnderWyhash128Config(t *testing.T) {
+	validation, superblock := validSuperblockFixture(t)
+	var encoded [SuperblockBytes]byte
+	if err := superblock.Encode(encoded[:], 0, validation); err != nil {
+		t.Fatal(err)
+	}
+	wyhashCluster := validation.Cluster
+	wyhashCluster.ChecksumAlgorithm = ChecksumWyhash128
+	wyhashValidation := validation
+	wyhashValidation.Cluster = wyhashCluster
+	wyhashValidation.ConfigurationChecksum = wyhashCluster.Fingerprint()
+	if _, err := DecodeSuperblock(encoded[:], 0, wyhashValidation); !errors.Is(err, ErrIncompatibleConfiguration) {
+		t.Fatalf("AEGIS superblock under Wyhash config error = %v, want %v", err, ErrIncompatibleConfiguration)
+	}
+}
+
+func TestRequireHardwareChecksumOptIn(t *testing.T) {
+	cluster := DefaultClusterConfig()
+	process := DefaultProcessConfig()
+	blockBase, ok := cluster.BlockBase()
+	if !ok {
+		t.Fatal("BlockBase overflow")
+	}
+	process.StorageSizeLimit = blockBase + cluster.BlockSize
+	if err := process.Validate(cluster); err != nil {
+		t.Fatalf("default process validate failed: %v", err)
+	}
+
+	process.RequireHardwareChecksum = true
+	err := process.Validate(cluster)
+	if protocol.HardwareChecksumAvailable() {
+		if err != nil {
+			t.Fatalf("hardware process validate unexpected error: %v", err)
+		}
+	} else if !errors.Is(err, ErrHardwareChecksumUnavailable) {
+		t.Fatalf("software process validate error = %v, want %v", err, ErrHardwareChecksumUnavailable)
+	}
+
+	optInStorage, err := OpenFileStorage(filepath.Join(t.TempDir(), "optin.vsr"), true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := optInStorage.Close(); closeErr != nil {
+			t.Errorf("close: %v", closeErr)
+		}
+	}()
+	formatErr := validateFormatConfig(FormatConfig{
+		Group:                   protocol.GroupID{1},
+		Membership:              Membership{Members: [MembersMax]protocol.MemberID{{1}}, ActiveCount: 1, LocalMember: protocol.MemberID{1}},
+		Cluster:                 cluster,
+		CurrentRelease:          1,
+		RequireHardwareChecksum: true,
+	}, FormatDependencies{Storage: optInStorage})
+	if protocol.HardwareChecksumAvailable() {
+		if formatErr != nil {
+			t.Fatalf("hardware format validate unexpected error: %v", formatErr)
+		}
+	} else if !errors.Is(formatErr, ErrHardwareChecksumUnavailable) {
+		t.Fatalf("software format validate error = %v, want %v", formatErr, ErrHardwareChecksumUnavailable)
+	}
 }

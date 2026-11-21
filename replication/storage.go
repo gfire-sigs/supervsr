@@ -38,21 +38,19 @@ type FileStorage struct {
 }
 
 func OpenFileStorage(path string, create, direct bool) (*FileStorage, error) {
-	flags := os.O_RDWR
-	if create {
-		flags |= os.O_CREATE
-	}
-	file, err := os.OpenFile(path, flags, 0o600)
+	file, err := openStorageFile(path, create, direct)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open %s: %w", ErrStorage, path, err)
 	}
-	if direct {
-		if err := configureDirectIO(file); err != nil {
-			_ = file.Close()
-			return nil, fmt.Errorf("%w: direct I/O %s: %w", ErrStorage, path, err)
-		}
-	}
 	return &FileStorage{file: file, path: path, direct: direct}, nil
+}
+
+func openStandardStorageFile(path string, create bool, extraFlags int) (*os.File, error) {
+	flags := os.O_RDWR | extraFlags
+	if create {
+		flags |= os.O_CREATE
+	}
+	return os.OpenFile(path, flags, 0o600)
 }
 
 func (storage *FileStorage) ReadAt(buffer []byte, offset uint64) error {
@@ -131,14 +129,41 @@ func (storage *FileStorage) Size() (uint64, error) {
 }
 
 func (storage *FileStorage) SyncParent() error {
-	directory, err := os.Open(filepath.Dir(storage.path))
+	if err := syncParentDir(filepath.Dir(storage.path)); err != nil {
+		return fmt.Errorf("%w: sync parent %s: %w", ErrStorage, storage.path, err)
+	}
+	return nil
+}
+
+func syncParentDirectoryFD(dir string) error {
+	directory, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("%w: open parent %s: %w", ErrStorage, storage.path, err)
+		return err
 	}
 	syncErr := directory.Sync()
 	closeErr := directory.Close()
 	if syncErr != nil || closeErr != nil {
-		return fmt.Errorf("%w: sync parent %s: %w", ErrStorage, storage.path, errors.Join(syncErr, closeErr))
+		return errors.Join(syncErr, closeErr)
+	}
+	return nil
+}
+
+func zeroExtendFile(file *os.File, size int64) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() >= size {
+		return nil
+	}
+	chunk := make([]byte, 64*1024)
+	offset := info.Size()
+	for offset < size {
+		step := min(size-offset, int64(len(chunk)))
+		if _, err := file.WriteAt(chunk[:step], offset); err != nil {
+			return err
+		}
+		offset += step
 	}
 	return nil
 }

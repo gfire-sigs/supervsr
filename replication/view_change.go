@@ -151,7 +151,7 @@ func (replica *Replica) persistView(install bool, commit, head protocol.Op, head
 		if header.Command == 0 {
 			continue
 		}
-		if err := protocol.EncodeHeader(encoded[:], &header); err != nil {
+		if err := protocol.EncodeHeaderWith(encoded[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			return err
 		}
 		next.ViewHeaders[index] = encoded
@@ -250,7 +250,7 @@ func (replica *Replica) sendJoinView() {
 		op := replica.headOp - protocol.Op(index)
 		header, available, negative, found := replica.localHeaderEvidence(op)
 		if found {
-			if err := protocol.EncodeHeader(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], &header); err != nil {
+			if err := protocol.EncodeHeaderWith(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 				message.Release()
 				replica.fail(err)
 				return
@@ -270,7 +270,7 @@ func (replica *Replica) sendJoinView() {
 	binary.LittleEndian.PutUint64(header.Fields[40:48], uint64(replica.commitMin))
 	binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(replica.checkpoint.PrepareOp()))
 	binary.LittleEndian.PutUint32(header.Fields[56:60], uint32(replica.logView))
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		message.Release()
 		replica.fail(err)
 		return
@@ -291,7 +291,7 @@ func (replica *Replica) localHeaderEvidence(op protocol.Op) (protocol.Header, bo
 		}
 	}
 	if op == replica.checkpoint.PrepareOp() {
-		header, reason := protocol.DecodeHeader(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		header, reason := protocol.DecodeHeaderWith(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		return header, reason == protocol.RejectNone, false, reason == protocol.RejectNone
 	}
 	header, present, nack := replica.wal.JoinEvidence(op)
@@ -346,7 +346,7 @@ func (replica *Replica) recordJoinView(header protocol.Header, body []byte) {
 		if allZeroBytes(encoded) {
 			continue
 		}
-		candidate, reason := protocol.DecodeHeader(encoded, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		candidate, reason := protocol.DecodeHeaderWith(encoded, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || prepareOp(&candidate) != record.head-protocol.Op(index) {
 			*record = joinRecord{}
 			return
@@ -568,6 +568,7 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
 		MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
 		BlockSize:   replica.config.Cluster.BlockSize, ClientsMax: replica.config.Cluster.ClientsMax,
+		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
 	checkpoint, err := DecodeCheckpointState(body[:CheckpointStateSize], validation)
@@ -579,7 +580,7 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		return
 	}
 	for index := range count {
-		candidate, reason := protocol.DecodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		candidate, reason := protocol.DecodeHeaderWith(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || candidate.View > header.View {
 			return
 		}
@@ -626,7 +627,7 @@ func (replica *Replica) validViewProof(checkpoint CheckpointState, head protocol
 	if count <= 0 || protocol.Op(count-1) > head || prepareOp(&replica.canonicalHeaders[0]) != head {
 		return false
 	}
-	checkpointHeader, reason := protocol.DecodeHeader(checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	checkpointHeader, reason := protocol.DecodeHeaderWith(checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return false
 	}
@@ -772,7 +773,7 @@ func (replica *Replica) collectViewSuffix() (int, error) {
 			return count, nil
 		}
 	}
-	checkpoint, reason := protocol.DecodeHeader(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	checkpoint, reason := protocol.DecodeHeaderWith(replica.checkpoint.Header[:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return 0, ErrInvalidCheckpoint
 	}
@@ -803,7 +804,7 @@ func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
 	}
 	for index := range count {
 		header := replica.canonicalHeaders[index]
-		if err := protocol.EncodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header); err != nil {
+		if err := protocol.EncodeHeaderWith(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			message.Release()
 			return nil, err
 		}
@@ -813,7 +814,7 @@ func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
 	binary.LittleEndian.PutUint64(header.Fields[16:24], uint64(replica.headOp))
 	binary.LittleEndian.PutUint64(header.Fields[24:32], uint64(replica.commitMax))
 	binary.LittleEndian.PutUint64(header.Fields[32:40], uint64(replica.checkpoint.PrepareOp()))
-	if err := message.Seal(&header); err != nil {
+	if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		message.Release()
 		return nil, err
 	}

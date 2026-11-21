@@ -169,10 +169,14 @@ func (frame *Frame) ResizeBody(bodySize uint32) error {
 }
 
 func (frame *Frame) Seal(header *Header) error {
+	return frame.SealWith(header, ChecksumAEGIS128L)
+}
+
+func (frame *Frame) SealWith(header *Header, algorithm ChecksumAlgorithm) error {
 	if frame.sealed.Load() || frame.refs.Load() != 1 {
 		return ErrFrameSealed
 	}
-	if err := SealFrame(frame.buffer[:frame.size], header); err != nil {
+	if err := SealFrameWith(frame.buffer[:frame.size], header, algorithm); err != nil {
 		return err
 	}
 	frame.sealed.Store(true)

@@ -58,8 +58,12 @@ func readCheckpointFreeSet(trailers *TrailerStore, address uint64, lastChecksum,
 	if err != nil {
 		return FixedBitSet{}, err
 	}
+	emptyChecksum, err := protocol.ChecksumBytesWith(trailers.blocks.cluster.ChecksumAlgorithm, nil)
+	if err != nil {
+		return FixedBitSet{}, ErrInvalidCheckpoint
+	}
 	if address == 0 {
-		if encodedSize != 0 || !lastChecksum.IsZero() || aggregate != protocol.ChecksumBytes(nil) {
+		if encodedSize != 0 || !lastChecksum.IsZero() || aggregate != emptyChecksum {
 			return FixedBitSet{}, ErrInvalidCheckpoint
 		}
 		return set, nil

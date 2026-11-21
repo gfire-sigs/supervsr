@@ -69,17 +69,18 @@ type kvMachine struct {
 	memberCount     uint8
 	messageSizeMax  uint32
 	compactionOps   uint64
+	checksum        protocol.ChecksumAlgorithm
 	lastObservedOp  protocol.Op
 	pendingSnapshot protocol.Op
 	frozenSnapshots [2]frozenSnapshot
 	logger          zerolog.Logger
 }
 
-func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, compactionOps uint64, logger zerolog.Logger) *kvMachine {
+func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, compactionOps uint64, checksum protocol.ChecksumAlgorithm, logger zerolog.Logger) *kvMachine {
 	return &kvMachine{
 		values: make(map[string][]byte, maxKeys), directory: directory, group: group,
 		memberCount: memberCount, messageSizeMax: messageSizeMax,
-		compactionOps: compactionOps, logger: logger,
+		compactionOps: compactionOps, checksum: checksum, logger: logger,
 	}
 }
 
@@ -221,7 +222,7 @@ func (machine *kvMachine) StartCheckpoint(input replication.CheckpointInput, _ *
 }
 
 func (machine *kvMachine) StartOpen(input replication.OpenCheckpointInput, _ *replication.SMCompletion) (replication.StartResult[replication.OpenResult], error) {
-	header, reason := protocol.DecodeHeader(input.State.Header[:], machine.group, machine.messageSizeMax, machine.memberCount)
+	header, reason := protocol.DecodeHeaderWith(input.State.Header[:], machine.group, machine.messageSizeMax, machine.memberCount, machine.checksum)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return replication.StartResult[replication.OpenResult]{}, errInvalidSnapshot
 	}
@@ -387,7 +388,10 @@ func (machine *kvMachine) encodeSnapshot(op protocol.Op) ([]byte, error) {
 	if err != nil {
 		return nil, errors.Join(errInvalidSnapshot, err)
 	}
-	checksum := protocol.ChecksumBytes(checksumInput)
+	checksum, err := protocol.ChecksumBytesWith(machine.checksum, checksumInput)
+	if err != nil {
+		return nil, errors.Join(errInvalidSnapshot, err)
+	}
 	document := snapshotDocument{Payload: payload, Checksum: hex.EncodeToString(checksum[:])}
 	encoded, err := json.Marshal(document)
 	if err != nil {
@@ -456,7 +460,8 @@ func (machine *kvMachine) readSnapshot(op protocol.Op) error {
 	if _, err := hex.Decode(stored[:], []byte(document.Checksum)); err != nil || hex.EncodeToString(stored[:]) != document.Checksum {
 		return errInvalidSnapshot
 	}
-	if protocol.ChecksumBytes(checksumInput) != stored {
+	computed, err := protocol.ChecksumBytesWith(machine.checksum, checksumInput)
+	if err != nil || computed != stored {
 		return errInvalidSnapshot
 	}
 

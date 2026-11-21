@@ -130,7 +130,7 @@ func NewWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCo
 		prepareBuffer: prepareBuffer,
 	}
 	for index := range wal.slots {
-		reserved, buildErr := ReservedPrepareHeader(group, protocol.Op(index), memberCount, uint32(cfg.MessageSizeMax))
+		reserved, buildErr := ReservedPrepareHeaderWith(group, protocol.Op(index), memberCount, uint32(cfg.MessageSizeMax), cfg.ChecksumAlgorithm)
 		if buildErr != nil {
 			return nil, buildErr
 		}
@@ -165,7 +165,7 @@ func (wal *WAL) beginAppend(sequence *ioSequence, frame []byte, reusableThrough 
 	if wal.ioActive {
 		return ErrIOBackpressure
 	}
-	header, _, reason := protocol.DecodeFrame(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount)
+	header, _, reason := protocol.DecodeFrameWith(frame, wal.group, uint32(wal.config.MessageSizeMax), wal.memberCount, wal.config.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 		return ErrInvalidWAL
 	}
@@ -223,6 +223,10 @@ func (wal *WAL) advanceAppend(sequence *ioSequence, frame []byte) error {
 }
 
 func ReservedPrepareHeader(group protocol.GroupID, physicalSlot protocol.Op, memberCount uint8, messageSizeMax uint32) ([protocol.HeaderSize]byte, error) {
+	return ReservedPrepareHeaderWith(group, physicalSlot, memberCount, messageSizeMax, ChecksumAEGIS128L)
+}
+
+func ReservedPrepareHeaderWith(group protocol.GroupID, physicalSlot protocol.Op, memberCount uint8, messageSizeMax uint32, algorithm ChecksumAlgorithm) ([protocol.HeaderSize]byte, error) {
 	var encoded [protocol.HeaderSize]byte
 	header := protocol.Header{
 		Group:    group,
@@ -232,10 +236,10 @@ func ReservedPrepareHeader(group protocol.GroupID, physicalSlot protocol.Op, mem
 	}
 	binary.LittleEndian.PutUint64(header.Fields[96:104], uint64(physicalSlot))
 	header.Fields[124] = byte(protocol.OperationReserved)
-	if err := protocol.SealFrame(encoded[:], &header); err != nil {
+	if err := protocol.SealFrameWith(encoded[:], &header, algorithm); err != nil {
 		return [protocol.HeaderSize]byte{}, err
 	}
-	if _, reason := protocol.DecodeHeader(encoded[:], group, messageSizeMax, memberCount); reason != protocol.RejectNone {
+	if _, reason := protocol.DecodeHeaderWith(encoded[:], group, messageSizeMax, memberCount, algorithm); reason != protocol.RejectNone {
 		return [protocol.HeaderSize]byte{}, ErrInvalidWAL
 	}
 	return encoded, nil

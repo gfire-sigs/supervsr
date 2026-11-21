@@ -228,7 +228,7 @@ func (cluster *Cluster) AddClient(id protocol.ClientID, events replication.Clien
 	observer := &observedClientEvents{cluster: cluster, client: id, target: events}
 	client, err := replication.NewClient(replication.ClientConfig{
 		Group: cluster.config.Group, ID: id, Release: cluster.config.CurrentRelease, ActiveCount: cluster.config.ActiveCount,
-		MessageSizeMax: uint32(cluster.config.Cluster.MessageSizeMax), Process: cluster.config.Process,
+		MessageSizeMax: uint32(cluster.config.Cluster.MessageSizeMax), ChecksumAlgorithm: cluster.config.Cluster.ChecksumAlgorithm, Process: cluster.config.Process,
 	}, cluster.network.ClientBus(), cluster.clock, bytes.NewReader(id[:8]), observer)
 	if err != nil {
 		return nil, err

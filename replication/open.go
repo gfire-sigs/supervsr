@@ -73,7 +73,7 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	}
 	var installed WALRecoveryView
 	if durable.ViewHeaderCount != 0 {
-		header, reason := protocol.DecodeHeader(durable.ViewHeaders[0][:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount)
+		header, reason := protocol.DecodeHeaderWith(durable.ViewHeaders[0][:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount, config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone {
 			return nil, ErrInvalidSuperblock
 		}
@@ -203,11 +203,12 @@ func newOpenSessionTable(config Config) (*SessionTable, error) {
 		ActiveCount:             config.Membership.ActiveCount,
 		MessageSizeMax:          uint32(config.Cluster.MessageSizeMax),
 		ApplicationReplySizeMax: uint32(config.Cluster.ApplicationReplySizeMax),
+		ChecksumAlgorithm:       config.Cluster.ChecksumAlgorithm,
 	})
 }
 
 func deriveInterruptedStateSync(config Config, durable Superblock, memberCount uint8) (ReplicaInitialState, error) {
-	header, reason := protocol.DecodeHeader(durable.State.Checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount)
+	header, reason := protocol.DecodeHeaderWith(durable.State.Checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount, config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return ReplicaInitialState{}, ErrInvalidCheckpoint
 	}
@@ -224,7 +225,7 @@ func (replica *Replica) resumeInterruptedStateSync(durable Superblock, recovery 
 		return ErrInvalidSuperblock
 	}
 	for index := range count {
-		header, reason := protocol.DecodeHeader(durable.ViewHeaders[index][:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), memberCount)
+		header, reason := protocol.DecodeHeaderWith(durable.ViewHeaders[index][:], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), memberCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone {
 			return ErrInvalidSuperblock
 		}
@@ -339,7 +340,7 @@ func recoveredCommittedHeader(config Config, durable Superblock, recovery WALRec
 		}
 		return header, nil
 	}
-	header, reason := protocol.DecodeHeader(durable.State.Checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount)
+	header, reason := protocol.DecodeHeaderWith(durable.State.Checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), memberCount, config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone {
 		return protocol.Header{}, ErrWALRecovery
 	}
@@ -413,7 +414,7 @@ func replayCommitted(
 		if err != nil {
 			return result, err
 		}
-		header, body, reason := protocol.DecodeFrame(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount)
+		header, body, reason := protocol.DecodeFrameWith(frame, config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount, config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone {
 			return result, ErrWALRecovery
 		}
@@ -516,12 +517,15 @@ func replayExecute(config Config, machine StateMachine, replies *ReplyStore, ses
 	copy(reply.Fields[96:104], prepare.Fields[112:120])
 	copy(reply.Fields[104:109], prepare.Fields[120:125])
 	frame := replyFrame[:protocol.HeaderSize+replyLength]
-	if err := protocol.SealFrame(frame, &reply); err != nil {
+	if err := protocol.SealFrameWith(frame, &reply, config.Cluster.ChecksumAlgorithm); err != nil {
 		return err
 	}
-	context := protocol.ChecksumBytes(frame[protocol.HeaderChecksumFrom:protocol.HeaderSize])
+	context, err := protocol.ChecksumBytesWith(config.Cluster.ChecksumAlgorithm, frame[protocol.HeaderChecksumFrom:protocol.HeaderSize])
+	if err != nil {
+		return err
+	}
 	copy(reply.Fields[32:48], context[:])
-	if err := protocol.SealFrame(frame, &reply); err != nil {
+	if err := protocol.SealFrameWith(frame, &reply, config.Cluster.ChecksumAlgorithm); err != nil {
 		return err
 	}
 	session := protocol.Session(prepareOp(&prepare))
@@ -570,7 +574,7 @@ func persistRecoveredView(store *SuperblockStore, wal *WAL, head protocol.Op, vi
 			break
 		}
 		copyOfHeader := header
-		if err := protocol.EncodeHeader(next.ViewHeaders[count][:], &copyOfHeader); err != nil {
+		if err := protocol.EncodeHeaderWith(next.ViewHeaders[count][:], &copyOfHeader, config.ChecksumAlgorithm); err != nil {
 			return err
 		}
 		child = header
@@ -598,7 +602,7 @@ func (replica *Replica) loadRecoveredSuffix(first, last protocol.Op) error {
 		if err != nil {
 			return err
 		}
-		header, body, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		header, body, reason := protocol.DecodeFrameWith(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone {
 			return ErrWALRecovery
 		}
@@ -612,7 +616,7 @@ func (replica *Replica) loadRecoveredSuffix(first, last protocol.Op) error {
 			return err
 		}
 		copy(messageBody, body)
-		if err := message.Seal(&header); err != nil {
+		if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			message.Release()
 			return err
 		}

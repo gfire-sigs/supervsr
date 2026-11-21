@@ -208,7 +208,7 @@ func (replica *Replica) buildCheckpointState(candidate BlockCheckpointCandidate,
 		return CheckpointState{}, ErrWALRecovery
 	}
 	var encodedHeader [protocol.HeaderSize]byte
-	if err := protocol.EncodeHeader(encodedHeader[:], &header); err != nil {
+	if err := protocol.EncodeHeaderWith(encodedHeader[:], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		return CheckpointState{}, err
 	}
 	if manifest.BlockCount == 0 {
@@ -248,6 +248,7 @@ func (replica *Replica) buildCheckpointState(candidate BlockCheckpointCandidate,
 		Group: replica.config.Group, MessageSizeMax: uint32(replica.config.Cluster.MessageSizeMax),
 		MemberCount: replica.membership.ActiveCount + replica.membership.StandbyCount,
 		BlockSize:   replica.config.Cluster.BlockSize, ClientsMax: replica.config.Cluster.ClientsMax,
+		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
 	if err := state.Validate(validation); err != nil {
@@ -287,7 +288,7 @@ func (replica *Replica) finishCheckpointPersistence(entry *pipelineEntry) {
 	replica.checkpointSuperseded = replica.checkpointSuperseded[:0]
 	replica.checkpoint = replica.pendingCheckpoint
 	targetRelease := replica.checkpoint.Release
-	checkpointID, err := replica.checkpoint.ID()
+	checkpointID, err := replica.checkpoint.IDWith(replica.config.Cluster.ChecksumAlgorithm)
 	if err != nil {
 		replica.fail(err)
 		return

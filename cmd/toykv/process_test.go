@@ -49,6 +49,33 @@ func TestToyKVProcessCrashRecoveryAndCompatibility(t *testing.T) {
 	}
 }
 
+func TestToyKVProcessWyhashChecksumMode(t *testing.T) {
+	directory := t.TempDir()
+	first := startToyKVProcessWithChecksum(t, directory, 3, "wyhash")
+	first.command(t, "put wyhash_key durable_wyhash", "OK")
+	first.stop(t)
+
+	second := startToyKVProcessWithChecksum(t, directory, 3, "wyhash")
+	second.command(t, "get wyhash_key", "durable_wyhash")
+	second.stop(t)
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestToyKVProcessCrashRecoveryAndCompatibility$", "-test.count=1")
+	command.Env = toyKVProcessEnvironmentWithChecksum(directory, 3, "aegis")
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Run(); err == nil {
+		t.Fatal("mismatched checksum mode reopened durable cluster")
+	}
+	if !strings.Contains(output.String(), errClusterMetadata.Error()) {
+		t.Fatalf("mismatched checksum output = %q", output.String())
+	}
+}
+
 func runToyKVProcessHelper(t testing.TB) {
 	t.Helper()
 	replicas, err := strconv.ParseUint(os.Getenv("TOYKV_REPLICAS"), 10, 8)
@@ -58,6 +85,7 @@ func runToyKVProcessHelper(t testing.TB) {
 	ctx := context.Background()
 	cluster, err := openCluster(ctx, options{
 		dataDir: os.Getenv("TOYKV_DATA_DIR"), replicas: uint(replicas), commandTimeout: 15 * time.Second,
+		checksumMode: os.Getenv("TOYKV_CHECKSUM"),
 	}, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
@@ -88,13 +116,17 @@ type toyKVProcess struct {
 }
 
 func startToyKVProcess(t testing.TB, directory string, replicas uint8) *toyKVProcess {
+	return startToyKVProcessWithChecksum(t, directory, replicas, "")
+}
+
+func startToyKVProcessWithChecksum(t testing.TB, directory string, replicas uint8, checksumMode string) *toyKVProcess {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	command := exec.Command(executable, "-test.run=^TestToyKVProcessCrashRecoveryAndCompatibility$", "-test.count=1")
-	command.Env = toyKVProcessEnvironment(directory, replicas)
+	command.Env = toyKVProcessEnvironmentWithChecksum(directory, replicas, checksumMode)
 	input, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -116,11 +148,19 @@ func startToyKVProcess(t testing.TB, directory string, replicas uint8) *toyKVPro
 }
 
 func toyKVProcessEnvironment(directory string, replicas uint8) []string {
-	return append(os.Environ(),
+	return toyKVProcessEnvironmentWithChecksum(directory, replicas, "")
+}
+
+func toyKVProcessEnvironmentWithChecksum(directory string, replicas uint8, checksumMode string) []string {
+	env := append(os.Environ(),
 		processHelperEnvironment+"=1",
 		"TOYKV_DATA_DIR="+directory,
 		"TOYKV_REPLICAS="+strconv.FormatUint(uint64(replicas), 10),
 	)
+	if checksumMode != "" {
+		env = append(env, "TOYKV_CHECKSUM="+checksumMode)
+	}
+	return env
 }
 
 func (process *toyKVProcess) command(t testing.TB, command, expected string) {

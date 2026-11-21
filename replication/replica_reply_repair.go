@@ -120,7 +120,7 @@ func (replica *Replica) continueReplyRepair(now uint64) bool {
 		client := replyClient(&record.Reply)
 		copy(header.Fields[32:48], client[:])
 		binary.LittleEndian.PutUint64(header.Fields[48:56], uint64(replyOp(&record.Reply)))
-		if err := message.Seal(&header); err != nil {
+		if err := message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			message.Release()
 			return false
 		}
@@ -153,7 +153,7 @@ func (replica *Replica) handleReplyRepair(message *Message, header protocol.Head
 	if err != nil {
 		return false
 	}
-	decoded, _, reason := protocol.DecodeFrame(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+	decoded, _, reason := protocol.DecodeFrameWith(frame, replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if reason != protocol.RejectNone || decoded.HeaderChecksum != expected.HeaderChecksum {
 		return false
 	}

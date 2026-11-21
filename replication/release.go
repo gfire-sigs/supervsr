@@ -197,7 +197,7 @@ func (replica *Replica) createUpgrade(sample TimeSample) error {
 	binary.LittleEndian.PutUint64(header.Fields[104:112], uint64(replica.commitMin))
 	binary.LittleEndian.PutUint64(header.Fields[112:120], timestamp)
 	header.Fields[124] = byte(protocol.OperationUpgrade)
-	if err := prepare.Seal(&header); err != nil {
+	if err := prepare.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 		prepare.Release()
 		return err
 	}

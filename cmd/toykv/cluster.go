@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -27,16 +28,18 @@ var (
 )
 
 type diskMetadata struct {
-	Version int      `json:"version"`
-	Group   string   `json:"group"`
-	Members []string `json:"members"`
-	Ready   bool     `json:"ready"`
+	Version  int      `json:"version"`
+	Group    string   `json:"group"`
+	Members  []string `json:"members"`
+	Checksum string   `json:"checksum,omitempty"`
+	Ready    bool     `json:"ready"`
 }
 
 type clusterIdentity struct {
-	group   protocol.GroupID
-	members []protocol.MemberID
-	ready   bool
+	group    protocol.GroupID
+	members  []protocol.MemberID
+	checksum protocol.ChecksumAlgorithm
+	ready    bool
 }
 
 type realClock struct {
@@ -205,12 +208,16 @@ func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*loc
 	if err := os.MkdirAll(opts.dataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
-	identity, err := loadOrCreateIdentity(opts.dataDir, uint8(opts.replicas))
+	checksumAlgorithm, _, err := parseChecksumMode(opts.checksumMode)
+	if err != nil {
+		return nil, err
+	}
+	identity, err := loadOrCreateIdentity(opts.dataDir, uint8(opts.replicas), checksumAlgorithm)
 	if err != nil {
 		return nil, err
 	}
 
-	clusterConfig := toykvClusterConfig()
+	clusterConfig := toykvClusterConfig(identity.checksum)
 	processConfig := replication.DefaultProcessConfig()
 	processConfig.StorageSizeLimit = 1 << 30
 	pool, err := protocol.NewFramePool(1024, uint32(clusterConfig.MessageSizeMax))
@@ -234,13 +241,14 @@ func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*loc
 	return cluster, nil
 }
 
-func toykvClusterConfig() replication.ClusterConfig {
+func toykvClusterConfig(checksum protocol.ChecksumAlgorithm) replication.ClusterConfig {
 	config := replication.DefaultClusterConfig()
 	config.JournalSlots = 128
 	config.MessageSizeMax = 128 << 10
 	config.ApplicationBatchSizeMax = maxRequestBytes
 	config.ApplicationReplySizeMax = maxReplyBytes
 	config.BlockSize = 128 << 10
+	config.ChecksumAlgorithm = checksum
 	return config
 }
 
@@ -280,6 +288,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 			uint8(len(identity.members)),
 			uint32(cluster.config.MessageSizeMax),
 			cluster.config.CompactionOps,
+			cluster.config.ChecksumAlgorithm,
 			replicaLogger,
 		)
 		replica, err := replication.Open(ctx, config, replication.Dependencies{
@@ -365,7 +374,7 @@ func (cluster *localCluster) RegisterClient(ctx context.Context, timeout time.Du
 	events := &clientEvents{notify: make(chan struct{}, 1)}
 	client, err := replication.NewClient(replication.ClientConfig{
 		Group: cluster.group, ID: id, Release: 1, ActiveCount: uint8(len(cluster.replicas)),
-		MessageSizeMax: uint32(cluster.config.MessageSizeMax), Process: cluster.process,
+		MessageSizeMax: uint32(cluster.config.MessageSizeMax), ChecksumAlgorithm: cluster.config.ChecksumAlgorithm, Process: cluster.process,
 	}, localBus{transport: cluster.transport}, realClock{start: time.Now()}, rand.Reader, events)
 	if err != nil {
 		return err
@@ -539,11 +548,11 @@ func (cluster *localCluster) Close(ctx context.Context) error {
 	return first
 }
 
-func loadOrCreateIdentity(directory string, replicas uint8) (clusterIdentity, error) {
+func loadOrCreateIdentity(directory string, replicas uint8, requested protocol.ChecksumAlgorithm) (clusterIdentity, error) {
 	path := filepath.Join(directory, "cluster.json")
 	encoded, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		identity, generateErr := generateIdentity(replicas)
+		identity, generateErr := generateIdentity(replicas, requested)
 		if generateErr != nil {
 			return clusterIdentity{}, generateErr
 		}
@@ -565,11 +574,18 @@ func loadOrCreateIdentity(directory string, replicas uint8) (clusterIdentity, er
 	if len(metadata.Members) != int(replicas) {
 		return clusterIdentity{}, fmt.Errorf("%w: replica count %d does not match existing cluster of %d", errClusterMetadata, replicas, len(metadata.Members))
 	}
+	storedChecksum, _, err := parseChecksumMode(metadata.Checksum)
+	if err != nil {
+		return clusterIdentity{}, fmt.Errorf("%w: invalid checksum %q", errClusterMetadata, metadata.Checksum)
+	}
+	if storedChecksum != requested {
+		return clusterIdentity{}, fmt.Errorf("%w: checksum %s does not match existing cluster checksum %s", errClusterMetadata, checksumModeName(requested), checksumModeName(storedChecksum))
+	}
 	groupBytes, err := hex.DecodeString(metadata.Group)
 	if err != nil || len(groupBytes) != len(protocol.GroupID{}) {
 		return clusterIdentity{}, errClusterMetadata
 	}
-	identity := clusterIdentity{members: make([]protocol.MemberID, len(metadata.Members)), ready: metadata.Ready}
+	identity := clusterIdentity{members: make([]protocol.MemberID, len(metadata.Members)), checksum: storedChecksum, ready: metadata.Ready}
 	copy(identity.group[:], groupBytes)
 	if identity.group.IsZero() {
 		return clusterIdentity{}, errClusterMetadata
@@ -592,8 +608,8 @@ func loadOrCreateIdentity(directory string, replicas uint8) (clusterIdentity, er
 	return identity, nil
 }
 
-func generateIdentity(replicas uint8) (clusterIdentity, error) {
-	identity := clusterIdentity{members: make([]protocol.MemberID, replicas)}
+func generateIdentity(replicas uint8, checksum protocol.ChecksumAlgorithm) (clusterIdentity, error) {
+	identity := clusterIdentity{members: make([]protocol.MemberID, replicas), checksum: checksum}
 	if _, err := io.ReadFull(rand.Reader, identity.group[:]); err != nil {
 		return clusterIdentity{}, err
 	}
@@ -609,7 +625,8 @@ func generateIdentity(replicas uint8) (clusterIdentity, error) {
 
 func storeIdentity(directory string, identity clusterIdentity) error {
 	metadata := diskMetadata{
-		Version: metadataVersion, Group: hex.EncodeToString(identity.group[:]), Members: make([]string, len(identity.members)), Ready: identity.ready,
+		Version: metadataVersion, Group: hex.EncodeToString(identity.group[:]), Members: make([]string, len(identity.members)),
+		Checksum: checksumModeName(identity.checksum), Ready: identity.ready,
 	}
 	for index := range identity.members {
 		metadata.Members[index] = hex.EncodeToString(identity.members[index][:])
@@ -652,6 +669,9 @@ func writeAtomic(path string, contents []byte, mode os.FileMode) error {
 }
 
 func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	directory, err := os.Open(path)
 	if err != nil {
 		return err

@@ -46,7 +46,7 @@ func (replica *Replica) handleGetHeaders(request protocol.Header) {
 	for op := start; op <= end && count < bodyCapacity; op++ {
 		header, present, dirty, found := replica.localHeaderEvidence(op)
 		if found && present && !dirty && prepareOperation(&header) != protocol.OperationReserved {
-			if protocol.EncodeHeader(body[count*protocol.HeaderSize:(count+1)*protocol.HeaderSize], &header) != nil {
+			if protocol.EncodeHeaderWith(body[count*protocol.HeaderSize:(count+1)*protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm) != nil {
 				message.Release()
 				return
 			}
@@ -65,7 +65,7 @@ func (replica *Replica) handleGetHeaders(request protocol.Header) {
 		return
 	}
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandHeaders, Author: replica.local}
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(request.Author, message)
 	}
 	message.Release()
@@ -183,7 +183,7 @@ func (replica *Replica) finishRepairRead(read *repairRead, completion IOCompleti
 	if kind == repairReadBlock {
 		maximum = uint32(replica.config.Cluster.BlockSize)
 	}
-	frame, header, ok := decodeRepairFrame(completion.Buffer, replica.config.Group, maximum, replica.membership.ActiveCount+replica.membership.StandbyCount)
+	frame, header, ok := decodeRepairFrameWith(completion.Buffer, replica.config.Group, maximum, replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 	if !ok || header.HeaderChecksum != checksum {
 		if kind == repairReadReply {
 			replica.markReplyIdentityFault(client, op, checksum)
@@ -231,6 +231,10 @@ func (replica *Replica) validRepairBlock(header protocol.Header, body []byte, ad
 }
 
 func decodeRepairFrame(physical []byte, group protocol.GroupID, maximum uint32, memberCount uint8) ([]byte, protocol.Header, bool) {
+	return decodeRepairFrameWith(physical, group, maximum, memberCount, ChecksumAEGIS128L)
+}
+
+func decodeRepairFrameWith(physical []byte, group protocol.GroupID, maximum uint32, memberCount uint8, algorithm ChecksumAlgorithm) ([]byte, protocol.Header, bool) {
 	if len(physical) < protocol.HeaderSize {
 		return nil, protocol.Header{}, false
 	}
@@ -239,7 +243,7 @@ func decodeRepairFrame(physical []byte, group protocol.GroupID, maximum uint32, 
 		return nil, protocol.Header{}, false
 	}
 	frame := physical[:size:size]
-	header, _, reason := protocol.DecodeFrame(frame, group, maximum, memberCount)
+	header, _, reason := protocol.DecodeFrameWith(frame, group, maximum, memberCount, algorithm)
 	return frame, header, reason == protocol.RejectNone
 }
 
@@ -254,7 +258,7 @@ func (replica *Replica) sendRepairFrame(peer protocol.ReplicaIndex, frame []byte
 		return
 	}
 	copy(body, frame[protocol.HeaderSize:])
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	}
 	message.Release()
@@ -348,7 +352,7 @@ func (replica *Replica) sendGetHeadersRange(peer protocol.ReplicaIndex, start, e
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetHeaders, Author: replica.local}
 	binary.LittleEndian.PutUint64(header.Fields[:8], uint64(start))
 	binary.LittleEndian.PutUint64(header.Fields[8:16], uint64(end))
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	}
 	message.Release()
@@ -381,7 +385,7 @@ func (replica *Replica) handleHeaders(header protocol.Header, body []byte) {
 		return
 	}
 	for offset := len(body) - protocol.HeaderSize; offset >= 0; offset -= protocol.HeaderSize {
-		candidate, reason := protocol.DecodeHeader(body[offset:offset+protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		candidate, reason := protocol.DecodeHeaderWith(body[offset:offset+protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || !replica.safeRepairHeader(candidate) {
 			continue
 		}
@@ -404,7 +408,7 @@ func (replica *Replica) handleRepairWindowHeaders(header protocol.Header, body [
 	}
 	parent := committed.HeaderChecksum
 	for index := range count {
-		candidate, reason := protocol.DecodeHeader(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount)
+		candidate, reason := protocol.DecodeHeaderWith(body[index*protocol.HeaderSize:(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || prepareOp(&candidate) != expected || candidate.View > replica.repairView || prepareParent(&candidate) != parent {
 			return
 		}
@@ -666,7 +670,7 @@ func (replica *Replica) sendGetPrepare(now uint64) {
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetPrepare, Author: replica.local}
 	copy(header.Fields[:16], replica.repairHeader.HeaderChecksum[:])
 	binary.LittleEndian.PutUint64(header.Fields[32:40], uint64(op))
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
 	} else {
 		replica.repairBudget.Complete(op, now)
@@ -763,7 +767,7 @@ func (replica *Replica) sendGetView(now uint64) {
 	}
 	header := protocol.Header{Group: replica.config.Group, View: view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetView, Author: replica.local}
 	copy(header.Fields[:16], replica.getViewNonce[:])
-	if message.Seal(&header) == nil {
+	if message.SealWith(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(primary, message)
 		replica.getViewLast = now
 	}

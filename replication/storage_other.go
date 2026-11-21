@@ -1,22 +1,26 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package replication
 
 import (
-	"errors"
 	"os"
 )
 
-var errPreallocationUnsupported = errors.New("replication: durable preallocation unsupported on this platform")
-
-func configureDirectIO(_ *os.File) error {
-	return ErrStorageAlignment
+func openStorageFile(path string, create, direct bool) (*os.File, error) {
+	if direct {
+		return nil, ErrStorageAlignment
+	}
+	return openStandardStorageFile(path, create, 0)
 }
 
 func durableSync(file *os.File) error {
 	return file.Sync()
 }
 
-func preallocateFile(_ *os.File, _ int64) error {
-	return errPreallocationUnsupported
+func preallocateFile(file *os.File, size int64) error {
+	return zeroExtendFile(file, size)
+}
+
+func syncParentDir(dir string) error {
+	return syncParentDirectoryFD(dir)
 }

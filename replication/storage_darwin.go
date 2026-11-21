@@ -27,3 +27,21 @@ func preallocateFile(file *os.File, size int64) error {
 	}
 	return unix.FcntlFstore(file.Fd(), unix.F_PREALLOCATE, &allocation)
 }
+
+func openStorageFile(path string, create, direct bool) (*os.File, error) {
+	file, err := openStandardStorageFile(path, create, 0)
+	if err != nil {
+		return nil, err
+	}
+	if direct {
+		if err := configureDirectIO(file); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+	}
+	return file, nil
+}
+
+func syncParentDir(dir string) error {
+	return syncParentDirectoryFD(dir)
+}

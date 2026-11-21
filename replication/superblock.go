@@ -92,7 +92,11 @@ func (superblock *Superblock) Encode(destination []byte, physicalIndex uint16, v
 		start := SuperblockHeadersOffset + index*protocol.HeaderSize
 		copy(destination[start:start+protocol.HeaderSize], superblock.ViewHeaders[index][:])
 	}
-	superblock.Checksum = protocol.ChecksumBytes(destination[34:])
+	checksum, err := protocol.ChecksumBytesWith(validation.Cluster.ChecksumAlgorithm, destination[34:])
+	if err != nil {
+		return ErrIncompatibleConfiguration
+	}
+	superblock.Checksum = checksum
 	copy(destination[:16], superblock.Checksum[:])
 	return nil
 }
@@ -103,7 +107,18 @@ func DecodeSuperblock(source []byte, physicalIndex uint16, validation Superblock
 	}
 	var checksum protocol.Checksum
 	copy(checksum[:], source[:16])
-	if protocol.ChecksumBytes(source[34:]) != checksum {
+	computed, err := protocol.ChecksumBytesWith(validation.Cluster.ChecksumAlgorithm, source[34:])
+	if err != nil {
+		return SuperblockCandidate{}, ErrIncompatibleConfiguration
+	}
+	if computed != checksum {
+		alternate := protocol.ChecksumWyhash128
+		if validation.Cluster.ChecksumAlgorithm == protocol.ChecksumWyhash128 {
+			alternate = protocol.ChecksumAEGIS128L
+		}
+		if altComputed, altErr := protocol.ChecksumBytesWith(alternate, source[34:]); altErr == nil && altComputed == checksum {
+			return SuperblockCandidate{}, errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
+		}
 		return SuperblockCandidate{}, ErrInvalidSuperblock
 	}
 	storedFormat := binary.LittleEndian.Uint16(source[34:36])
@@ -171,10 +186,11 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 		return errors.Join(ErrInvalidSuperblock, ErrIncompatibleConfiguration)
 	}
 	checkpointValidation := CheckpointValidation{
-		Group:          validation.Group,
-		MessageSizeMax: uint32(validation.Cluster.MessageSizeMax),
-		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
-		ClientsMax:     validation.Cluster.ClientsMax,
+		Group:             validation.Group,
+		MessageSizeMax:    uint32(validation.Cluster.MessageSizeMax),
+		MemberCount:       validation.Membership.ActiveCount + validation.Membership.StandbyCount,
+		ClientsMax:        validation.Cluster.ClientsMax,
+		ChecksumAlgorithm: validation.Cluster.ChecksumAlgorithm,
 	}
 	checkpointValidation.BlockBase, _ = validation.Cluster.BlockBase()
 	checkpointValidation.BlockSize = validation.Cluster.BlockSize
@@ -189,7 +205,7 @@ func (superblock *Superblock) Validate(validation SuperblockValidation) error {
 		return ErrInvalidSuperblock
 	}
 	for index := range int(superblock.ViewHeaderCount) {
-		header, reason := protocol.DecodeHeader(superblock.ViewHeaders[index][:], validation.Group, uint32(validation.Cluster.MessageSizeMax), validation.Membership.ActiveCount+validation.Membership.StandbyCount)
+		header, reason := protocol.DecodeHeaderWith(superblock.ViewHeaders[index][:], validation.Group, uint32(validation.Cluster.MessageSizeMax), validation.Membership.ActiveCount+validation.Membership.StandbyCount, validation.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || header.Command != protocol.CommandPrepare {
 			return ErrInvalidSuperblock
 		}
@@ -237,12 +253,13 @@ func decodeDurableReplicaState(source []byte, validation SuperblockValidation) (
 		return DurableReplicaState{}, ErrInvalidSuperblock
 	}
 	checkpoint, err := DecodeCheckpointState(source[:1024], CheckpointValidation{
-		Group:          validation.Group,
-		MessageSizeMax: uint32(validation.Cluster.MessageSizeMax),
-		MemberCount:    validation.Membership.ActiveCount + validation.Membership.StandbyCount,
-		BlockBase:      blockBase,
-		BlockSize:      validation.Cluster.BlockSize,
-		ClientsMax:     validation.Cluster.ClientsMax,
+		Group:             validation.Group,
+		MessageSizeMax:    uint32(validation.Cluster.MessageSizeMax),
+		MemberCount:       validation.Membership.ActiveCount + validation.Membership.StandbyCount,
+		BlockBase:         blockBase,
+		BlockSize:         validation.Cluster.BlockSize,
+		ClientsMax:        validation.Cluster.ClientsMax,
+		ChecksumAlgorithm: validation.Cluster.ChecksumAlgorithm,
 	})
 	if err != nil {
 		return DurableReplicaState{}, err

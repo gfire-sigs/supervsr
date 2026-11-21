@@ -6,7 +6,8 @@ Viewstamped Replication (VSR) consensus, WAL storage, and block checkpointing in
 
 - **Cluster topology**: 1 to 6 active replicas plus up to 6 standbys (`MembersMax = 12`) with validated quorum intersection.
 - **Single-file layout**: Preallocated replica file holding 4, 6, or 8 superblock copies, WAL header rings and prepare slots, client reply slots, and block-addressed checkpoints.
-- **Platforms and CPU**: Go 1.27.4+ on Linux (`O_DIRECT`, `fallocate`) and macOS (`F_NOCACHE`, `F_FULLFSYNC`, `F_PREALLOCATE`), requiring x86-64 (AVX + AES-NI) or ARM64 (AES) hardware checksums.
+- **Platforms and storage**: Go 1.27.4+ with platform-native `FileStorage` on Linux (`O_DIRECT`, `fallocate`), macOS (`F_NOCACHE`, `F_FULLFSYNC`, `F_PREALLOCATE`), Windows (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, `FileAllocationInfo`, `FlushFileBuffers`), and portable buffered fallback on other OSes.
+- **Checksums**: 128-bit `ChecksumAEGIS128L` by default (hardware AES on x86-64/ARM64 with automatic portable fallback, plus opt-in `RequireHardwareChecksum` on `FormatConfig` and `ProcessConfig`) or `ChecksumWyhash128` (`ClusterConfig.ChecksumAlgorithm`), bound into the superblock configuration fingerprint.
 - **Dependencies**: Only `github.com/rs/zerolog` and `golang.org/x/sys`.
 
 ```sh
@@ -23,8 +24,6 @@ go run ./cmd/toykv -data ./toykv-data -replicas 3
 go get z.gfire.dev/supervsr@latest
 ```
 
-Windows and CPU targets without AES checksum instructions are rejected when formatting or opening storage.
-
 ## Quick start
 
 Run the included in-process key-value demo (`cmd/toykv`) from a repository checkout to format and start a local 3-replica cluster:
@@ -35,7 +34,7 @@ cd supervsr
 go run ./cmd/toykv -data ./toykv-data -replicas 3 -pretty-logs
 ```
 
-Enter `put KEY VALUE`, `get KEY`, `delete KEY` (`del`), or `quit` at the prompt. Reopening an existing `-data` directory requires the same `-replicas` count stored in `cluster.json`.
+Enter `put KEY VALUE`, `get KEY`, `delete KEY` (`del`), or `quit` at the prompt. Pass `-checksum wyhash` when formatting to use `ChecksumWyhash128` instead of the default `aegis` mode. Reopening an existing `-data` directory requires the same `-replicas` count and `-checksum` mode stored in `cluster.json`.
 
 ## Features
 
@@ -285,7 +284,7 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 | Path | Responsibility |
 | --- | --- |
 | `replication/` | VSR `Replica`, `Client`, `WAL`, `SuperblockStore`, `BlockStore`, `BlockAllocator`, `IOEngine`, `MPSCRing`, `ClockSynchronizer`, scrubbing, and `ReplaceLostReplica`. |
-| `replication/protocol/` | 256-byte fixed headers, `FramePool`, source binding, semantic validation, and AEGIS 128-bit checksums (AVX-AES, ARM64 NEON-AES, and portable fallback). |
+| `replication/protocol/` | 256-byte fixed headers, `FramePool`, source binding, semantic validation, and 128-bit checksums (`ChecksumAEGIS128L` with AVX-AES, NEON-AES, and portable fallback; `ChecksumWyhash128`). |
 | `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`, `IOController`), `LedgerMachine`, and global invariant checks. |
 | `cmd/toykv/` | Local multi-replica in-process cluster demo and KV REPL. |
 | `formal/` | TLA+ specifications (`VSR.tla`, `VSRConsensus`, `MPSCRing.tla`) verified in CI. |
@@ -310,7 +309,7 @@ VSR_LONG_SEED_START=1 VSR_LONG_SEED_COUNT=2 go test ./replication/sim -run '^Tes
 
 ### Verification scope and limits
 
-- CI ([ci.yml](.github/workflows/ci.yml)) runs all Go tests on `ubuntu-26.04` and `macos-26`, `go vet`, `gojgp lint`, `-race` (excluding `TestFoundationDBFaultCampaign`, whose initial full race run exceeded 15 minutes), and three TLA+ configurations (`MPSCRing`, `VSR`, `VSRConsensus`).
+- CI ([ci.yml](.github/workflows/ci.yml)) runs `go vet`, `gojgp lint`, and all Go tests on `ubuntu-26.04`, `macos-26`, and `windows-2025`, `-race` on `ubuntu-26.04` and `macos-26` (excluding `TestFoundationDBFaultCampaign`, whose initial full race run exceeded 15 minutes), and three TLA+ configurations (`MPSCRing`, `VSR`, `VSRConsensus`).
 - TLA+/TLC runs only in CI; finite model bounds do not establish refinement of the Go implementation.
 - `TestFoundationDBFaultCampaign` exercises swizzle-clogging, correlated reboots, overlapping stalls, and 14 storage fault modes below the first checkpoint; `TestLongDeterministicFaultCampaign` crosses at least eight checkpoint boundaries and four journal wraps per seed against a non-idempotent `LedgerMachine` and bounded history oracle.
 - With `sim.Config.ControlledIO`, `PendingIO` and `AdvanceIO` drive queued `IOEngine` work deterministically, while `Format`, `Open`, and synchronous state-machine block calls stay immediate.

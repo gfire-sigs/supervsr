@@ -3,22 +3,23 @@ package replication
 import "z.gfire.dev/supervsr/replication/protocol"
 
 type (
-	GroupID      = protocol.GroupID
-	MemberID     = protocol.MemberID
-	ClientID     = protocol.ClientID
-	Checksum     = protocol.Checksum
-	Nonce        = protocol.Nonce
-	CheckpointID = protocol.CheckpointID
-	ReplicaIndex = protocol.ReplicaIndex
-	View         = protocol.View
-	Epoch        = protocol.Epoch
-	Op           = protocol.Op
-	Session      = protocol.Session
-	RequestNo    = protocol.RequestNo
-	Release      = protocol.Release
-	Operation    = protocol.Operation
-	Command      = protocol.Command
-	BlockType    = protocol.BlockType
+	GroupID           = protocol.GroupID
+	MemberID          = protocol.MemberID
+	ClientID          = protocol.ClientID
+	Checksum          = protocol.Checksum
+	Nonce             = protocol.Nonce
+	CheckpointID      = protocol.CheckpointID
+	ReplicaIndex      = protocol.ReplicaIndex
+	View              = protocol.View
+	Epoch             = protocol.Epoch
+	Op                = protocol.Op
+	Session           = protocol.Session
+	RequestNo         = protocol.RequestNo
+	Release           = protocol.Release
+	Operation         = protocol.Operation
+	Command           = protocol.Command
+	BlockType         = protocol.BlockType
+	ChecksumAlgorithm = protocol.ChecksumAlgorithm
 )
 
 const (
@@ -45,4 +46,9 @@ const (
 	BlockManifest       = protocol.BlockManifest
 	BlockIndex          = protocol.BlockIndex
 	BlockValue          = protocol.BlockValue
+)
+
+const (
+	ChecksumAEGIS128L = protocol.ChecksumAEGIS128L
+	ChecksumWyhash128 = protocol.ChecksumWyhash128
 )
