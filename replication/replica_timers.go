@@ -9,6 +9,7 @@ type replicaTimers struct {
 	commit     tickTimeout
 	exit       tickTimeout
 	join       tickTimeout
+	viewChange tickTimeout
 	pulse      tickTimeout
 	repair     tickTimeout
 }
@@ -21,6 +22,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		500 * time.Millisecond,
 		500 * time.Millisecond,
 		500 * time.Millisecond,
+		5 * time.Second,
 		100 * time.Millisecond,
 		100 * time.Millisecond,
 	}
@@ -32,6 +34,7 @@ func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
 		&timers.commit,
 		&timers.exit,
 		&timers.join,
+		&timers.viewChange,
 		&timers.pulse,
 		&timers.repair,
 	}

@@ -3,9 +3,12 @@ package replication
 import (
 	"encoding/binary"
 	"errors"
+	"time"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
+
+const exitViewCollectionWindow = uint64(5 * time.Second)
 
 func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 	if header.View < replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
@@ -47,7 +50,7 @@ func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 	return false
 }
 
-func (replica *Replica) handleExitView(header protocol.Header) {
+func (replica *Replica) handleExitView(header protocol.Header, now uint64) {
 	if uint8(header.Author) >= replica.membership.ActiveCount {
 		return
 	}
@@ -55,14 +58,25 @@ func (replica *Replica) handleExitView(header protocol.Header) {
 		replica.beginViewChange(header.View)
 		return
 	}
-	if replica.status != StatusNormal || header.View != replica.view {
+	if header.View != replica.view || !replica.canEnterViewChange() {
 		return
 	}
-	bit := uint16(1) << uint8(header.Author)
-	if replica.exitViewBits&bit != 0 {
-		return
+	if now != 0 {
+		for member := range replica.membership.ActiveCount {
+			bit := uint16(1) << member
+			if replica.exitViewBits&bit == 0 {
+				continue
+			}
+			recorded := replica.exitViewAt[member]
+			if recorded != 0 && now > recorded && now-recorded > exitViewCollectionWindow {
+				replica.exitViewBits &^= bit
+				replica.exitViewAt[member] = 0
+			}
+		}
 	}
-	replica.exitViewBits |= bit
+	author := uint8(header.Author)
+	replica.exitViewBits |= uint16(1) << author
+	replica.exitViewAt[author] = now
 	if countAckBits(replica.exitViewBits) < replica.quorums.ViewChange {
 		return
 	}
@@ -73,20 +87,27 @@ func (replica *Replica) handleExitView(header protocol.Header) {
 	replica.beginViewChange(replica.view + 1)
 }
 
+func (replica *Replica) canAbortRepairForViewChange() bool {
+	if replica.status != StatusRecoveringHead || !replica.repairViewValid || replica.repairViewRebuilt {
+		return false
+	}
+	if replica.repairWrite.busy || replica.pipelineBusyForRepair() {
+		return false
+	}
+	return replica.wal != nil && !replica.wal.HasFaultySlots()
+}
+
 func (replica *Replica) canEnterViewChange() bool {
 	if uint8(replica.local) >= replica.membership.ActiveCount {
 		return false
 	}
-	if replica.status != StatusNormal && replica.status != StatusViewChange {
+	if replica.stateSync.stage != syncStageIdle || replica.stateSync.repairing || replica.stateSync.opening || replica.stateSync.replayRunning {
 		return false
 	}
-	if replica.repairViewValid || replica.stateSync.stage != syncStageIdle {
-		return false
+	if replica.status == StatusNormal || replica.status == StatusViewChange {
+		return !replica.repairViewValid
 	}
-	if replica.stateSync.repairing || replica.stateSync.opening {
-		return false
-	}
-	return !replica.stateSync.replayRunning
+	return replica.canAbortRepairForViewChange()
 }
 
 func (replica *Replica) beginViewChange(target protocol.View) {
@@ -101,13 +122,22 @@ func (replica *Replica) beginViewChange(target protocol.View) {
 }
 
 func (replica *Replica) beginViewChangeNow(target protocol.View) {
+	if replica.repairViewValid {
+		replica.clearRepairView()
+	}
 	replica.status = StatusViewChange
 	replica.view = target
+	replica.abdicated = false
+	replica.viewChangeStalled = false
 	replica.exitViewBits = 0
+	clear(replica.exitViewAt[:])
 	replica.invalidateReleaseReports()
 	replica.joinViewBits = 0
 	clear(replica.joins)
+	replica.timers.abdication.Reset()
+	replica.timers.prepare.Reset()
 	replica.timers.join.Reset()
+	replica.timers.viewChange.Reset()
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
 		entry.acks = 0
@@ -209,6 +239,8 @@ func (replica *Replica) handleViewPersistence(completion ioCompletion) bool {
 	}
 	replica.durableView = replica.view
 	if !replica.viewInstall {
+		replica.viewChangeStalled = false
+		replica.timers.viewChange.Reset()
 		if replica.resumePendingViewChange() {
 			return true
 		}
@@ -217,10 +249,17 @@ func (replica *Replica) handleViewPersistence(completion ioCompletion) bool {
 	}
 	replica.wal.DiscardAfter(replica.viewHead)
 	replica.lastPrimaryCommit = 0
-	replica.failureDetector.Signal(replica.deps.Clock.Now().Monotonic)
+	replica.failureDetector = newLivenessDetector(replica.deps.Clock.Now().Monotonic)
 	replica.logView = replica.view
 	replica.commitMax = max(replica.commitMax, replica.viewCommit)
 	replica.status = StatusNormal
+	replica.abdicated = false
+	replica.viewChangeStalled = false
+	replica.exitViewBits = 0
+	clear(replica.exitViewAt[:])
+	replica.timers.abdication.Reset()
+	replica.timers.prepare.Reset()
+	replica.timers.viewChange.Reset()
 	replica.refreshLocalReleaseReport()
 	replica.maybeSelectUpgrade()
 	replica.viewInstall = false
@@ -548,6 +587,7 @@ func (replica *Replica) joinCommittedBound(sender uint8) protocol.Op {
 func (replica *Replica) canonicalEvidence(op protocol.Op, candidate protocol.Header, candidateFound bool) (uint8, uint8) {
 	var negatives, copies uint8
 	latest := replica.canonicalLogView()
+	latestUncertain := replica.latestLogViewUncertain(op, latest)
 	for sender := range replica.joins {
 		record := &replica.joins[sender]
 		if !record.valid {
@@ -574,12 +614,31 @@ func (replica *Replica) canonicalEvidence(op protocol.Op, candidate protocol.Hea
 			continue
 		}
 		differentCandidate := candidateFound && header.HeaderChecksum != candidate.HeaderChecksum
-		absentFromLatest := !candidateFound && header.View < latest
+		absentFromLatest := !candidateFound && !latestUncertain && header.View < latest
 		if differentCandidate || absentFromLatest {
 			negatives++
 		}
 	}
 	return negatives, copies
+}
+
+func (replica *Replica) latestLogViewUncertain(op protocol.Op, latest protocol.View) bool {
+	for sender := range replica.joins {
+		record := &replica.joins[sender]
+		if !record.valid || record.logView != latest || record.head < op {
+			continue
+		}
+		index := record.head - op
+		if index >= protocol.Op(record.count) {
+			continue
+		}
+		bit := uint16(1) << uint(index)
+		_, present := replica.joinHeaderAt(uint8(sender), op)
+		if !present && record.nack&bit == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (replica *Replica) joinHeaderAt(sender uint8, op protocol.Op) (protocol.Header, bool) {
@@ -646,7 +705,11 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	}
 	head := protocol.Op(binary.LittleEndian.Uint64(header.Fields[16:24]))
 	commit := protocol.Op(binary.LittleEndian.Uint64(header.Fields[24:32]))
-	if commit < replica.commitMax || head < commit || head < replica.commitMin {
+	minimumCommit := protocol.Op(0)
+	if head > protocol.Op(replica.config.Cluster.PipelineMax) {
+		minimumCommit = head - protocol.Op(replica.config.Cluster.PipelineMax)
+	}
+	if head < commit || head < replica.commitMin || head < replica.commitMax || commit < minimumCommit {
 		return
 	}
 	if replica.status == StatusRecoveringHead {
@@ -695,24 +758,25 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 	if replica.stateSyncAwaitingOpen() && checkpoint.PrepareOp() == replica.checkpoint.PrepareOp() {
 		return
 	}
+	effectiveCommit := max(commit, replica.commitMax)
 	if checkpoint.PrepareOp() > replica.checkpoint.PrepareOp() {
-		if !replica.beginStateSync(checkpoint, header.View, commit, head, incoming) {
+		if !replica.beginStateSync(checkpoint, header.View, effectiveCommit, head, incoming) {
 			return
 		}
-	} else if commit > replica.commitMin && head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
+	} else if effectiveCommit > replica.commitMin && head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
 		sameViewPipeline := replica.status == StatusNormal && header.View == replica.view && !replica.isPrimary() && replica.pipelineLen > 0
 		if sameViewPipeline {
-			replica.commitMax = max(replica.commitMax, commit)
-		} else if replica.commitInFlight() || !replica.beginRepairWindow(header.View, commit) {
+			replica.commitMax = max(replica.commitMax, effectiveCommit)
+		} else if replica.commitInFlight() || !replica.beginRepairWindow(header.View, effectiveCommit) {
 			return
 		}
 	} else {
-		if !replica.validRecoveringView(header.View, commit, head, incoming) {
+		if !replica.validRecoveringView(header.View, effectiveCommit, head, incoming) {
 			return
 		}
 		replica.status = StatusRecoveringHead
 		replica.releaseQueuedRequests()
-		replica.recordRecoveringView(header.View, commit, head, incoming)
+		replica.recordRecoveringView(header.View, effectiveCommit, head, incoming)
 	}
 	replica.observePeerCheckpoint(header.Author, checkpoint.PrepareOp())
 	replica.getViewNonce = protocol.Nonce{}
@@ -762,7 +826,11 @@ func (replica *Replica) validRecoveringView(view protocol.View, commit, head pro
 	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
 		return false
 	}
-	if view < replica.view || commit < replica.commitMax || head < commit {
+	minimumCommit := protocol.Op(0)
+	if head > protocol.Op(replica.config.Cluster.PipelineMax) {
+		minimumCommit = head - protocol.Op(replica.config.Cluster.PipelineMax)
+	}
+	if view < replica.view || head < replica.commitMax || head < commit || commit < minimumCommit {
 		return false
 	}
 	if head-replica.commitMin > protocol.Op(len(replica.pipeline)) {
@@ -836,6 +904,8 @@ func (replica *Replica) recordRecoveringView(view protocol.View, commit, head pr
 	replica.repairViewRebuilt = false
 	replica.repairViewCount = len(headers)
 	replica.commitMax = max(replica.commitMax, commit)
+	replica.viewChangeStalled = false
+	replica.timers.viewChange.Reset()
 }
 
 func (replica *Replica) broadcastView() {

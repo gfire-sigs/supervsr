@@ -230,6 +230,34 @@ func TestWALRecoverTruncatesProvenFutureHeader(t *testing.T) {
 	}
 }
 
+func TestClassifyWALSlotFutureCounterpartSafety(t *testing.T) {
+	context := walRecoveryContext{PhysicalSlot: 1, JournalSlots: 16, RetainedMin: 1, PrepareMax: 20, UntrustedMax: 20}
+	future := walCandidate{Kind: walCandidateOrdinary, Op: 33}
+	retained := walCandidate{Kind: walCandidateOrdinary, Op: 17}
+	reserved := walCandidate{Kind: walCandidateReserved, Op: 1}
+	invalid := walCandidate{Kind: walCandidateInvalid}
+
+	cases := []struct {
+		name            string
+		header, prepare walCandidate
+		want            walRecoveryDecision
+	}{
+		{"future_header_reserved_prepare", future, reserved, walRecoveryTruncate},
+		{"reserved_header_future_prepare", reserved, future, walRecoveryTruncate},
+		{"future_header_invalid_prepare", future, invalid, walRecoveryRemoteRepair},
+		{"invalid_header_future_prepare", invalid, future, walRecoveryRemoteRepair},
+		{"future_header_retained_prepare", future, retained, walRecoveryLocalRepair},
+		{"retained_header_future_prepare", retained, future, walRecoveryRemoteRepair},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := classifyWALSlot(testCase.header, testCase.prepare, context); got != testCase.want {
+				t.Fatalf("classifyWALSlot = %d, want %d", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestRecoveredCommitTargetRetainsBoundedSuffix(t *testing.T) {
 	config := compactTestClusterConfig()
 	head := protocol.Header{}

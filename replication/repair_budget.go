@@ -159,6 +159,15 @@ func (budget *journalRepairBudget) assertInvariant() {
 	}
 }
 
+func (budget *journalRepairBudget) HasPending(op protocol.Op) bool {
+	for index := range budget.entries {
+		if budget.entries[index].busy && budget.entries[index].op == op {
+			return true
+		}
+	}
+	return false
+}
+
 func (budget *journalRepairBudget) Reset() {
 	for index := range budget.entries {
 		budget.entries[index] = journalRepairEntry{}

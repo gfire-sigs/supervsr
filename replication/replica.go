@@ -208,6 +208,9 @@ type Replica struct {
 	stage                  CommitStage
 	stageGeneration        uint64
 	exitViewBits           uint16
+	exitViewAt             [ActiveMax]uint64
+	abdicated              bool
+	viewChangeStalled      bool
 	joins                  []joinRecord
 	joinHeaders            []protocol.Header
 	canonicalHeaders       []protocol.Header
@@ -710,7 +713,7 @@ func (replica *Replica) Process(limit int) (int, error) {
 		}
 		var completion ioCompletion
 		if replica.io.Poll(&completion) {
-			if replica.stateSync.stage == syncStageCancelingGrid {
+			if replica.stateSync.stage == syncStageCancelingStorage {
 				replica.handleStateSyncDrainIO(completion)
 			} else {
 				replica.handleIOCompletion(completion)
@@ -734,7 +737,7 @@ func (replica *Replica) Process(limit int) (int, error) {
 				event.message.Release()
 			}
 		case replicaEventSMCompletion:
-			if replica.stateSync.stage == syncStageCancelingGrid || replica.stateSync.stage == syncStageUpdatingCheckpoint || replica.stateSync.replayRunning {
+			if replica.stateSync.stage == syncStageCancelingStorage || replica.stateSync.stage == syncStageUpdatingCheckpoint || replica.stateSync.replayRunning {
 				replica.handleStateSyncDrainSM(event)
 			} else {
 				replica.handleSMCompletion(event)

@@ -47,7 +47,7 @@ func (replica *Replica) handleMessage(message *Message) bool {
 	case protocol.CommandCommit:
 		replica.handleCommit(header, sample)
 	case protocol.CommandExitView:
-		replica.handleExitView(header)
+		replica.handleExitView(header, sample.Monotonic)
 	case protocol.CommandJoinView:
 		replica.handleJoinView(header, body)
 	case protocol.CommandView:
@@ -93,7 +93,7 @@ func (replica *Replica) validationContext(source protocol.FrameSource, sender pr
 }
 
 func (replica *Replica) handleRequest(message *Message, header protocol.Header, body []byte, sample TimeSample) bool {
-	if replica.status != StatusNormal || replica.durableView != replica.view {
+	if replica.status != StatusNormal || replica.durableView != replica.view || replica.abdicated {
 		replica.metrics.requestsDropped.Add(1)
 		return false
 	}
@@ -115,9 +115,12 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 	if operation == protocol.OperationRegister {
 		if session, found := replica.sessions.Session(client); found {
 			cached, _, ready := replica.sessions.Reply(client, session, 0)
-			if ready && replyRequestChecksum(&cached) == header.HeaderChecksum {
+			switch {
+			case ready && cached.Release != header.Release:
+				replica.sendEviction(client, protocol.EvictionSessionReleaseMismatch)
+			case ready && replyRequestChecksum(&cached) == header.HeaderChecksum:
 				replica.sendCachedReply(client, session, 0)
-			} else {
+			default:
 				replica.metrics.clientForks.Add(1)
 			}
 			return false
@@ -361,15 +364,13 @@ func (replica *Replica) createPrepare(request protocol.Header, requestBody []byt
 	}
 	replica.metrics.preparesCreated.Add(1)
 	replica.deps.MessageBus.BroadcastReplicas(prepare)
+	replica.failureDetector.Signal(sample.Monotonic)
 	return nil
 }
 
 func (replica *Replica) handlePrepare(message *Message, header protocol.Header, sample TimeSample) bool {
 	if replica.status != StatusNormal || replica.durableView != replica.view || header.View > replica.view || header.Author != replica.membership.Primary(header.View) {
 		return false
-	}
-	if header.View == replica.view {
-		replica.failureDetector.Signal(sample.Monotonic)
 	}
 	op := prepareOp(&header)
 	for offset := range replica.pipelineLen {
@@ -391,6 +392,7 @@ func (replica *Replica) handlePrepare(message *Message, header protocol.Header, 
 	if header.View != replica.view {
 		return false
 	}
+	replica.failureDetector.Signal(sample.Monotonic)
 	if op != replica.headOp+1 || prepareParent(&header) != replica.headChecksum || prepareCommit(&header) > replica.commitMin {
 		replica.requestView(header.View, sample.Monotonic)
 		return false
@@ -560,6 +562,10 @@ func (replica *Replica) countPrepareAck(entry *pipelineEntry, author protocol.Re
 	replica.metrics.prepareAcks.Add(1)
 	if countAckBits(entry.acks) >= replica.quorums.Replication {
 		entry.quorum = true
+		if replica.pipelineLen > 0 && entry == replica.pipelineEntry(0) {
+			replica.timers.abdication.Reset()
+			replica.timers.prepare.Reset()
+		}
 	}
 }
 
@@ -887,6 +893,10 @@ func (replica *Replica) finishCommit(entry *pipelineEntry) {
 	replica.commitMin = op
 	if replica.commitMax < op {
 		replica.commitMax = op
+	}
+	if replica.isPrimary() {
+		replica.timers.abdication.Reset()
+		replica.timers.prepare.Reset()
 	}
 	replica.lastCommitTimestamp = prepareTimestamp(&entry.header)
 	replica.metrics.operationsCommitted.Add(1)

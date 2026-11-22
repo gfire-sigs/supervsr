@@ -270,12 +270,15 @@ func (replica *Replica) handleRepairTimeout(sample TimeSample) {
 	if replica.stateSyncAwaitingOpen() {
 		return
 	}
-	if replica.stateSync.repliesPending && replica.continueReplyRepair(sample.Monotonic) {
-		return
+	if replica.stateSync.repliesPending {
+		replica.continueReplyRepair(sample.Monotonic)
+		if replica.replyRepair.handle != (IOHandle{}) {
+			return
+		}
 	}
 	replica.repairBudget.Expire(sample.Monotonic)
 	if replica.repairViewValid {
-		replica.continueRecoveringView(sample.Monotonic)
+		replica.continueRecoveringViewWithRetry(sample.Monotonic, true)
 		return
 	}
 	if replica.headOp < replica.commitMax || replica.status == StatusRecoveringHead {
@@ -506,6 +509,8 @@ func (replica *Replica) beginRepairWindow(view protocol.View, commit protocol.Op
 	replica.repairViewPartial = true
 	replica.commitMax = max(replica.commitMax, commit)
 	replica.repairHeadersLast = 0
+	replica.viewChangeStalled = false
+	replica.timers.viewChange.Reset()
 	replica.requestRepairWindowHeaders(replica.deps.Clock.Now().Monotonic)
 	return true
 }
@@ -521,6 +526,10 @@ func (replica *Replica) requestRepairWindowHeaders(now uint64) {
 }
 
 func (replica *Replica) continueRecoveringView(now uint64) {
+	replica.continueRecoveringViewWithRetry(now, false)
+}
+
+func (replica *Replica) continueRecoveringViewWithRetry(now uint64, retryPending bool) {
 	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
 		return
 	}
@@ -542,6 +551,10 @@ func (replica *Replica) continueRecoveringView(now uint64) {
 		header := replica.canonicalHeaders[index]
 		if prepareOp(&header) <= replica.repairViewAncestor || replica.repairFrames[index] != nil {
 			continue
+		}
+		op := prepareOp(&header)
+		if !retryPending && replica.repairBudget.HasPending(op) {
+			return
 		}
 		replica.repairHeader = header
 		replica.repairHeaderValid = true
@@ -618,6 +631,8 @@ func (replica *Replica) finishRecoveringView() {
 	replica.repairViewRebuilt = false
 	replica.repairHeader = protocol.Header{}
 	replica.repairHeaderValid = false
+	replica.viewChangeStalled = false
+	replica.timers.viewChange.Reset()
 }
 
 func (replica *Replica) finishPartialRepairWindow() {
@@ -648,11 +663,16 @@ func (replica *Replica) finishPartialRepairWindow() {
 		return
 	}
 	replica.status = StatusViewChange
+	replica.abdicated = false
+	replica.viewChangeStalled = false
 	replica.exitViewBits = 0
+	clear(replica.exitViewAt[:])
 	replica.invalidateReleaseReports()
 	replica.joinViewBits = 0
 	clear(replica.joins)
+	replica.timers.abdication.Reset()
 	replica.timers.join.Reset()
+	replica.timers.viewChange.Reset()
 	count := replica.collectLocalSuffix(replica.canonicalHeaders)
 	durableCommit := max(replica.superblocks.Current().State.CommitMax, min(replica.commitMax, replica.durableHeadOp()))
 	if err := replica.persistView(false, durableCommit, replica.headOp, replica.canonicalHeaders[:count]); err != nil {
@@ -827,6 +847,8 @@ func (replica *Replica) finishRepairWrite(completion ioCompletion) {
 	}
 	replica.repairHeader = protocol.Header{}
 	replica.repairHeaderValid = false
+	replica.viewChangeStalled = false
+	replica.timers.viewChange.Reset()
 }
 
 func (replica *Replica) requestView(view protocol.View, now uint64) {

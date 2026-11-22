@@ -552,7 +552,7 @@ func submitPipelineBatch(t testing.TB, cluster *Cluster, clients []*replication.
 		}
 		return true
 	}); err != nil {
-		t.Fatalf("batch %d completion: %v", body, err)
+		t.Fatalf("batch %d completion: %v states=%v", body, err, compactSnapshots(cluster))
 	}
 }
 
@@ -1338,6 +1338,215 @@ func TestClusterWyhash128CommitsViewChangesAndCheckpoints(t *testing.T) {
 		return ok && snapshot.View > 0 && snapshot.Checkpoint.PrepareOp() > 0
 	}); err != nil {
 		t.Fatalf("%v snapshots=%v", err, clusterSnapshots(cluster))
+	}
+	if err := cluster.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsymmetricPrimaryPartitionTriggersAbdicationAndRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	events := &clientEvents{}
+	client, err := cluster.AddClient(protocol.ClientID{0x51}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := currentPrimary(t, cluster)
+	before, _ := cluster.Snapshot(primary)
+	// Block only backups -> primary; primary -> backups stays open so Commit heartbeats would keep backups green unless primary abdicates.
+	for index := range cluster.config.ActiveCount {
+		peer := protocol.ReplicaIndex(index)
+		if peer != primary {
+			if err := cluster.Network().PartitionDirected(peer, primary); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := client.Submit(protocol.OperationApplicationMin, []byte("asymmetric-abdication")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 8_000, func(*Cluster) bool { return events.replyCount() == 2 }); err != nil {
+		t.Fatalf("asymmetric partition stalled client commit: %v states=%v", err, compactSnapshots(cluster))
+	}
+	newPrimary := currentPrimary(t, cluster)
+	if newPrimary == primary {
+		t.Fatalf("cluster did not elect a new primary under asymmetric partition: states=%v", compactSnapshots(cluster))
+	}
+	after, _ := cluster.Snapshot(newPrimary)
+	if after.View <= before.View {
+		t.Fatalf("view did not advance: before=%d after=%d", before.View, after.View)
+	}
+
+	cluster.Network().HealAll()
+	if err := runUntil(cluster, 4_000, replicasAgree); err != nil {
+		t.Fatalf("healed cluster did not converge: %v states=%v", err, compactSnapshots(cluster))
+	}
+	if err := cluster.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsolatedViewChangeReplicaDoesNotDisruptHealthyCluster(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	primary := currentPrimary(t, cluster)
+	before, _ := cluster.Snapshot(primary)
+	targetView := before.View + 1
+	nextPrimary := protocol.ReplicaIndex(uint64(targetView) % uint64(cluster.config.ActiveCount))
+	var isolated protocol.ReplicaIndex
+	for index := range cluster.config.ActiveCount {
+		candidate := protocol.ReplicaIndex(index)
+		if candidate != primary && candidate != nextPrimary {
+			isolated = candidate
+			break
+		}
+	}
+	// Block primary -> backups with a small delay between backups so isolated enters StatusViewChange(targetView) before View(targetView) arrives.
+	if err := cluster.Network().SetLinkDelay(nextPrimary, isolated, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Network().SetLinkDelay(isolated, nextPrimary, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Network().PartitionDirected(primary, isolated); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Network().PartitionDirected(primary, nextPrimary); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 3_000, func(cluster *Cluster) bool {
+		snap, ok := cluster.Snapshot(isolated)
+		return ok && snap.Status == replication.StatusViewChange && snap.View == targetView && snap.DurableView == targetView
+	}); err != nil {
+		t.Fatalf("replica %d did not enter StatusViewChange(%d): %v states=%v", isolated, targetView, err, compactSnapshots(cluster))
+	}
+	// Isolate the replica while allowing {primary, nextPrimary} to install targetView.
+	if err := cluster.Network().HealDirected(primary, nextPrimary); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.Network().Disconnect(isolated); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(cluster *Cluster) bool {
+		sA, okA := cluster.Snapshot(primary)
+		sB, okB := cluster.Snapshot(nextPrimary)
+		return okA && okB && sA.Status == replication.StatusNormal && sB.Status == replication.StatusNormal && sA.View == targetView && sB.View == targetView
+	}); err != nil {
+		t.Fatalf("quorum {%d,%d} did not install view %d: %v states=%v", primary, nextPrimary, targetView, err, compactSnapshots(cluster))
+	}
+
+	// Run 25 simulated seconds (5x view-change progress timeout) while the replica stays isolated in StatusViewChange(targetView).
+	for range 2_500 {
+		if err := cluster.Step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	isolatedSnap, _ := cluster.Snapshot(isolated)
+	if isolatedSnap.Status != replication.StatusViewChange || isolatedSnap.View != targetView {
+		t.Fatalf("isolated replica inflated view or left StatusViewChange: %+v", isolatedSnap)
+	}
+
+	// Reconnect the isolated replica and verify it catches up without disrupting targetView.
+	if err := cluster.Network().Reconnect(isolated); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatalf("reconnected replica did not converge: %v states=%v", err, compactSnapshots(cluster))
+	}
+	for index := range cluster.config.ActiveCount {
+		snap, _ := cluster.Snapshot(protocol.ReplicaIndex(index))
+		if snap.View != targetView || snap.Status != replication.StatusNormal {
+			t.Fatalf("isolated replica disrupted healthy cluster view: member=%d snap=%+v wantView=%d", index, snap, targetView)
+		}
+	}
+	if err := cluster.CheckInvariants(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrimaryClockDesyncAbdicatesToSynchronizedPrimary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cluster, err := NewCluster(ctx, DefaultConfig(3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cluster.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := runUntil(cluster, 2_000, replicasAgree); err != nil {
+		t.Fatal(err)
+	}
+	events := &clientEvents{}
+	client, err := cluster.AddClient(protocol.ClientID{0x52}, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 2_000, func(*Cluster) bool { return events.replyCount() == 1 }); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := currentPrimary(t, cluster)
+	before, _ := cluster.Snapshot(primary)
+	cluster.MemberClock(primary).SetSynchronized(false)
+	if err := client.Submit(protocol.OperationApplicationMin, []byte("clock-desync-failover")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runUntil(cluster, 8_000, func(*Cluster) bool { return events.replyCount() == 2 }); err != nil {
+		t.Fatalf("unsynchronized primary did not abdicate to synchronized primary: %v states=%v", err, compactSnapshots(cluster))
+	}
+	newPrimary := currentPrimary(t, cluster)
+	if newPrimary == primary {
+		t.Fatalf("primary did not change after clock desync: states=%v", compactSnapshots(cluster))
+	}
+	after, _ := cluster.Snapshot(newPrimary)
+	if after.View <= before.View {
+		t.Fatalf("view did not advance on clock desync failover: before=%d after=%d", before.View, after.View)
+	}
+
+	cluster.MemberClock(primary).SetSynchronized(true)
+	if err := runUntil(cluster, 4_000, replicasAgree); err != nil {
+		t.Fatalf("cluster did not converge after restoring clock sync: %v states=%v", err, compactSnapshots(cluster))
 	}
 	if err := cluster.CheckInvariants(); err != nil {
 		t.Fatal(err)

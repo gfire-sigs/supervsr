@@ -328,7 +328,7 @@ func TestStandbyAndRecoveringIgnoreExitViewAndStateSyncView(t *testing.T) {
 		},
 		logger: zerolog.Nop(),
 	}
-	active.handleExitView(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 3})
+	active.handleExitView(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 3}, 100)
 	active.handleJoinView(protocol.Header{Command: protocol.CommandJoinView, View: 6, Author: 3}, nil)
 	if !active.handleHigherViewEvidence(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 1}) {
 		t.Fatal("active recovering replica did not handle active higher view")

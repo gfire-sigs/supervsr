@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"strconv"
 	"testing"
+	"time"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -847,5 +848,351 @@ func TestLaggingPrimarySelectCanonicalSuffixBridgesCommittedGap(t *testing.T) {
 		if checksum, found := replica.DurableChecksum(op); !found || checksum != expected.HeaderChecksum {
 			t.Fatalf("op %d checksum mismatch: found=%t got=%x want=%x", op, found, checksum, expected.HeaderChecksum)
 		}
+	}
+}
+
+func TestCanonicalUncertainLatestLogViewDoesNotTruncateCommittedOp(t *testing.T) {
+	cluster := compactTestClusterConfig()
+	membership := Membership{
+		Members:     [MembersMax]protocol.MemberID{{1}, {2}, {3}, {4}, {5}},
+		ActiveCount: 5,
+		LocalMember: protocol.MemberID{1},
+	}
+	rootBytes, err := rootPrepareHeader(protocol.GroupID{1}, 5, uint32(cluster.MessageSizeMax), ChecksumAEGIS128L)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, reason := protocol.DecodeHeader(rootBytes[:], protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 5, ChecksumAEGIS128L)
+	if reason != protocol.RejectNone {
+		t.Fatal(reason)
+	}
+	firstFrame := connectedPrepareFrame(t, cluster, root, 1)
+	first, _, reason := protocol.DecodeFrame(firstFrame, protocol.GroupID{1}, uint32(cluster.MessageSizeMax), 5, ChecksumAEGIS128L)
+	if reason != protocol.RejectNone {
+		t.Fatal(reason)
+	}
+	quorums, ok := QuorumsFor(5, 3)
+	if !ok {
+		t.Fatal("quorums unavailable")
+	}
+	makeReplica := func() *Replica {
+		return &Replica{
+			config:           Config{Group: protocol.GroupID{1}, Membership: membership, Cluster: cluster},
+			membership:       membership,
+			quorums:          quorums,
+			checkpoint:       CheckpointState{Header: rootBytes},
+			joins:            make([]joinRecord, 5),
+			joinHeaders:      make([]protocol.Header, 5*int(cluster.PipelineMax+1)),
+			canonicalHeaders: make([]protocol.Header, int(cluster.PipelineMax+1)),
+		}
+	}
+
+	replica := makeReplica()
+	// Senders 0 and 1 hold durable op 1 from LogView 0; sender 2 is at HeadOp 0;
+	// sender 3 is at LogView 1 with an uncertain faulty blank slot at op 1 (Present=0, Nack=0).
+	installJoinRecord(replica, 0, 1, 0, []protocol.Header{first, root}, 0b11, 0)
+	installJoinRecord(replica, 1, 1, 0, []protocol.Header{first, root}, 0b11, 0)
+	installJoinRecord(replica, 2, 0, 0, []protocol.Header{root}, 0b1, 0)
+	installJoinRecord(replica, 3, 1, 0, []protocol.Header{{}, root}, 0b10, 0)
+	replica.joins[3].logView = 1
+
+	negatives, copies := replica.canonicalEvidence(1, protocol.Header{}, false)
+	if negatives >= quorums.Negative || copies != 0 {
+		t.Fatalf("uncertain latest LogView produced negatives=%d (Qn=%d) copies=%d", negatives, quorums.Negative, copies)
+	}
+	if _, _, _, resolved := replica.selectCanonicalSuffix(); resolved {
+		t.Fatal("uncertain latest LogView truncated potentially committed op 1")
+	}
+
+	// Contrast: when sender 3 explicitly NACKs op 1 (Nack bit set), truncation proceeds cleanly.
+	explicit := makeReplica()
+	installJoinRecord(explicit, 0, 1, 0, []protocol.Header{first, root}, 0b11, 0)
+	installJoinRecord(explicit, 1, 1, 0, []protocol.Header{first, root}, 0b11, 0)
+	installJoinRecord(explicit, 2, 0, 0, []protocol.Header{root}, 0b1, 0)
+	installJoinRecord(explicit, 3, 1, 0, []protocol.Header{{}, root}, 0b10, 0b01)
+	explicit.joins[3].logView = 1
+
+	commit, head, count, resolved := explicit.selectCanonicalSuffix()
+	if !resolved || commit != 0 || head != 0 || count != 1 {
+		t.Fatalf("explicit latest NACK selection = commit=%d head=%d count=%d resolved=%t", commit, head, count, resolved)
+	}
+}
+
+func consensusPrimary(t testing.TB, synchronized bool) (*Replica, *captureBus) {
+	t.Helper()
+	config, _ := threeReplicaFormat(t)
+	config.Membership.LocalMember = config.Membership.Members[0]
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	storage := &crashStorage{}
+	if err := Format(context.Background(), FormatConfig{Group: config.Group, Membership: config.Membership, Cluster: config.Cluster, CurrentRelease: 1}, FormatDependencies{Storage: storage}); err != nil {
+		t.Fatal(err)
+	}
+	storage.Crash()
+	bus := &captureBus{}
+	machine := &testStateMachine{capacities: StateMachineCapacities{
+		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
+		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
+	}}
+	replica, err := Open(context.Background(), config, Dependencies{
+		Storage: storage, MessageBus: bus, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: synchronized}},
+		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeReplica(t, replica) })
+	// Open fences a restarted pre-crash primary into StatusViewChange(1); install View 3 where member 0 leads.
+	root := consensusRoot(t, replica)
+	viewBody := encodeTestViewBody(t, replica, root)
+	replica.handleView(makeTestViewHeader(replica, 3, 0, 0, protocol.Nonce{}), viewBody)
+	consensusProcessUntilNormal(t, replica)
+	if snap := replica.Snapshot(); snap.Status != StatusNormal || snap.View != 3 || !replica.isPrimary() {
+		t.Fatalf("failed to establish normal primary: %+v", snap)
+	}
+	return replica, bus
+}
+
+func TestPrimaryAbdicationSuppressesCommitHeartbeatsAndResumesOnQuorum(t *testing.T) {
+	replica, bus := consensusPrimary(t, true)
+	msg, hdr := consensusPulse(t, replica, consensusRoot(t, replica), 1, replica.view)
+	if !replica.acceptPrepare(msg, hdr) {
+		msg.Release()
+		t.Fatal("prepare rejected")
+	}
+	consensusProcess(t, replica)
+	if !replica.pipelineEntry(0).durable || replica.pipelineEntry(0).quorum {
+		t.Fatalf("unexpected pipeline entry state: durable=%t quorum=%t", replica.pipelineEntry(0).durable, replica.pipelineEntry(0).quorum)
+	}
+
+	step := uint64(replica.config.Process.Tick)
+	ticksForTenSeconds := int(10 * time.Second / replica.config.Process.Tick)
+	for tick := 1; tick <= ticksForTenSeconds; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: true})
+	}
+	if !replica.abdicated {
+		t.Fatal("primary did not abdicate after 10 seconds without quorum")
+	}
+	if replica.metrics.Snapshot().QuorumUnavailable != 1 {
+		t.Fatalf("quorum unavailable count = %d, want 1", replica.metrics.Snapshot().QuorumUnavailable)
+	}
+	commitsBefore := countConsensusCommand(t, replica, bus, protocol.CommandCommit)
+	preparesBefore := countConsensusCommand(t, replica, bus, protocol.CommandPrepare)
+	exitsBefore := countConsensusCommand(t, replica, bus, protocol.CommandExitView)
+	if exitsBefore == 0 {
+		t.Fatal("abdicating primary did not emit ExitView")
+	}
+
+	for tick := ticksForTenSeconds + 1; tick <= ticksForTenSeconds+200; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: true})
+	}
+	if got := countConsensusCommand(t, replica, bus, protocol.CommandCommit); got != commitsBefore {
+		t.Fatalf("abdicated primary kept sending Commit heartbeats: before=%d after=%d", commitsBefore, got)
+	}
+	if got := countConsensusCommand(t, replica, bus, protocol.CommandPrepare); got != preparesBefore {
+		t.Fatalf("abdicated primary kept resending Prepares: before=%d after=%d", preparesBefore, got)
+	}
+	if got := countConsensusCommand(t, replica, bus, protocol.CommandExitView); got <= exitsBefore {
+		t.Fatalf("abdicated primary did not rebroadcast ExitView: before=%d after=%d", exitsBefore, got)
+	}
+
+	// Restoring quorum clears abdication and resumes Commit heartbeats.
+	replica.countPrepareAck(replica.pipelineEntry(0), 1)
+	if !replica.pipelineEntry(0).quorum {
+		t.Fatal("pipeline head did not reach quorum")
+	}
+	for tick := ticksForTenSeconds + 201; tick <= ticksForTenSeconds+260; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: true})
+	}
+	if replica.abdicated {
+		t.Fatal("primary remained abdicated after regaining quorum")
+	}
+	if got := countConsensusCommand(t, replica, bus, protocol.CommandCommit); got <= commitsBefore {
+		t.Fatalf("primary did not resume Commit heartbeats after regaining quorum: before=%d after=%d", commitsBefore, got)
+	}
+}
+
+func TestPrimaryClockDesyncTriggersAbdication(t *testing.T) {
+	replica, bus := consensusPrimary(t, false)
+	step := uint64(replica.config.Process.Tick)
+	ticksForTenSeconds := int(10 * time.Second / replica.config.Process.Tick)
+	for tick := 1; tick <= ticksForTenSeconds; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: false})
+	}
+	if !replica.abdicated {
+		t.Fatal("unsynchronized primary did not abdicate with empty pipeline")
+	}
+	commitsAtAbdication := countConsensusCommand(t, replica, bus, protocol.CommandCommit)
+	for tick := ticksForTenSeconds + 1; tick <= ticksForTenSeconds+120; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: false})
+	}
+	if got := countConsensusCommand(t, replica, bus, protocol.CommandCommit); got != commitsAtAbdication {
+		t.Fatalf("unsynchronized abdicated primary kept sending Commit: before=%d after=%d", commitsAtAbdication, got)
+	}
+}
+
+func TestDuplicatePrepareDoesNotRefreshFailureDetector(t *testing.T) {
+	replica, _ := consensusBackup(t)
+	root := consensusRoot(t, replica)
+	firstMsg, firstHdr := consensusPulse(t, replica, root, 1, 0)
+	t1 := uint64(time.Second)
+	if !replica.handlePrepare(firstMsg, firstHdr, TimeSample{Wall: t1, Monotonic: t1, Synchronized: true}) {
+		firstMsg.Release()
+		t.Fatal("initial prepare rejected")
+	}
+	consensusProcess(t, replica)
+	for _, seconds := range []time.Duration{3, 5, 7, 9} {
+		dup, _ := consensusPulse(t, replica, root, 1, 0)
+		now := uint64(seconds * time.Second)
+		if replica.handlePrepare(dup, firstHdr, TimeSample{Wall: now, Monotonic: now, Synchronized: true}) {
+			t.Fatal("duplicate prepare retained")
+		}
+		dup.Release()
+	}
+	if level := replica.failureDetector.Level(uint64(9 * time.Second)); level != failureRed {
+		t.Fatalf("failure detector level after duplicate-only prepares = %d, want failureRed (%d)", level, failureRed)
+	}
+}
+
+func TestIsolatedViewChangeReplicaCannotInflateViewAndExitWindowExpires(t *testing.T) {
+	replica, bus := consensusBackup(t)
+	replica.beginViewChange(1)
+	consensusProcess(t, replica)
+	if snap := replica.Snapshot(); snap.Status != StatusViewChange || snap.View != 1 || snap.DurableView != 1 {
+		t.Fatalf("unexpected initial view-change snapshot: %+v", snap)
+	}
+
+	step := uint64(replica.config.Process.Tick)
+	ticks := int(16 * time.Second / replica.config.Process.Tick)
+	for tick := 1; tick <= ticks; tick++ {
+		now := uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: true})
+		consensusProcess(t, replica)
+	}
+	if snap := replica.Snapshot(); snap.View != 1 || snap.Status != StatusViewChange {
+		t.Fatalf("isolated view-change replica inflated view: %+v", snap)
+	}
+	if !replica.viewChangeStalled {
+		t.Fatal("view-change stall flag not set after 5s timeout")
+	}
+	if countConsensusCommand(t, replica, bus, protocol.CommandExitView) == 0 {
+		t.Fatal("stalled view-change replica did not emit ExitView")
+	}
+
+	// Verify exit-view collection window expires stale votes after 5 seconds.
+	replica.exitViewBits = 0
+	clear(replica.exitViewAt[:])
+	exitFrom2 := protocol.Header{Group: replica.config.Group, View: 1, Command: protocol.CommandExitView, Author: 2}
+	exitFrom0 := protocol.Header{Group: replica.config.Group, View: 1, Command: protocol.CommandExitView, Author: 0}
+	tStart := uint64(20 * time.Second)
+	replica.handleExitView(exitFrom2, tStart)
+	replica.handleExitView(exitFrom0, tStart+uint64(6*time.Second))
+	if replica.view != 1 || replica.exitViewBits != 1<<0 {
+		t.Fatalf("stale ExitView vote did not expire: view=%d bits=%03b", replica.view, replica.exitViewBits)
+	}
+	replica.handleExitView(exitFrom2, tStart+uint64(7*time.Second))
+	consensusProcess(t, replica)
+	if snap := replica.Snapshot(); snap.View != 2 || snap.Status != StatusViewChange {
+		t.Fatalf("fresh ExitView quorum did not advance view: %+v", snap)
+	}
+}
+
+func TestHandleViewAcceptsLowerViewCommitMaxWhenHeadCoversLocalCommitMax(t *testing.T) {
+	replica, _ := consensusBackup(t)
+	root := consensusRoot(t, replica)
+	headers := make([]protocol.Header, 4)
+	headers[0] = root
+	for op := protocol.Op(1); op <= 3; op++ {
+		msg, hdr := consensusPulse(t, replica, headers[op-1], op, 0)
+		if !replica.handlePrepare(msg, hdr, replica.deps.Clock.Now()) {
+			msg.Release()
+			t.Fatalf("prepare %d rejected", op)
+		}
+		headers[op] = hdr
+		consensusProcess(t, replica)
+	}
+	replica.commitMax = 1
+	consensusProcess(t, replica)
+	// Backup learned CommitMax=3 before view change, while new primary's View reports CommitMax=1 and HeadOp=3.
+	replica.commitMax = 3
+	viewBody := encodeTestViewBody(t, replica, headers[3], headers[2], headers[1], root)
+	replica.handleView(makeTestViewHeader(replica, 2, 3, 1, protocol.Nonce{}), viewBody)
+	if !replica.repairViewValid || replica.repairView != 2 {
+		t.Fatalf("View with lower CommitMax rejected: valid=%t repairView=%d", replica.repairViewValid, replica.repairView)
+	}
+	replica.continueRecoveringView(20)
+	consensusProcessUntilNormal(t, replica)
+	got := replica.Snapshot()
+	if got.Status != StatusNormal || got.View != 2 || got.CommitMin != 3 || got.CommitMax != 3 || got.HeadOp != 3 {
+		t.Fatalf("installed view state = %+v", got)
+	}
+}
+
+func TestStalledRecoveringHeadAbortsUninstalledRepairOnExitQuorum(t *testing.T) {
+	replica, _ := consensusBackup(t)
+	root := consensusRoot(t, replica)
+	msg1, hdr1 := consensusPulse(t, replica, root, 1, 1)
+	msg1.Release()
+	viewBody := encodeTestViewBody(t, replica, hdr1, root)
+	replica.handleView(makeTestViewHeader(replica, 1, 1, 0, protocol.Nonce{}), viewBody)
+	if replica.status != StatusRecoveringHead || !replica.repairViewValid {
+		t.Fatalf("expected RecoveringHead with active repairView: status=%d valid=%t", replica.status, replica.repairViewValid)
+	}
+
+	step := uint64(replica.config.Process.Tick)
+	ticks := int(5 * time.Second / replica.config.Process.Tick)
+	var now uint64
+	for tick := 1; tick <= ticks; tick++ {
+		now = uint64(tick) * step
+		replica.handleTick(TimeSample{Wall: 100 + now, Monotonic: now, Synchronized: true})
+	}
+	if !replica.viewChangeStalled {
+		t.Fatal("stalled RecoveringHead did not trip view-change progress timeout")
+	}
+	replica.handleExitView(protocol.Header{Group: replica.config.Group, View: 0, Command: protocol.CommandExitView, Author: 2}, now+step)
+	consensusProcess(t, replica)
+	if replica.repairViewValid || replica.status != StatusViewChange || replica.view != 1 {
+		t.Fatalf("stalled RecoveringHead did not abort uninstalled repair on ExitView quorum: status=%d view=%d repairValid=%t",
+			replica.status, replica.view, replica.repairViewValid)
+	}
+}
+
+func TestStateSyncDoesNotStampLogViewBeforeSuffixInstall(t *testing.T) {
+	replica, _ := consensusBackup(t)
+	root := consensusRoot(t, replica)
+	msg1, hdr1 := consensusPulse(t, replica, root, 1, 4)
+	msg1.Release()
+
+	replica.stateSync.checkpoint = replica.checkpoint
+	replica.stateSync.view = 4
+	replica.stateSync.commit = 0
+	replica.stateSync.head = 1
+	replica.stateSync.count = 2
+	replica.stateSync.headers[0] = hdr1
+	replica.stateSync.headers[1] = root
+
+	withSuffix, err := replica.stateSyncSuperblock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withSuffix.State.View != 4 || withSuffix.State.LogView != 0 {
+		t.Fatalf("state sync with suffix stamped LogView prematurely: view=%d logView=%d", withSuffix.State.View, withSuffix.State.LogView)
+	}
+
+	replica.stateSync.head = replica.checkpoint.PrepareOp()
+	replica.stateSync.count = 1
+	replica.stateSync.headers[0] = root
+	atCheckpoint, err := replica.stateSyncSuperblock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atCheckpoint.State.View != 4 || atCheckpoint.State.LogView != 4 {
+		t.Fatalf("state sync at checkpoint head did not stamp LogView: view=%d logView=%d", atCheckpoint.State.View, atCheckpoint.State.LogView)
 	}
 }

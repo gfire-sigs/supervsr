@@ -292,7 +292,18 @@ func classifyWALSlot(header, prepare walCandidate, context walRecoveryContext) w
 	if impossibleWALCandidate(header, context) || impossibleWALCandidate(prepare, context) {
 		return walRecoveryFail
 	}
-	if futureWALCandidate(header, context) || futureWALCandidate(prepare, context) {
+	futureHeader := futureWALCandidate(header, context)
+	futurePrepare := futureWALCandidate(prepare, context)
+	if futureHeader || futurePrepare {
+		if header.Kind == walCandidateInvalid || prepare.Kind == walCandidateInvalid {
+			return walRecoveryRemoteRepair
+		}
+		if futureHeader && retainedOrdinary(prepare, context) {
+			return walRecoveryLocalRepair
+		}
+		if futurePrepare && retainedOrdinary(header, context) {
+			return walRecoveryRemoteRepair
+		}
 		return walRecoveryTruncate
 	}
 	obsoleteHeader := obsoleteWALCandidate(header, context.Installed)

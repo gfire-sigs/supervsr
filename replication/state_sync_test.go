@@ -102,14 +102,14 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 	if _, err := target.Process(64); err != nil {
 		t.Fatal(err)
 	}
-	if target.stateSync.stage != syncStageCancelingGrid {
+	if target.stateSync.stage != syncStageCancelingStorage {
 		t.Fatalf("stage after selection = %d", target.stateSync.stage)
 	}
 	if _, err := target.Process(64); err != nil {
 		t.Fatal(err)
 	}
 	if target.stateSync.stage != syncStageUpdatingCheckpoint {
-		t.Fatalf("stage after grid drain = %d", target.stateSync.stage)
+		t.Fatalf("stage after storage drain = %d", target.stateSync.stage)
 	}
 
 	deadline := time.NewTimer(3 * time.Second)

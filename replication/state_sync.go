@@ -13,7 +13,7 @@ type syncStage uint8
 const (
 	syncStageIdle syncStage = iota
 	syncStageCancelingCommit
-	syncStageCancelingGrid
+	syncStageCancelingStorage
 	syncStageUpdatingCheckpoint
 	syncStageResizingStorage
 )
@@ -75,9 +75,15 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	replica.stateSync.repliesPending = false
 	replica.clearRepairView()
 	replica.status = StatusRecovering
+	replica.abdicated = false
+	replica.viewChangeStalled = false
+	replica.exitViewBits = 0
+	clear(replica.exitViewAt[:])
+	replica.timers.abdication.Reset()
+	replica.timers.viewChange.Reset()
 	replica.releaseQueuedRequests()
 	if replica.stage == CommitStageIdle {
-		replica.stateSync.stage = syncStageCancelingGrid
+		replica.stateSync.stage = syncStageCancelingStorage
 	} else {
 		replica.stateSync.stage = syncStageCancelingCommit
 	}
@@ -90,10 +96,10 @@ func (replica *Replica) dispatchStateSync() {
 		return
 	case syncStageCancelingCommit:
 		if replica.stage == CommitStageIdle {
-			replica.stateSync.stage = syncStageCancelingGrid
+			replica.stateSync.stage = syncStageCancelingStorage
 		}
-	case syncStageCancelingGrid:
-		replica.dispatchStateSyncCancelingGrid()
+	case syncStageCancelingStorage:
+		replica.dispatchStateSyncCancelingStorage()
 	case syncStageUpdatingCheckpoint:
 		replica.dispatchStateSyncCheckpoint()
 	case syncStageResizingStorage:
@@ -103,7 +109,7 @@ func (replica *Replica) dispatchStateSync() {
 	}
 }
 
-func (replica *Replica) dispatchStateSyncCancelingGrid() {
+func (replica *Replica) dispatchStateSyncCancelingStorage() {
 	if !replica.stateSync.cancelStarted {
 		replica.cancelStateSyncReads()
 		replica.stateSync.cancelStarted = true
@@ -342,7 +348,9 @@ func (replica *Replica) stateSyncSuperblock() (superblockRecord, error) {
 	next.State.Checkpoint = replica.stateSync.checkpoint
 	next.State.CommitMax = replica.stateSync.commit
 	next.State.View = replica.stateSync.view
-	next.State.LogView = replica.stateSync.view
+	if replica.stateSync.head == replica.stateSync.checkpoint.PrepareOp() {
+		next.State.LogView = replica.stateSync.view
+	}
 	next.ViewHeaderCount = uint32(replica.stateSync.count)
 	clear(next.ViewHeaders[:])
 	for index := range replica.stateSync.count {
@@ -393,7 +401,11 @@ func (replica *Replica) installStateSyncCheckpoint() {
 	replica.headChecksum = header.HeaderChecksum
 	replica.view = replica.stateSync.view
 	replica.durableView = replica.stateSync.view
-	replica.logView = replica.stateSync.view
+	if target.PrepareOp() == replica.stateSync.head {
+		replica.logView = replica.stateSync.view
+	} else {
+		replica.logView = replica.superblocks.Current().State.LogView
+	}
 	replica.stateSync.stage = syncStageResizingStorage
 	replica.stateSync.persistPhase = 0
 	replica.stateSync.persistDone = false

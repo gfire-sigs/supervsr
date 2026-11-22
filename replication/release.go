@@ -207,6 +207,7 @@ func (replica *Replica) createUpgrade(sample TimeSample) error {
 	}
 	replica.metrics.preparesCreated.Add(1)
 	replica.deps.MessageBus.BroadcastReplicas(prepare)
+	replica.failureDetector.Signal(sample.Monotonic)
 	return nil
 }
 

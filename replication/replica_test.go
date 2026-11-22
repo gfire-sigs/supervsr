@@ -1101,7 +1101,10 @@ func TestReplicaAbdicationReportsUnavailableQuorum(t *testing.T) {
 		quorums: Quorums{ViewChange: 2}, status: StatusNormal, pipeline: make([]pipelineEntry, 1),
 		pipelineLen: 1, frames: frames, metrics: metrics, deps: Dependencies{MessageBus: bus},
 	}
-	replica.handleAbdicationTimeout()
+	replica.handleAbdicationTimeout(TimeSample{Wall: 1, Monotonic: uint64(10 * time.Second), Synchronized: true})
+	if !replica.abdicated {
+		t.Fatal("primary did not mark abdicated")
+	}
 	if snapshot := metrics.Snapshot(); snapshot.QuorumUnavailable != 1 {
 		t.Fatalf("quorum unavailable metric = %d", snapshot.QuorumUnavailable)
 	}

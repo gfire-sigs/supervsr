@@ -19,14 +19,22 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 	if replica.tickTimer(&replica.timers.prepare) {
 		replica.handlePrepareTimeout()
 	}
-	if replica.tickTimer(&replica.timers.abdication) {
-		replica.handleAbdicationTimeout()
+	if replica.primaryStalled(sample) {
+		if !replica.abdicated && replica.tickTimer(&replica.timers.abdication) {
+			replica.handleAbdicationTimeout(sample)
+			replica.timers.abdication.Reset()
+		}
+	} else {
+		replica.abdicated = false
 		replica.timers.abdication.Reset()
 	}
-	if replica.tickTimer(&replica.timers.commit) {
-		if replica.status == StatusNormal && replica.isPrimary() {
+	commitFired := replica.tickTimer(&replica.timers.commit)
+	if replica.status == StatusNormal && replica.isPrimary() && !replica.abdicated {
+		if commitFired || replica.failureDetector.Level(sample.Monotonic) >= failureYellow {
 			replica.sendCommit(sample)
+			replica.timers.commit.Reset()
 		}
+	} else if commitFired {
 		replica.timers.commit.Reset()
 	}
 	if replica.tickTimer(&replica.timers.exit) {
@@ -36,6 +44,15 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 	if replica.tickTimer(&replica.timers.join) {
 		replica.handleJoinTimeout()
 	}
+	if replica.viewChangeProgressTracked() {
+		if replica.tickTimer(&replica.timers.viewChange) {
+			replica.handleViewChangeTimeout(sample)
+			replica.timers.viewChange.Reset()
+		}
+	} else {
+		replica.viewChangeStalled = false
+		replica.timers.viewChange.Reset()
+	}
 	if replica.tickTimer(&replica.timers.pulse) {
 		replica.handlePulseTimeout(sample)
 		replica.timers.pulse.Reset()
@@ -44,6 +61,23 @@ func (replica *Replica) tickTimers(sample TimeSample) {
 		replica.handleRepairTimeout(sample)
 		replica.timers.repair.Reset()
 	}
+}
+
+func (replica *Replica) primaryStalled(sample TimeSample) bool {
+	if replica.status != StatusNormal || !replica.isPrimary() || replica.durableView != replica.view || replica.membership.ActiveCount <= 1 {
+		return false
+	}
+	return (replica.pipelineLen > 0 && !replica.pipelineEntry(0).quorum) || !sample.Synchronized
+}
+
+func (replica *Replica) viewChangeProgressTracked() bool {
+	if uint8(replica.local) >= replica.membership.ActiveCount {
+		return false
+	}
+	if replica.status == StatusViewChange && replica.durableView == replica.view {
+		return true
+	}
+	return replica.status == StatusRecoveringHead && !replica.stateSyncAwaitingOpen()
 }
 
 func (replica *Replica) tickTimer(timeout *tickTimeout) bool {
@@ -56,7 +90,7 @@ func (replica *Replica) tickTimer(timeout *tickTimeout) bool {
 }
 
 func (replica *Replica) handlePrepareTimeout() {
-	if replica.status != StatusNormal || !replica.isPrimary() || replica.pipelineLen == 0 {
+	if replica.status != StatusNormal || !replica.isPrimary() || replica.pipelineLen == 0 || replica.abdicated {
 		replica.timers.prepare.Reset()
 		return
 	}
@@ -77,11 +111,13 @@ func (replica *Replica) handlePrepareTimeout() {
 	}
 }
 
-func (replica *Replica) handleAbdicationTimeout() {
-	if replica.status == StatusNormal && replica.isPrimary() && replica.pipelineLen > 0 && !replica.pipelineEntry(0).quorum {
-		replica.metrics.quorumUnavailable.Add(1)
-		replica.sendExitView()
+func (replica *Replica) handleAbdicationTimeout(sample TimeSample) {
+	if !replica.primaryStalled(sample) {
+		return
 	}
+	replica.abdicated = true
+	replica.metrics.quorumUnavailable.Add(1)
+	replica.sendExitView(sample.Monotonic)
 }
 
 func (replica *Replica) handleJoinTimeout() {
@@ -89,32 +125,44 @@ func (replica *Replica) handleJoinTimeout() {
 		replica.timers.join.Reset()
 		return
 	}
-	if replica.timers.join.Attempts() == 0 {
-		replica.sendJoinView()
-		if err := replica.timers.join.Backoff(replica.config.Process, replica.config.Process.InitialRTT, &replica.random); err != nil {
-			replica.fail(err)
-		}
+	replica.sendJoinView()
+	if err := replica.timers.join.Backoff(replica.config.Process, replica.config.Process.InitialRTT, &replica.random); err != nil {
+		replica.fail(err)
+	}
+}
+
+func (replica *Replica) handleViewChangeTimeout(sample TimeSample) {
+	if !replica.viewChangeProgressTracked() {
 		return
 	}
-	if replica.view == protocol.MaxView {
-		replica.fail(ErrReplicaInvariant)
-		return
-	}
-	replica.timers.join.Reset()
-	replica.beginViewChange(replica.view + 1)
+	replica.viewChangeStalled = true
+	replica.sendExitView(sample.Monotonic)
 }
 
 func (replica *Replica) handleExitTimeout(sample TimeSample) {
-	if replica.status != StatusNormal || replica.isPrimary() || uint8(replica.local) >= replica.membership.ActiveCount {
+	if uint8(replica.local) >= replica.membership.ActiveCount {
 		return
 	}
-	if replica.failureDetector.Level(sample.Monotonic) == failureRed {
-		replica.sendExitView()
+	switch replica.status {
+	case StatusNormal:
+		if replica.isPrimary() {
+			if replica.abdicated {
+				replica.sendExitView(sample.Monotonic)
+			}
+			return
+		}
+		if replica.failureDetector.Level(sample.Monotonic) == failureRed {
+			replica.sendExitView(sample.Monotonic)
+		}
+	case StatusViewChange, StatusRecoveringHead:
+		if replica.viewChangeStalled && replica.viewChangeProgressTracked() {
+			replica.sendExitView(sample.Monotonic)
+		}
 	}
 }
 
 func (replica *Replica) handlePulseTimeout(sample TimeSample) {
-	if replica.status != StatusNormal || !replica.isPrimary() || replica.durableView != replica.view {
+	if replica.status != StatusNormal || !replica.isPrimary() || replica.durableView != replica.view || replica.abdicated {
 		return
 	}
 	if replica.membership.ActiveCount > 1 && !sample.Synchronized {
@@ -213,18 +261,19 @@ func (replica *Replica) sendCommit(sample TimeSample) {
 	binary.LittleEndian.PutUint64(header.Fields[64:72], max(uint64(1), sample.Monotonic))
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.BroadcastReplicas(message)
+		replica.failureDetector.Signal(sample.Monotonic)
 	}
 	message.Release()
 }
 
-func (replica *Replica) sendExitView() {
+func (replica *Replica) sendExitView(now uint64) {
 	message, err := replica.frames.Acquire(0)
 	if err != nil {
 		return
 	}
 	header := protocol.Header{Group: replica.config.Group, View: replica.view, Protocol: protocol.ProtocolVersion, Command: protocol.CommandExitView, Author: replica.local}
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
-		replica.handleExitView(header)
+		replica.handleExitView(header, now)
 		replica.deps.MessageBus.BroadcastReplicas(message)
 	}
 	message.Release()
@@ -253,5 +302,6 @@ func (replica *Replica) createPulse(sample TimeSample) error {
 	}
 	replica.metrics.preparesCreated.Add(1)
 	replica.deps.MessageBus.BroadcastReplicas(prepare)
+	replica.failureDetector.Signal(sample.Monotonic)
 	return nil
 }
