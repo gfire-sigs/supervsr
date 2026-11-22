@@ -250,7 +250,7 @@ stateDiagram-v2
 When `beginStateSync` runs in [state_sync.go](replication/state_sync.go), the replica steps through four `syncStage` phases before reopening the state machine:
 
 1. `syncStageCancelingCommit`: wait for any active `CommitStage` entry to return to `CommitStageIdle`.
-2. `syncStageCancelingGrid`: cancel in-flight repair or duplicate reads and drain `storageIOEngine`.
+2. `syncStageCancelingStorage`: cancel in-flight repair or duplicate reads and drain `storageIOEngine`.
 3. `syncStageUpdatingCheckpoint`: record `SyncMin`/`SyncMax` in the superblock, reset the state machine via `StartReset`, and persist the new checkpoint superblock.
 4. `syncStageResizingStorage`: fetch missing blocks, call `StartOpen` with the target `CheckpointBlockReader`, repair reply slots, and switch to `StatusNormal` or `StatusRecoveringHead`.
 
@@ -288,7 +288,7 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 | `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`, `IOController`), `LedgerMachine`, and global invariant checks. |
 | `cmd/toykv/` | Local multi-replica in-process cluster demo and KV REPL. |
 | `formal/` | TLA+ specifications (`VSR.tla`, `VSRConsensus`, `MPSCRing.tla`) verified in CI. |
-| `errata/` | Protocol, recovery, and API errata from conformance verification ([errata/README.md](errata/README.md)). |
+| `spec/v1.0/errata/` | Protocol, recovery, and API errata from v1.0 conformance verification ([spec/v1.0/errata/README.md](spec/v1.0/errata/README.md)). |
 
 ## Development
 

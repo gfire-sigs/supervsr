@@ -31,4 +31,4 @@ go.work.sum
 # .idea/
 # .vscode/
 
-VSR_SPEC.md
+VSR_SPEC*.md
