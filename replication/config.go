@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -303,8 +304,34 @@ func (cfg ClusterConfig) BlockOffset(address uint64) (uint64, bool) {
 	return checkedAdd(base, delta)
 }
 
-// ProcessConfig defines per-process runtime limits, retry backoffs, I/O
-// concurrencies, storage ceiling, and optional hardware-checksum enforcement.
+const (
+	defaultPingInterval             = time.Second
+	defaultPrepareTimeout           = 250 * time.Millisecond
+	defaultAbdicationTimeout        = 10 * time.Second
+	defaultCommitInterval           = 500 * time.Millisecond
+	defaultExitViewTimeout          = 500 * time.Millisecond
+	defaultJoinViewTimeout          = 500 * time.Millisecond
+	defaultViewChangeTimeout        = 5 * time.Second
+	defaultExitViewCollectionWindow = 5 * time.Second
+	defaultPulseInterval            = 100 * time.Millisecond
+	defaultRepairInterval           = 100 * time.Millisecond
+	defaultJournalRepairTimeout     = 500 * time.Millisecond
+	defaultBlockRepairRetryAfter    = 100 * time.Millisecond
+	defaultBlockRepairTimeout       = 250 * time.Millisecond
+	defaultClientPingInterval       = 30 * time.Second
+	defaultFailureIntervalMin       = 100 * time.Millisecond
+	defaultFailureIntervalMax       = 2 * time.Second
+	defaultFailureYellowPermille    = uint32(1500)
+	defaultFailureRedPermille       = uint32(3000)
+)
+
+// ProcessConfig defines per-process runtime limits, protocol timers, failure
+// detector bounds, retry backoffs, I/O concurrencies, storage ceiling, and
+// optional hardware-checksum enforcement.
+//
+// Zero values on optional protocol timer and failure-detector fields fall back
+// to the defaults returned by DefaultProcessConfig so existing v1.0 configs
+// keep identical behavior.
 type ProcessConfig struct {
 	Tick                    time.Duration
 	InitialRTT              time.Duration
@@ -332,36 +359,118 @@ type ProcessConfig struct {
 	ClockWindowMin          time.Duration
 	ClockWindowMax          time.Duration
 	RequireHardwareChecksum bool
+
+	// Optional protocol timers and failure-detector parameters (0 = default).
+	PingInterval             time.Duration
+	PrepareTimeout           time.Duration
+	AbdicationTimeout        time.Duration
+	CommitInterval           time.Duration
+	ExitViewTimeout          time.Duration
+	JoinViewTimeout          time.Duration
+	ViewChangeTimeout        time.Duration
+	ExitViewCollectionWindow time.Duration
+	PulseInterval            time.Duration
+	RepairInterval           time.Duration
+	JournalRepairTimeout     time.Duration
+	BlockRepairRetryAfter    time.Duration
+	BlockRepairTimeout       time.Duration
+	ClientPingInterval       time.Duration
+	FailureIntervalMin       time.Duration
+	FailureIntervalMax       time.Duration
+	FailureYellowPermille    uint32
+	FailureRedPermille       uint32
+}
+
+type resolvedProcessTimers struct {
+	pingInterval             time.Duration
+	prepareTimeout           time.Duration
+	abdicationTimeout        time.Duration
+	commitInterval           time.Duration
+	exitViewTimeout          time.Duration
+	joinViewTimeout          time.Duration
+	viewChangeTimeout        time.Duration
+	exitViewCollectionWindow time.Duration
+	pulseInterval            time.Duration
+	repairInterval           time.Duration
+	journalRepairTimeout     time.Duration
+	blockRepairRetryAfter    time.Duration
+	blockRepairTimeout       time.Duration
+	clientPingInterval       time.Duration
+	failureIntervalMin       time.Duration
+	failureIntervalMax       time.Duration
+	failureYellowPermille    uint32
+	failureRedPermille       uint32
+}
+
+func (cfg ProcessConfig) resolvedTimers() resolvedProcessTimers {
+	return resolvedProcessTimers{
+		pingInterval:             cmp.Or(cfg.PingInterval, defaultPingInterval),
+		prepareTimeout:           cmp.Or(cfg.PrepareTimeout, defaultPrepareTimeout),
+		abdicationTimeout:        cmp.Or(cfg.AbdicationTimeout, defaultAbdicationTimeout),
+		commitInterval:           cmp.Or(cfg.CommitInterval, defaultCommitInterval),
+		exitViewTimeout:          cmp.Or(cfg.ExitViewTimeout, defaultExitViewTimeout),
+		joinViewTimeout:          cmp.Or(cfg.JoinViewTimeout, defaultJoinViewTimeout),
+		viewChangeTimeout:        cmp.Or(cfg.ViewChangeTimeout, defaultViewChangeTimeout),
+		exitViewCollectionWindow: cmp.Or(cfg.ExitViewCollectionWindow, defaultExitViewCollectionWindow),
+		pulseInterval:            cmp.Or(cfg.PulseInterval, defaultPulseInterval),
+		repairInterval:           cmp.Or(cfg.RepairInterval, defaultRepairInterval),
+		journalRepairTimeout:     cmp.Or(cfg.JournalRepairTimeout, defaultJournalRepairTimeout),
+		blockRepairRetryAfter:    cmp.Or(cfg.BlockRepairRetryAfter, defaultBlockRepairRetryAfter),
+		blockRepairTimeout:       cmp.Or(cfg.BlockRepairTimeout, defaultBlockRepairTimeout),
+		clientPingInterval:       cmp.Or(cfg.ClientPingInterval, defaultClientPingInterval),
+		failureIntervalMin:       cmp.Or(cfg.FailureIntervalMin, defaultFailureIntervalMin),
+		failureIntervalMax:       cmp.Or(cfg.FailureIntervalMax, defaultFailureIntervalMax),
+		failureYellowPermille:    cmp.Or(cfg.FailureYellowPermille, defaultFailureYellowPermille),
+		failureRedPermille:       cmp.Or(cfg.FailureRedPermille, defaultFailureRedPermille),
+	}
 }
 
 // DefaultProcessConfig returns baseline per-process runtime settings.
 func DefaultProcessConfig() ProcessConfig {
 	return ProcessConfig{
-		Tick:                    10 * time.Millisecond,
-		InitialRTT:              300 * time.Millisecond,
-		MaximumRTT:              60 * time.Second,
-		RTTMultiplier:           2,
-		BackoffMin:              10 * time.Millisecond,
-		BackoffMax:              10 * time.Second,
-		PrimaryRequestQueueMax:  2,
-		JournalReadConcurrency:  8,
-		JournalWriteConcurrency: 32,
-		ReplyReadConcurrency:    1,
-		ReplyWriteConcurrency:   2,
-		BlockReadConcurrency:    32,
-		BlockWriteConcurrency:   32,
-		StorageSizeLimit:        16 << 40,
-		RepairRequestsMax:       4,
-		RepairReadsMax:          4,
-		ScrubReadConcurrency:    1,
-		ScrubWriteConcurrency:   1,
-		ScrubCycle:              180 * 24 * time.Hour,
-		ScrubIntervalMin:        50 * time.Millisecond,
-		ScrubIntervalMax:        10 * time.Second,
-		ClockOffsetToleranceMax: 10 * time.Second,
-		ClockEpochMax:           60 * time.Second,
-		ClockWindowMin:          2 * time.Second,
-		ClockWindowMax:          20 * time.Second,
+		Tick:                     10 * time.Millisecond,
+		InitialRTT:               300 * time.Millisecond,
+		MaximumRTT:               60 * time.Second,
+		RTTMultiplier:            2,
+		BackoffMin:               10 * time.Millisecond,
+		BackoffMax:               10 * time.Second,
+		PrimaryRequestQueueMax:   2,
+		JournalReadConcurrency:   8,
+		JournalWriteConcurrency:  32,
+		ReplyReadConcurrency:     1,
+		ReplyWriteConcurrency:    2,
+		BlockReadConcurrency:     32,
+		BlockWriteConcurrency:    32,
+		StorageSizeLimit:         16 << 40,
+		RepairRequestsMax:        4,
+		RepairReadsMax:           4,
+		ScrubReadConcurrency:     1,
+		ScrubWriteConcurrency:    1,
+		ScrubCycle:               180 * 24 * time.Hour,
+		ScrubIntervalMin:         50 * time.Millisecond,
+		ScrubIntervalMax:         10 * time.Second,
+		ClockOffsetToleranceMax:  10 * time.Second,
+		ClockEpochMax:            60 * time.Second,
+		ClockWindowMin:           2 * time.Second,
+		ClockWindowMax:           20 * time.Second,
+		PingInterval:             defaultPingInterval,
+		PrepareTimeout:           defaultPrepareTimeout,
+		AbdicationTimeout:        defaultAbdicationTimeout,
+		CommitInterval:           defaultCommitInterval,
+		ExitViewTimeout:          defaultExitViewTimeout,
+		JoinViewTimeout:          defaultJoinViewTimeout,
+		ViewChangeTimeout:        defaultViewChangeTimeout,
+		ExitViewCollectionWindow: defaultExitViewCollectionWindow,
+		PulseInterval:            defaultPulseInterval,
+		RepairInterval:           defaultRepairInterval,
+		JournalRepairTimeout:     defaultJournalRepairTimeout,
+		BlockRepairRetryAfter:    defaultBlockRepairRetryAfter,
+		BlockRepairTimeout:       defaultBlockRepairTimeout,
+		ClientPingInterval:       defaultClientPingInterval,
+		FailureIntervalMin:       defaultFailureIntervalMin,
+		FailureIntervalMax:       defaultFailureIntervalMax,
+		FailureYellowPermille:    defaultFailureYellowPermille,
+		FailureRedPermille:       defaultFailureRedPermille,
 	}
 }
 
@@ -369,11 +478,15 @@ func (cfg ProcessConfig) Validate(cluster ClusterConfig) error {
 	invalid := func(field, reason string) error {
 		return &ConfigError{Field: field, Reason: reason}
 	}
+	if err := cfg.validateTimers(); err != nil {
+		return err
+	}
+	resolved := cfg.resolvedTimers()
 	if cfg.Tick <= 0 || cfg.InitialRTT < cfg.Tick || cfg.MaximumRTT < cfg.InitialRTT {
 		return invalid("RTT", "require 0 < Tick <= InitialRTT <= MaximumRTT")
 	}
-	if cfg.Tick >= 50*time.Millisecond {
-		return invalid("Tick", "must be less than half the 100ms failure-detector minimum")
+	if cfg.Tick >= resolved.failureIntervalMin/2 {
+		return invalid("Tick", "must be less than half of FailureIntervalMin")
 	}
 	if cfg.RTTMultiplier == 0 {
 		return invalid("RTTMultiplier", "must be positive")
@@ -396,6 +509,70 @@ func (cfg ProcessConfig) Validate(cluster ClusterConfig) error {
 	}
 	if cfg.RequireHardwareChecksum && !protocol.HardwareChecksumAvailable() {
 		return ErrHardwareChecksumUnavailable
+	}
+	return nil
+}
+
+func (cfg ProcessConfig) validateTimers() error {
+	invalid := func(field, reason string) error {
+		return &ConfigError{Field: field, Reason: reason}
+	}
+	rawDurations := [...]time.Duration{
+		cfg.PingInterval,
+		cfg.PrepareTimeout,
+		cfg.AbdicationTimeout,
+		cfg.CommitInterval,
+		cfg.ExitViewTimeout,
+		cfg.JoinViewTimeout,
+		cfg.ViewChangeTimeout,
+		cfg.ExitViewCollectionWindow,
+		cfg.PulseInterval,
+		cfg.RepairInterval,
+		cfg.JournalRepairTimeout,
+		cfg.BlockRepairRetryAfter,
+		cfg.BlockRepairTimeout,
+		cfg.ClientPingInterval,
+		cfg.FailureIntervalMin,
+		cfg.FailureIntervalMax,
+	}
+	for _, value := range rawDurations {
+		if value < 0 {
+			return invalid("Timers", "must not be negative")
+		}
+	}
+	resolved := cfg.resolvedTimers()
+	if resolved.failureIntervalMax < resolved.failureIntervalMin {
+		return invalid("FailureInterval", "require 0 < FailureIntervalMin <= FailureIntervalMax")
+	}
+	if resolved.failureYellowPermille < 1000 || resolved.failureRedPermille <= resolved.failureYellowPermille {
+		return invalid("FailureThreshold", "require 1000 <= FailureYellowPermille < FailureRedPermille")
+	}
+	if resolved.blockRepairTimeout < resolved.blockRepairRetryAfter {
+		return invalid("BlockRepair", "require 0 < BlockRepairRetryAfter <= BlockRepairTimeout")
+	}
+	if cfg.Tick <= 0 {
+		return nil
+	}
+	periods := [...]time.Duration{
+		resolved.pingInterval,
+		resolved.prepareTimeout,
+		resolved.abdicationTimeout,
+		resolved.commitInterval,
+		resolved.exitViewTimeout,
+		resolved.joinViewTimeout,
+		resolved.viewChangeTimeout,
+		resolved.exitViewCollectionWindow,
+		resolved.pulseInterval,
+		resolved.repairInterval,
+		resolved.journalRepairTimeout,
+		resolved.blockRepairRetryAfter,
+		resolved.blockRepairTimeout,
+		resolved.clientPingInterval,
+	}
+	for _, period := range periods {
+		if period < cfg.Tick {
+			return invalid("Timers", "protocol timers must be at least Tick")
+		}
 	}
 	return nil
 }

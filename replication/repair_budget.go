@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"cmp"
 	"time"
 
 	"z.gfire.dev/supervsr/replication/protocol"
@@ -20,19 +21,29 @@ type journalRepairBudget struct {
 	local       protocol.ReplicaIndex
 	capacity    uint8
 	outstanding uint8
+	deadline    uint64
 	ewma        [ActiveMax]uint64
 	entries     [ActiveMax * journalRepairsPerPeer]journalRepairEntry
 }
 
 func newJournalRepairBudget(active uint8, local protocol.ReplicaIndex) (journalRepairBudget, error) {
-	if active == 0 || active > ActiveMax || uint8(local) >= MembersMax {
+	return newJournalRepairBudgetWithTimeout(active, local, defaultJournalRepairTimeout)
+}
+
+func newJournalRepairBudgetWithTimeout(active uint8, local protocol.ReplicaIndex, timeout time.Duration) (journalRepairBudget, error) {
+	if active == 0 || active > ActiveMax || uint8(local) >= MembersMax || timeout <= 0 {
 		return journalRepairBudget{}, ErrInvalidConfiguration
 	}
 	peers := active
 	if uint8(local) < active {
 		peers--
 	}
-	budget := journalRepairBudget{active: active, local: local, capacity: peers * journalRepairsPerPeer}
+	budget := journalRepairBudget{
+		active:   active,
+		local:    local,
+		capacity: peers * journalRepairsPerPeer,
+		deadline: uint64(timeout),
+	}
 	for peer := range active {
 		budget.ewma[peer] = uint64(time.Millisecond)
 	}
@@ -114,7 +125,7 @@ func (budget *journalRepairBudget) Expire(now uint64) (uint8, error) {
 			continue
 		}
 		elapsed := elapsedSince(entry.started, now)
-		deadline := uint64(500 * time.Millisecond)
+		deadline := cmp.Or(budget.deadline, uint64(defaultJournalRepairTimeout))
 		if budget.ewma[entry.peer] < deadline/2 {
 			deadline = 2 * budget.ewma[entry.peer]
 		}

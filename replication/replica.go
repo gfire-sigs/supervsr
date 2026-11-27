@@ -311,12 +311,13 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, ioOptions si
 	if !ok {
 		return nil, ErrInvalidConfiguration
 	}
-	repairBudget, err := newJournalRepairBudget(config.Membership.ActiveCount, local)
+	resolvedTimers := config.Process.resolvedTimers()
+	repairBudget, err := newJournalRepairBudgetWithTimeout(config.Membership.ActiveCount, local, resolvedTimers.journalRepairTimeout)
 	if err != nil {
 		return nil, err
 	}
 	memberCount := config.Membership.ActiveCount + config.Membership.StandbyCount
-	blockBudget, err := newBlockRepairBudget(memberCount, local, config.Process.RepairRequestsMax)
+	blockBudget, err := newBlockRepairBudgetWithTimeouts(memberCount, local, config.Process.RepairRequestsMax, resolvedTimers.blockRepairRetryAfter, resolvedTimers.blockRepairTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +473,7 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, ioOptions si
 		headChecksum:         initial.HeadHeader.HeaderChecksum,
 		lastPrepareTimestamp: prepareTimestamp(&initial.HeadHeader),
 		lastCommitTimestamp:  prepareTimestamp(&initial.HeadHeader),
-		failureDetector:      newLivenessDetector(initialTime.Monotonic),
+		failureDetector:      newLivenessDetectorFromProcess(initialTime.Monotonic, config.Process),
 		timers:               timers,
 		random:               random,
 		checkpointSession:    checkpointSession,

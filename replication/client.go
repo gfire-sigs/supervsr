@@ -108,7 +108,8 @@ func NewClient(config ClientConfig, bus MessageBus, clock Clock, entropy io.Read
 	if err != nil {
 		return nil, err
 	}
-	ping, err := newTimeout(30*time.Second, config.Process.Tick, 0)
+	resolved := config.Process.resolvedTimers()
+	ping, err := newTimeout(resolved.clientPingInterval, config.Process.Tick, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +122,17 @@ func NewClient(config ClientConfig, bus MessageBus, clock Clock, entropy io.Read
 }
 
 func validateClientProcess(config ProcessConfig) error {
-	if config.Tick <= 0 || config.Tick >= 50*time.Millisecond {
+	if config.ClientPingInterval < 0 || config.FailureIntervalMin < 0 || config.FailureIntervalMax < 0 {
+		return ErrInvalidConfiguration
+	}
+	resolved := config.resolvedTimers()
+	if resolved.failureIntervalMax < resolved.failureIntervalMin {
+		return ErrInvalidConfiguration
+	}
+	if config.Tick <= 0 || config.Tick >= resolved.failureIntervalMin/2 {
+		return ErrInvalidConfiguration
+	}
+	if resolved.clientPingInterval < config.Tick {
 		return ErrInvalidConfiguration
 	}
 	if config.InitialRTT < config.Tick || config.MaximumRTT < config.InitialRTT || config.RTTMultiplier == 0 {

@@ -163,6 +163,19 @@ func TestProcessConfigurationRejectsInvalidBounds(t *testing.T) {
 		{name: "clock epoch", mutate: func(cfg *ProcessConfig) { cfg.ClockEpochMax = cfg.ClockWindowMin }},
 		{name: "small storage", mutate: func(cfg *ProcessConfig) { cfg.StorageSizeLimit = 1 }},
 		{name: "unaligned storage", mutate: func(cfg *ProcessConfig) { cfg.StorageSizeLimit++ }},
+		{name: "negative ping interval", mutate: func(cfg *ProcessConfig) { cfg.PingInterval = -time.Millisecond }},
+		{name: "negative client ping interval", mutate: func(cfg *ProcessConfig) { cfg.ClientPingInterval = -time.Millisecond }},
+		{name: "timer below tick", mutate: func(cfg *ProcessConfig) { cfg.RepairInterval = cfg.Tick / 2 }},
+		{name: "failure interval order", mutate: func(cfg *ProcessConfig) {
+			cfg.FailureIntervalMin = 3 * time.Second
+			cfg.FailureIntervalMax = 2 * time.Second
+		}},
+		{name: "yellow permille below 1000", mutate: func(cfg *ProcessConfig) { cfg.FailureYellowPermille = 999 }},
+		{name: "red permille not above yellow", mutate: func(cfg *ProcessConfig) { cfg.FailureYellowPermille = 2000; cfg.FailureRedPermille = 2000 }},
+		{name: "block repair timeout below retry", mutate: func(cfg *ProcessConfig) {
+			cfg.BlockRepairRetryAfter = 500 * time.Millisecond
+			cfg.BlockRepairTimeout = 250 * time.Millisecond
+		}},
 	}
 	cluster := DefaultClusterConfig()
 	for _, test := range tests {
@@ -175,6 +188,187 @@ func TestProcessConfigurationRejectsInvalidBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestProcessConfigZeroOptionalTimersUseV1DefaultsAndSupportWANTuning(t *testing.T) {
+	cluster := DefaultClusterConfig()
+
+	// Legacy v1.0 literal ProcessConfig with zero optional timer fields must validate and resolve to v1.0 defaults.
+	legacy := ProcessConfig{
+		Tick:                    10 * time.Millisecond,
+		InitialRTT:              300 * time.Millisecond,
+		MaximumRTT:              60 * time.Second,
+		RTTMultiplier:           2,
+		BackoffMin:              10 * time.Millisecond,
+		BackoffMax:              10 * time.Second,
+		PrimaryRequestQueueMax:  2,
+		JournalReadConcurrency:  8,
+		JournalWriteConcurrency: 32,
+		ReplyReadConcurrency:    1,
+		ReplyWriteConcurrency:   2,
+		BlockReadConcurrency:    32,
+		BlockWriteConcurrency:   32,
+		StorageSizeLimit:        16 << 40,
+		RepairRequestsMax:       4,
+		RepairReadsMax:          4,
+		ScrubReadConcurrency:    1,
+		ScrubWriteConcurrency:   1,
+		ScrubCycle:              180 * 24 * time.Hour,
+		ScrubIntervalMin:        50 * time.Millisecond,
+		ScrubIntervalMax:        10 * time.Second,
+		ClockOffsetToleranceMax: 10 * time.Second,
+		ClockEpochMax:           60 * time.Second,
+		ClockWindowMin:          2 * time.Second,
+		ClockWindowMax:          20 * time.Second,
+	}
+	if err := legacy.Validate(cluster); err != nil {
+		t.Fatalf("legacy v1.0 ProcessConfig rejected: %v", err)
+	}
+	if legacy.resolvedTimers() != DefaultProcessConfig().resolvedTimers() {
+		t.Fatalf("zero-field resolution mismatch: got %+v want %+v", legacy.resolvedTimers(), DefaultProcessConfig().resolvedTimers())
+	}
+
+	// WAN profile with larger FailureIntervalMin permits larger Tick and custom timers across replica, budgets, and client.
+	wan := DefaultProcessConfig()
+	wan.Tick = 50 * time.Millisecond
+	wan.InitialRTT = 250 * time.Millisecond
+	wan.BackoffMin = 50 * time.Millisecond
+	wan.PingInterval = 2 * time.Second
+	wan.PrepareTimeout = 600 * time.Millisecond
+	wan.AbdicationTimeout = 20 * time.Second
+	wan.CommitInterval = 1 * time.Second
+	wan.ExitViewTimeout = 1 * time.Second
+	wan.JoinViewTimeout = 1 * time.Second
+	wan.ViewChangeTimeout = 12 * time.Second
+	wan.ExitViewCollectionWindow = 15 * time.Second
+	wan.PulseInterval = 250 * time.Millisecond
+	wan.RepairInterval = 500 * time.Millisecond
+	wan.JournalRepairTimeout = 2 * time.Second
+	wan.BlockRepairRetryAfter = 500 * time.Millisecond
+	wan.BlockRepairTimeout = 2 * time.Second
+	wan.ClientPingInterval = 5 * time.Second
+	wan.FailureIntervalMin = 500 * time.Millisecond
+	wan.FailureIntervalMax = 6 * time.Second
+	wan.FailureYellowPermille = 2000
+	wan.FailureRedPermille = 5000
+
+	if err := wan.Validate(cluster); err != nil {
+		t.Fatalf("WAN ProcessConfig rejected: %v", err)
+	}
+	if err := validateClientProcess(wan); err != nil {
+		t.Fatalf("WAN Client ProcessConfig rejected: %v", err)
+	}
+	timers, err := newReplicaTimers(wan)
+	if err != nil {
+		t.Fatalf("newReplicaTimers(wan): %v", err)
+	}
+	gotThresholds := [6]uint64{
+		timers.ping.Threshold(),
+		timers.prepare.Threshold(),
+		timers.commit.Threshold(),
+		timers.repair.Threshold(),
+		timers.viewChange.Threshold(),
+		timers.abdication.Threshold(),
+	}
+	wantThresholds := [6]uint64{40, 12, 20, 10, 240, 400}
+	if gotThresholds != wantThresholds {
+		t.Fatalf("WAN timer thresholds = %v, want %v", gotThresholds, wantThresholds)
+	}
+
+	// Journal repair budget respects configured 2s deadline instead of hardcoded 500ms.
+	jBudget, err := newJournalRepairBudgetWithTimeout(3, 0, wan.JournalRepairTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jBudget.ewma[1] = uint64(time.Second)
+	jBudget.ewma[2] = uint64(time.Second)
+	rng := newDeterministicRandom(7)
+	if _, ok, reserveErr := jBudget.Reserve(1, 100, &rng); reserveErr != nil || !ok {
+		t.Fatalf("journal reserve ok=%v err=%v", ok, reserveErr)
+	}
+	if expired, expireErr := jBudget.Expire(100 + uint64(time.Second)); expireErr != nil || expired != 0 {
+		t.Fatalf("expired at 1s = (%d, %v), want (0, nil)", expired, expireErr)
+	}
+	if expired, expireErr := jBudget.Expire(100 + uint64(2*time.Second)); expireErr != nil || expired != 1 {
+		t.Fatalf("expired at 2s = (%d, %v), want (1, nil)", expired, expireErr)
+	}
+
+	// Block repair budget respects configured 500ms retry and 2s expiry.
+	bBudget, err := newBlockRepairBudgetWithTimeouts(3, 0, 2, wan.BlockRepairRetryAfter, wan.BlockRepairTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := BlockReference{Address: 1, Checksum: protocol.Checksum{1}}
+	if !bBudget.Reserve(1, []BlockReference{ref}, 100) {
+		t.Fatal("initial block reserve failed")
+	}
+	if bBudget.Reserve(2, []BlockReference{ref}, 100+uint64(300*time.Millisecond)) {
+		t.Fatal("block retry succeeded before configured BlockRepairRetryAfter")
+	}
+	if !bBudget.Reserve(2, []BlockReference{ref}, 100+uint64(500*time.Millisecond)) {
+		t.Fatal("block retry failed at configured BlockRepairRetryAfter")
+	}
+	if expired, expireErr := bBudget.Expire(100 + uint64(time.Second)); expireErr != nil || expired != 0 {
+		t.Fatalf("block expired at 1s = (%d, %v), want (0, nil)", expired, expireErr)
+	}
+	if expired, expireErr := bBudget.Expire(100 + uint64(2*time.Second)); expireErr != nil || expired != 1 {
+		t.Fatalf("block expired at 2s = (%d, %v), want (1, nil)", expired, expireErr)
+	}
+
+	// Client honors custom ClientPingInterval (5s / 50ms = 100 ticks).
+	clientBus := &captureBus{}
+	client, err := NewClient(ClientConfig{
+		Group:             protocol.GroupID{1},
+		ID:                protocol.ClientID{2},
+		Release:           1,
+		ActiveCount:       3,
+		MessageSizeMax:    4096,
+		ChecksumAlgorithm: protocol.ChecksumAEGIS128L,
+		Process:           wan,
+	}, clientBus, fixedClock{sample: TimeSample{Wall: 1, Monotonic: 1, Synchronized: true}}, zeroReader{}, &clientEventCollector{})
+	if err != nil {
+		t.Fatalf("NewClient(wan): %v", err)
+	}
+	if client.ping.Threshold() != 100 {
+		t.Fatalf("client ping threshold = %d, want 100", client.ping.Threshold())
+	}
+	_ = client.Close()
+
+	// ExitView collection honors configured ExitViewCollectionWindow (15s instead of 5s).
+	replica := &Replica{
+		config: Config{Process: wan},
+		membership: Membership{
+			Members:     [MembersMax]protocol.MemberID{{1}, {2}, {3}, {4}},
+			ActiveCount: 4,
+			LocalMember: protocol.MemberID{1},
+		},
+		quorums: Quorums{Replication: 2, ViewChange: 3, Negative: 3, Majority: 3, Upgrade: 4},
+		status:  StatusNormal,
+		view:    1,
+	}
+	replica.handleExitView(protocol.Header{View: 1, Author: 1, Command: protocol.CommandExitView}, uint64(time.Second))
+	// At +10s (past default 5s, inside 15s window), author 1 vote must still be retained.
+	replica.handleExitView(protocol.Header{View: 1, Author: 2, Command: protocol.CommandExitView}, uint64(11*time.Second))
+	if replica.exitViewBits&(1<<1) == 0 {
+		t.Fatalf("configured 15s ExitViewCollectionWindow expired early at +10s (bits=%b)", replica.exitViewBits)
+	}
+	// At +16s (past 15s window from t=1s), author 1 vote must expire while author 2 (t=11s) remains.
+	replica.handleExitView(protocol.Header{View: 1, Author: 3, Command: protocol.CommandExitView}, uint64(17*time.Second))
+	if replica.exitViewBits&(1<<1) != 0 || replica.exitViewBits&(1<<2) == 0 || replica.exitViewBits&(1<<3) == 0 {
+		t.Fatalf("unexpected exitViewBits after 15s window expiry: %b", replica.exitViewBits)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+type clientEventCollector struct{}
+
+func (*clientEventCollector) Reply(ClientReply)               {}
+func (*clientEventCollector) Evicted(protocol.EvictionReason) {}
 
 func TestMembershipRequiresOrderedUniqueMembersAndLocalIdentity(t *testing.T) {
 	member1 := protocol.MemberID{1}

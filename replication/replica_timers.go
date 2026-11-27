@@ -15,16 +15,17 @@ type replicaTimers struct {
 }
 
 func newReplicaTimers(process ProcessConfig) (replicaTimers, error) {
+	resolved := process.resolvedTimers()
 	periods := [...]time.Duration{
-		time.Second,
-		250 * time.Millisecond,
-		10 * time.Second,
-		500 * time.Millisecond,
-		500 * time.Millisecond,
-		500 * time.Millisecond,
-		5 * time.Second,
-		100 * time.Millisecond,
-		100 * time.Millisecond,
+		resolved.pingInterval,
+		resolved.prepareTimeout,
+		resolved.abdicationTimeout,
+		resolved.commitInterval,
+		resolved.exitViewTimeout,
+		resolved.joinViewTimeout,
+		resolved.viewChangeTimeout,
+		resolved.pulseInterval,
+		resolved.repairInterval,
 	}
 	timers := replicaTimers{}
 	destinations := [...]*tickTimeout{

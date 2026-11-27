@@ -1,14 +1,15 @@
 package replication
 
 import (
+	"cmp"
 	"time"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 const (
-	blockRepairRetryAfter = uint64(100 * time.Millisecond)
-	blockRepairExpires    = uint64(250 * time.Millisecond)
+	blockRepairRetryAfter = uint64(defaultBlockRepairRetryAfter)
+	blockRepairExpires    = uint64(defaultBlockRepairTimeout)
 )
 
 type blockRepairBudgetEntry struct {
@@ -30,13 +31,19 @@ type blockRepairBudget struct {
 	batchMax          uint32
 	perPeer           uint32
 	requestsAvailable uint32
+	retryAfter        uint64
+	expires           uint64
 	available         []uint32
 	entries           []blockRepairBudgetEntry
 	requests          []blockRepairRequestRecord
 }
 
 func newBlockRepairBudget(memberCount uint8, local protocol.ReplicaIndex, batchMax uint32) (blockRepairBudget, error) {
-	if memberCount == 0 || memberCount > MembersMax || batchMax == 0 {
+	return newBlockRepairBudgetWithTimeouts(memberCount, local, batchMax, defaultBlockRepairRetryAfter, defaultBlockRepairTimeout)
+}
+
+func newBlockRepairBudgetWithTimeouts(memberCount uint8, local protocol.ReplicaIndex, batchMax uint32, retryAfter, expires time.Duration) (blockRepairBudget, error) {
+	if memberCount == 0 || memberCount > MembersMax || batchMax == 0 || retryAfter <= 0 || expires < retryAfter {
 		return blockRepairBudget{}, ErrInvalidConfiguration
 	}
 	perPeer := batchMax + 1
@@ -52,6 +59,8 @@ func newBlockRepairBudget(memberCount uint8, local protocol.ReplicaIndex, batchM
 		batchMax:          batchMax,
 		perPeer:           perPeer,
 		requestsAvailable: batchMax,
+		retryAfter:        uint64(retryAfter),
+		expires:           uint64(expires),
 		available:         filledUint32(int(memberCount), perPeer),
 		entries:           make([]blockRepairBudgetEntry, int(memberCount)*int(perPeer)),
 		requests:          requests,
@@ -129,7 +138,8 @@ func (budget *blockRepairBudget) referencesEligible(peer protocol.ReplicaIndex, 
 				if !entry.busy || entry.reference != reference {
 					continue
 				}
-				if protocol.ReplicaIndex(candidatePeer) == peer || elapsedSince(entry.started, now) < blockRepairRetryAfter {
+				retryAfter := cmp.Or(budget.retryAfter, blockRepairRetryAfter)
+				if protocol.ReplicaIndex(candidatePeer) == peer || elapsedSince(entry.started, now) < retryAfter {
 					return false
 				}
 			}
@@ -212,9 +222,10 @@ func (budget *blockRepairBudget) Fulfill(reference BlockReference) (int, error) 
 
 func (budget *blockRepairBudget) Expire(now uint64) (int, error) {
 	expired := 0
+	expires := cmp.Or(budget.expires, blockRepairExpires)
 	for index := range budget.requests {
 		record := &budget.requests[index]
-		if !record.busy || elapsedSince(record.started, now) < blockRepairExpires {
+		if !record.busy || elapsedSince(record.started, now) < expires {
 			continue
 		}
 		for _, reference := range record.references {

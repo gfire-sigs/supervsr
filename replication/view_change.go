@@ -3,12 +3,9 @@ package replication
 import (
 	"encoding/binary"
 	"errors"
-	"time"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
-
-const exitViewCollectionWindow = uint64(5 * time.Second)
 
 func (replica *Replica) handleHigherViewEvidence(header protocol.Header) bool {
 	if header.View < replica.view || uint8(header.Author) >= replica.membership.ActiveCount {
@@ -62,13 +59,14 @@ func (replica *Replica) handleExitView(header protocol.Header, now uint64) {
 		return
 	}
 	if now != 0 {
+		window := uint64(replica.config.Process.resolvedTimers().exitViewCollectionWindow)
 		for member := range replica.membership.ActiveCount {
 			bit := uint16(1) << member
 			if replica.exitViewBits&bit == 0 {
 				continue
 			}
 			recorded := replica.exitViewAt[member]
-			if recorded != 0 && now > recorded && now-recorded > exitViewCollectionWindow {
+			if recorded != 0 && now > recorded && now-recorded > window {
 				replica.exitViewBits &^= bit
 				replica.exitViewAt[member] = 0
 			}
@@ -259,7 +257,7 @@ func (replica *Replica) handleViewPersistence(completion ioCompletion) bool {
 	if replica.deps.Clock != nil {
 		now = replica.deps.Clock.Now().Monotonic
 	}
-	replica.failureDetector = newLivenessDetector(now)
+	replica.failureDetector = newLivenessDetectorFromProcess(now, replica.config.Process)
 	if replica.metrics != nil {
 		replica.metrics.viewChangeTruncationOp.Store(uint64(replica.viewHead))
 		if replica.viewChangeStarted != 0 {
