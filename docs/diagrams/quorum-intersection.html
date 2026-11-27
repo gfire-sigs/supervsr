@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quorum intersection · Venn</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; min-width: 0; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Quorum safety · SuperVSR</p>
+    <h1>Why committed data survives leader failure</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="quorum-intersection-title quorum-intersection-desc">
+        <title id="quorum-intersection-title">Quorum intersection in a 6-replica cluster</title>
+        <desc id="quorum-intersection-desc">Two overlapping circles showing a replication quorum of 3 replicas and a view-change quorum of 4 replicas out of 6 total replicas, guaranteed to share at least 1 replica.</desc>
+        <defs>
+          <clipPath id="clip-qr">
+            <circle cx="368" cy="240" r="156"/>
+          </clipPath>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+        <!-- Set 1: Replication Quorum Qr = 3 (smaller circle, proportional) -->
+        <circle cx="368" cy="240" r="156" fill="rgba(45,49,66,0.04)" stroke="#2d3142" stroke-width="1"/>
+
+        <!-- Set 2: View-Change Quorum Qv = 4 (larger circle, proportional) -->
+        <circle cx="564" cy="240" r="172" fill="rgba(79,93,117,0.05)" stroke="#4f5d75" stroke-width="1"/>
+
+        <!-- Focal overlap lens: clipped to Qr, drawn by Qv (width = 524 - 392 = 132px) -->
+        <g clip-path="url(#clip-qr)">
+          <circle cx="564" cy="240" r="172" fill="rgba(191,69,32,0.12)" stroke="#bf4520" stroke-width="1.2"/>
+        </g>
+
+        <!-- Set labels placed cleanly outside the circles -->
+        <text x="160" y="76" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replication Quorum</text>
+        <text x="160" y="94" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">Qr = 3 OF 6 REPLICAS</text>
+
+        <text x="792" y="76" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">View-Change Quorum</text>
+        <text x="792" y="94" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">Qv = 4 OF 6 REPLICAS</text>
+
+        <!-- Replicas inside Qr only: R0, R1 -->
+        <rect x="248" y="176" width="112" height="52" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="304" y="200" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 0</text>
+        <text x="304" y="216" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">old primary</text>
+
+        <rect x="248" y="252" width="112" height="52" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="304" y="276" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 1</text>
+        <text x="304" y="292" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">acked op</text>
+
+        <!-- Focal overlap replica: R2 (fits completely inside the 132px coral lens 392..524) -->
+        <rect x="404" y="212" width="108" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="404" y="212" width="108" height="56" rx="6" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1.2"/>
+        <text x="458" y="236" fill="#bf4520" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 2</text>
+        <text x="458" y="254" fill="#2d3142" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">shared witness</text>
+
+        <!-- Replicas inside Qv only: R3, R4, R5 -->
+        <rect x="564" y="140" width="116" height="52" rx="6" fill="#ffffff" stroke="#4f5d75" stroke-width="1"/>
+        <text x="622" y="164" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 3</text>
+        <text x="622" y="180" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">new view voter</text>
+
+        <rect x="564" y="212" width="116" height="52" rx="6" fill="#ffffff" stroke="#4f5d75" stroke-width="1"/>
+        <text x="622" y="236" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 4</text>
+        <text x="622" y="252" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">new view voter</text>
+
+        <rect x="564" y="284" width="116" height="52" rx="6" fill="#ffffff" stroke="#4f5d75" stroke-width="1"/>
+        <text x="622" y="308" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Replica 5</text>
+        <text x="622" y="324" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">new view voter</text>
+
+        <!-- Annotation callout pointing to the top cusp of the focal overlap -->
+        <text x="456" y="44" fill="#bf4520" font-size="14" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="middle">Qr + Qv = 3 + 4 = 7 &gt; 6, so at least 1 witness always overlaps</text>
+        <path d="M 456,56 V 108" fill="none" stroke="rgba(191,69,32,0.50)" stroke-width="1" stroke-dasharray="4,3"/>
+        <circle cx="456" cy="108" r="2.5" fill="#bf4520"/>
+
+        <!-- Legend and quick formula table strip -->
+        <line x1="40" y1="440" x2="920" y2="440" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+        <text x="40" y="460" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.18em">QUORUM RULE</text>
+
+        <rect x="40" y="476" width="14" height="10" rx="2" fill="rgba(191,69,32,0.12)" stroke="#bf4520" stroke-width="1"/>
+        <text x="60" y="484" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Guaranteed overlap (Qr + Qv &gt; N)</text>
+
+        <text x="348" y="484" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace">N=3: Qr=2, Qv=2, Qn=2</text>
+        <text x="568" y="484" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace">N=5: Qr=3, Qv=3, Qn=3</text>
+        <text x="780" y="484" fill="#bf4520" font-size="8.5" font-family="'Geist Mono', ui-monospace, monospace">N=6: Qr=3, Qv=4, Qn=4</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>

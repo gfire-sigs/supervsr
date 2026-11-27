@@ -210,6 +210,8 @@ In a multi-node service, bind authenticated incoming frames with `Frame.BindRepl
 
 ## State machine architecture
 
+For a step-by-step introduction to the full VSR consensus, view-change, recovery, and checkpointing algorithm implemented here, see [How Viewstamped Replication works in supervsr](docs/vsr-guide.md).
+
 ### Design and execution contract
 
 Each `Replica` runs a single-threaded event loop (`Replica.Run` / `Replica.Process`) that drains an MPSC ring of inbound messages and state-machine completions alongside an asynchronous storage I/O completion ring. Because all `StateMachine` methods are invoked from this event loop in strict `Op` order, implementations need no internal mutexes unless background workers complete asynchronous operations.
@@ -221,24 +223,9 @@ Methods in [sm.go](replication/sm.go) use two patterns:
 
 ### Replica status transitions
 
-A replica moves between four `Status` modes defined in [status.go](replication/status.go):
+A replica moves between four `Status` modes defined in [status.go](replication/status.go) (interactive source: [replica-lifecycle.html](docs/diagrams/replica-lifecycle.html)):
 
-```mermaid
-stateDiagram-v2
-    [*] --> StatusRecovering: "Open or state sync"
-    StatusRecovering --> StatusNormal: "causeRecoveredBackup / sync complete"
-    StatusRecovering --> StatusViewChange: "causeRecoveredViewChange"
-    StatusRecovering --> StatusRecoveringHead: "causeRecoveredUncertainHead / suffix repair"
-    StatusNormal --> StatusViewChange: "causeLocalTimeout / causeHigherView"
-    StatusNormal --> StatusRecoveringHead: "Gap or higher commit observed"
-    StatusNormal --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
-    StatusViewChange --> StatusViewChange: "causeNewerViewChange"
-    StatusViewChange --> StatusNormal: "causeCanonicalViewInstalled"
-    StatusViewChange --> StatusRecoveringHead: "Missing canonical suffix"
-    StatusViewChange --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
-    StatusRecoveringHead --> StatusNormal: "causeCanonicalViewInstalled / suffix repaired"
-    StatusRecoveringHead --> StatusRecovering: "Lagging checkpoint (beginStateSync)"
-```
+![Replica status transitions](docs/diagrams/replica-lifecycle.svg)
 
 | Status | Role | Key transitions out |
 | --- | --- | --- |
@@ -256,26 +243,11 @@ When `beginStateSync` runs in [state_sync.go](replication/state_sync.go), the re
 
 ### Commit and checkpoint pipeline transitions
 
-Once the pipeline head entry is durable and has a quorum of `PrepareOK` acks (or `commitMax >= op` on backups), `advanceCommit` drives it through `CommitStage` ([replica.go](replication/replica.go), [replica_normal.go](replication/replica_normal.go), [replica_checkpoint.go](replication/replica_checkpoint.go)):
+Once the pipeline head entry is durable and has a quorum of `PrepareOK` acks (or `commitMax >= op` on backups), `advanceCommit` drives it through `CommitStage` ([replica.go](replication/replica.go), [replica_normal.go](replication/replica_normal.go), [replica_checkpoint.go](replication/replica_checkpoint.go); interactive source: [commit-pipeline.html](docs/diagrams/commit-pipeline.html)):
 
-```mermaid
-stateDiagram-v2
-    [*] --> CommitStageIdle
-    CommitStageIdle --> CommitStageStart: "Durable + quorum or commitMax"
-    CommitStageStart --> CommitStageCheckPrepare
-    CommitStageCheckPrepare --> CommitStagePrefetch: "Application op or Pulse"
-    CommitStageCheckPrepare --> CommitStageStall: "Control op (Register, Noop, Upgrade)"
-    CommitStagePrefetch --> CommitStageStall: "StartPrefetch Ready / SMCompletion"
-    CommitStageStall --> CommitStageReplySetup
-    CommitStageReplySetup --> CommitStageExecute: "Persist reply frame (if non-empty)"
-    CommitStageExecute --> CommitStageCheckpointDurable: "StateMachine.Commit"
-    CommitStageCheckpointDurable --> CommitStageIdle: "Non-compaction op"
-    CommitStageCheckpointDurable --> CommitStageCompact: "(op + 1) % CompactionOps == 0"
-    CommitStageCompact --> CommitStageIdle: "Non-trigger op"
-    CommitStageCompact --> CommitStageCheckpointData: "Trigger op (target + CompactionOps)"
-    CommitStageCheckpointData --> CommitStageCheckpointSuperblock: "StartCheckpoint + trailer blocks written"
-    CommitStageCheckpointSuperblock --> CommitStageIdle: "Superblock persisted"
-```
+![Commit and checkpoint pipeline](docs/diagrams/commit-pipeline.svg)
+
+In code, the pipeline gates map to `CommitStageIdle`, `CommitStageStart`, `CommitStageCheckPrepare`, `CommitStagePrefetch`, `CommitStageStall`, `CommitStageReplySetup`, `CommitStageExecute`, `CommitStageCheckpointDurable`, `CommitStageCompact`, `CommitStageCheckpointData`, and `CommitStageCheckpointSuperblock`.
 
 Compaction and checkpoint persistence are intentionally offset by one `CompactionOps` window: the replica encodes the session trailer at `target = checkpointAfter(cluster, currentCheckpoint)` and calls `StartCheckpoint` at `target + CompactionOps`. Any pending view change yields in `afterCompact` or `applyCheckpoint` before updating durable checkpoint state.
 
@@ -287,6 +259,7 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 | `replication/protocol/` | 256-byte fixed headers, `FramePool`, source binding, semantic validation, and 128-bit checksums (`ChecksumAEGIS128L` with AVX-AES, NEON-AES, and portable fallback; `ChecksumWyhash128`). |
 | `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`, `IOController`), `LedgerMachine`, and global invariant checks. |
 | `cmd/toykv/` | Local multi-replica in-process cluster demo and KV REPL. |
+| `docs/` | Step-by-step VSR guide ([docs/vsr-guide.md](docs/vsr-guide.md)) and editorial SVG/HTML architecture diagrams (`docs/diagrams/`). |
 | `formal/` | TLA+ specifications (`VSR.tla`, `VSRConsensus`, `MPSCRing.tla`) verified in CI. |
 | `spec/v1.0/errata/` | Protocol, recovery, and API errata from v1.0 conformance verification ([spec/v1.0/errata/README.md](spec/v1.0/errata/README.md)). |
 

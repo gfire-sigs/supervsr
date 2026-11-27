@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 500" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="storage-layout-title storage-layout-desc" id="storage-layout-root">
+        <title id="storage-layout-title">Single preallocated replica file</title>
+        <desc id="storage-layout-desc">Layer stack showing the five contiguous zones inside one SuperVSR replica file from offset zero to end of file: Superblock Ring, WAL Header Ring, WAL Prepare Ring, Client Reply Slots, and Block Store.</desc>
+        <defs>
+      <style>#storage-layout-root { --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace; }
+      #storage-layout-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #storage-layout-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#storage-layout-root .diagram-container { overflow-x: visible; }
+}</style>
+          <marker id="storage-layout-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+        <!-- Left margin axis: byte offset 0 down to EOF -->
+        <text x="80" y="56" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">OFFSET 0</text>
+        <line x1="80" y1="68" x2="80" y2="396" stroke="#2d3142" stroke-width="1" marker-end="url(#storage-layout-arrow)" stroke-opacity="0.30"/>
+        <text x="80" y="420" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">EOF</text>
+
+        <!-- Outer stack rules -->
+        <line x1="140" y1="64" x2="920" y2="64" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+        <line x1="140" y1="404" x2="920" y2="404" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+
+        <!-- Zone 01: Superblock Ring (FOCAL CORAL) -->
+        <rect x="140" y="64" width="780" height="68" fill="#bf4520" fill-opacity="0.08"/>
+        <rect x="140" y="64" width="780" height="68" fill="none" stroke="#bf4520" stroke-width="1"/>
+        <text x="164" y="101" fill="#bf4520" font-size="8" font-weight="600" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">01</text>
+        <text x="232" y="103" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Superblock Ring</text>
+        <text x="896" y="102" fill="#bf4520" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">4, 6, or 8 copies x 8 KiB · quorum opened</text>
+
+        <!-- Zone 02: WAL Header Ring -->
+        <rect x="140" y="132" width="780" height="68" fill="#ffffff"/>
+        <line x1="140" y1="200" x2="920" y2="200" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+        <text x="164" y="169" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">02</text>
+        <text x="232" y="171" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">WAL Header Ring</text>
+        <text x="896" y="170" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">JournalSlots x 256 B · op hash chain</text>
+
+        <!-- Zone 03: WAL Prepare Ring -->
+        <rect x="140" y="200" width="780" height="68" fill="#f5f5f5"/>
+        <line x1="140" y1="268" x2="920" y2="268" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+        <text x="164" y="237" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">03</text>
+        <text x="232" y="239" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">WAL Prepare Ring</text>
+        <text x="896" y="238" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">JournalSlots x MessageSizeMax · full frames</text>
+
+        <!-- Zone 04: Client Reply Slots -->
+        <rect x="140" y="268" width="780" height="68" fill="#ffffff"/>
+        <line x1="140" y1="336" x2="920" y2="336" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+        <text x="164" y="305" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">04</text>
+        <text x="232" y="307" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Client Reply Slots</text>
+        <text x="896" y="306" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">ClientsMax x MessageSizeMax · cached replies</text>
+
+        <!-- Zone 05: Block Store -->
+        <rect x="140" y="336" width="780" height="68" fill="#ececec"/>
+        <text x="164" y="373" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.14em">05</text>
+        <text x="232" y="375" fill="#2d3142" font-size="14" font-weight="600" font-family="'Geist', system-ui, sans-serif">Block Store</text>
+        <text x="896" y="374" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="end">BlockSize extents · checkpoints + 3 trailers</text>
+
+        <!-- Vertical outer side hairlines -->
+        <line x1="140" y1="64" x2="140" y2="404" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+        <line x1="920" y1="64" x2="920" y2="404" stroke="#2d3142" stroke-width="1" stroke-opacity="0.12"/>
+
+        <!-- Caption strip -->
+        <line x1="40" y1="436" x2="920" y2="436" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.10"/>
+        <text x="40" y="460" fill="#bf4520" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.16em">FOCAL ZONE</text>
+        <text x="140" y="460" fill="#2d3142" font-size="14" font-style="italic" font-family="'Instrument Serif', serif">The superblock ring anchors view, logView, checkpoint pointers, and config fingerprint against torn writes.</text>
+      </svg>

@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 640" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="normal-path-title normal-path-desc" id="normal-path-root">
+        <title id="normal-path-title">Normal write path in a 3-replica cluster</title>
+        <desc id="normal-path-desc">Sequence diagram showing a client request moving to the primary, syncing to WAL, replicating via Prepare and PrepareOK to reach quorum, returning a committed reply, and sending a Commit heartbeat to backups.</desc>
+        <defs>
+      <style>#normal-path-root { --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace; }
+      #normal-path-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #normal-path-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#normal-path-root .diagram-container { overflow-x: visible; }
+}</style>
+          <marker id="normal-path-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+          </marker>
+          <marker id="normal-path-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#bf4520"/>
+          </marker>
+          <marker id="normal-path-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+          </marker>
+          <marker id="normal-path-arrow-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polyline points="0 0, 8 3, 0 6" fill="none" stroke="#4f5d75" stroke-width="1.2"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+        <!-- Lifelines at x = 128, 368, 608, 832 -->
+        <line x1="128" y1="108" x2="128" y2="544" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="368" y1="108" x2="368" y2="544" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="608" y1="108" x2="608" y2="544" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+        <line x1="832" y1="108" x2="832" y2="544" stroke="#2d3142" stroke-width="1" stroke-dasharray="3,3" stroke-opacity="0.20"/>
+
+        <!-- Activation bars -->
+        <rect x="364" y="148" width="8" height="364" fill="#2d3142" stroke="#4f5d75" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="604" y="252" width="8" height="120" fill="#2d3142" stroke="#4f5d75" stroke-width="0.8" fill-opacity="0.06"/>
+        <rect x="828" y="288" width="8" height="60" fill="#2d3142" stroke="#4f5d75" stroke-width="0.8" fill-opacity="0.06"/>
+
+        <!-- Messages (drawn before labels and actor boxes) -->
+        <!-- M1: Client -> Primary (Request) -->
+        <line x1="128" y1="148" x2="364" y2="148" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#normal-path-arrow-link)"/>
+
+        <!-- M2: Primary self-message (WAL sync) -->
+        <path d="M 372,180 H 416 Q 424,180 424,188 V 204 Q 424,212 416,212 H 372" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M3: Primary -> Backup 1 (Prepare) -->
+        <line x1="372" y1="252" x2="604" y2="252" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M4: Primary -> Backup 2 (Prepare) -->
+        <line x1="372" y1="288" x2="828" y2="288" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M5: Backup 1 self-message (WAL sync before ack) -->
+        <path d="M 612,308 H 656 Q 664,308 664,316 V 332 Q 664,340 656,340 H 612" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M6: Backup 1 -> Primary (PrepareOK -> Qr = 2 reached!) -->
+        <line x1="604" y1="372" x2="372" y2="372" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M7: Primary self-message (Execute SM + save reply) -->
+        <path d="M 372,404 H 416 Q 424,404 424,412 V 428 Q 424,436 416,436 H 372" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+
+        <!-- M8: Primary -> Client (Reply, headline success, coral) -->
+        <line x1="364" y1="468" x2="128" y2="468" stroke="#bf4520" stroke-width="1.4" marker-end="url(#normal-path-arrow-accent)"/>
+
+        <!-- M9: Primary -> Backup 1 & Backup 2 (Commit heartbeat, async open arrowhead) -->
+        <line x1="372" y1="512" x2="832" y2="512" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#normal-path-arrow-open)"/>
+
+        <!-- Message labels (every mask 6-10px clear of stroke and off lifelines) -->
+        <g font-family="'Geist Mono', ui-monospace, monospace" font-size="8" text-anchor="middle" letter-spacing="0.06em">
+          <rect x="192" y="128" width="112" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="248" y="137" fill="#2e5aa8">REQUEST #K</text>
+
+          <rect x="432" y="190" width="104" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="436" y="199" fill="#5a6580" text-anchor="start">ASSIGN OP · WAL</text>
+
+          <rect x="432" y="232" width="112" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="488" y="241" fill="#5a6580">PREPARE (OP, H)</text>
+
+          <rect x="668" y="268" width="112" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="724" y="277" fill="#5a6580">PREPARE (OP, H)</text>
+
+          <rect x="672" y="318" width="76" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="676" y="327" fill="#5a6580" text-anchor="start">WAL FSYNC</text>
+
+          <rect x="424" y="352" width="128" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="488" y="361" fill="#5a6580">PREPARE_OK (QR=2)</text>
+
+          <rect x="432" y="414" width="104" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="436" y="423" fill="#5a6580" text-anchor="start">COMMIT + REPLY</text>
+
+          <rect x="192" y="448" width="112" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="248" y="457" fill="#bf4520">REPLY (OK)</text>
+
+          <rect x="664" y="492" width="120" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="724" y="501" fill="#5a6580">COMMIT HEARTBEAT</text>
+        </g>
+
+        <!-- Actor boxes (drawn last) -->
+        <!-- Actor 1: Client -->
+        <rect x="52" y="48" width="152" height="60" rx="6" fill="#f5f5f5"/>
+        <rect x="52" y="48" width="152" height="60" rx="6" fill="#4f5d75" stroke="#5a6580" stroke-width="1" fill-opacity="0.10"/>
+        <rect x="60" y="56" width="40" height="12" rx="2" fill="none" stroke="#5a6580" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="80" y="65" fill="#5a6580" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">CLIENT</text>
+        <text x="128" y="84" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Client</text>
+        <text x="128" y="99" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">session · req chain</text>
+
+        <!-- Actor 2: Primary R0 (FOCAL CORAL) -->
+        <rect x="288" y="48" width="160" height="60" rx="6" fill="#f5f5f5"/>
+        <rect x="288" y="48" width="160" height="60" rx="6" fill="#bf4520" stroke="#bf4520" stroke-width="1" fill-opacity="0.08"/>
+        <rect x="296" y="56" width="44" height="12" rx="2" fill="none" stroke="#bf4520" stroke-width="0.8" stroke-opacity="0.50"/>
+        <text x="318" y="65" fill="#bf4520" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">LEADER</text>
+        <text x="368" y="84" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Primary (R0)</text>
+        <text x="368" y="99" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">view 0 · pipeline</text>
+
+        <!-- Actor 3: Backup 1 -->
+        <rect x="532" y="48" width="152" height="60" rx="6" fill="#f5f5f5"/>
+        <rect x="532" y="48" width="152" height="60" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="540" y="56" width="44" height="12" rx="2" fill="none" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="562" y="65" fill="#2d3142" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BACKUP</text>
+        <text x="608" y="84" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Backup (R1)</text>
+        <text x="608" y="99" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">WAL + replay</text>
+
+        <!-- Actor 4: Backup 2 -->
+        <rect x="756" y="48" width="152" height="60" rx="6" fill="#f5f5f5"/>
+        <rect x="756" y="48" width="152" height="60" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="764" y="56" width="44" height="12" rx="2" fill="none" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="786" y="65" fill="#2d3142" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BACKUP</text>
+        <text x="832" y="84" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Backup (R2)</text>
+        <text x="832" y="99" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">WAL + replay</text>
+
+        <!-- Legend strip -->
+        <line x1="40" y1="564" x2="920" y2="564" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.10"/>
+        <text x="40" y="584" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.18em">LEGEND</text>
+
+        <line x1="40" y1="604" x2="68" y2="604" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#normal-path-arrow-link)"/>
+        <text x="76" y="607" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Client request</text>
+
+        <line x1="192" y1="604" x2="220" y2="604" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#normal-path-arrow)"/>
+        <text x="228" y="607" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Replication call</text>
+
+        <line x1="352" y1="604" x2="380" y2="604" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#normal-path-arrow)"/>
+        <text x="388" y="607" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Durable ack (return)</text>
+
+        <line x1="532" y1="604" x2="560" y2="604" stroke="#bf4520" stroke-width="1.4" marker-end="url(#normal-path-arrow-accent)"/>
+        <text x="568" y="607" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Committed reply</text>
+
+        <line x1="696" y1="604" x2="724" y2="604" stroke="#4f5d75" stroke-width="1.2" stroke-dasharray="5,4" marker-end="url(#normal-path-arrow-open)"/>
+        <text x="732" y="607" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Async heartbeat</text>
+      </svg>

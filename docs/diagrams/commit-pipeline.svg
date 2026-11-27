@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="commit-pipeline-title commit-pipeline-desc" id="commit-pipeline-root">
+        <title id="commit-pipeline-title">Commit and checkpoint pipeline</title>
+        <desc id="commit-pipeline-desc">Two-tier pipeline showing how each durable, quorum-backed operation executes and persists replies, while compaction and block checkpointing run at periodic boundaries offset by one CompactionOps window.</desc>
+        <defs>
+      <style>#commit-pipeline-root { --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #bf4520;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace; }
+      #commit-pipeline-root { font-family: var(--font-sans); color: var(--color-ink); }
+      #commit-pipeline-root .diagram-container { width: 100%; overflow-x: auto; }
+      @media print {
+#commit-pipeline-root .diagram-container { overflow-x: visible; }
+}</style>
+          <marker id="commit-pipeline-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+          </marker>
+          <marker id="commit-pipeline-arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#bf4520"/>
+          </marker>
+          <marker id="commit-pipeline-arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+          </marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+        <!-- Zones (drawn before arrows and nodes) -->
+        <rect x="40" y="44" width="880" height="168" rx="8" fill="#2d3142" stroke="#2d3142" stroke-width="0.8" fill-opacity="0.02" stroke-opacity="0.10"/>
+        <rect x="56" y="48" width="144" height="12" rx="2" fill="#f5f5f5"/>
+        <text x="128" y="57" fill="#5a6580" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">EVERY COMMITTED OP</text>
+
+        <rect x="40" y="264" width="880" height="156" rx="8" fill="#2d3142" stroke="#2d3142" stroke-width="0.8" fill-opacity="0.02" stroke-opacity="0.10"/>
+        <rect x="56" y="268" width="200" height="12" rx="2" fill="#f5f5f5"/>
+        <text x="156" y="277" fill="#5a6580" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">PERIODIC CHECKPOINT MAINTENANCE</text>
+
+        <!-- Connectors (drawn before nodes) -->
+        <!-- 1. Quorum Ready -> Prefetch (app op or pulse) -->
+        <line x1="236" y1="156" x2="288" y2="156" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#commit-pipeline-arrow)"/>
+
+        <!-- 2. Quorum Ready -> Execute & Reply (bypass Prefetch for control ops) -->
+        <path d="M 148,120 V 96 Q 148,88 156,88 H 588 Q 596,88 596,96 V 120" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#commit-pipeline-arrow)"/>
+
+        <!-- 3. Prefetch -> Execute & Reply -->
+        <line x1="460" y1="156" x2="512" y2="156" stroke="#bf4520" stroke-width="1.4" marker-end="url(#commit-pipeline-arrow-accent)"/>
+
+        <!-- 4. Execute & Reply -> Advance Commit -->
+        <line x1="684" y1="156" x2="736" y2="156" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#commit-pipeline-arrow)"/>
+
+        <!-- 5. Advance Commit -> Compact (boundary trigger) -->
+        <path d="M 820,192 V 236 Q 820,244 812,244 H 172 Q 164,244 164,252 V 308" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#commit-pipeline-arrow)"/>
+
+        <!-- 6. Compact -> Checkpoint Data (trigger op = target + CompactionOps) -->
+        <line x1="276" y1="348" x2="368" y2="348" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#commit-pipeline-arrow)"/>
+
+        <!-- 7. Checkpoint Data -> Checkpoint Durable (superblock persist, focal coral) -->
+        <line x1="592" y1="348" x2="684" y2="348" stroke="#bf4520" stroke-width="1.4" marker-end="url(#commit-pipeline-arrow-accent)"/>
+
+        <!-- Connector labels -->
+        <g font-family="'Geist Mono', ui-monospace, monospace" font-size="8" text-anchor="middle" letter-spacing="0.06em">
+          <rect x="240" y="136" width="44" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="262" y="145" fill="#5a6580">APP OP</text>
+
+          <rect x="316" y="68" width="112" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="372" y="77" fill="#5a6580">CONTROL OP</text>
+
+          <rect x="464" y="136" width="44" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="486" y="145" fill="#bf4520">READY</text>
+
+          <rect x="688" y="136" width="44" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="710" y="145" fill="#5a6580">REPLY</text>
+
+          <rect x="404" y="224" width="152" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="480" y="233" fill="#5a6580">COMPACTION BOUNDARY</text>
+
+          <rect x="284" y="328" width="76" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="322" y="337" fill="#5a6580">TRIGGER OP</text>
+
+          <rect x="600" y="328" width="76" height="12" rx="2" fill="#f5f5f5"/>
+          <text x="638" y="337" fill="#bf4520">SYNC BLOCKS</text>
+        </g>
+
+        <!-- Row 1 Nodes: Every committed op -->
+        <!-- Node 1: Quorum Ready -->
+        <rect x="64" y="120" width="172" height="72" rx="6" fill="#f5f5f5"/>
+        <rect x="64" y="120" width="172" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="72" y="128" width="40" height="12" rx="2" fill="none" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="92" y="137" fill="#2d3142" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">GATE</text>
+        <text x="150" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Quorum Ready</text>
+        <text x="150" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">durable + Qr / commitMax</text>
+
+        <!-- Node 2: Prefetch -->
+        <rect x="288" y="120" width="172" height="72" rx="6" fill="#f5f5f5"/>
+        <rect x="288" y="120" width="172" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="296" y="128" width="44" height="12" rx="2" fill="none" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="318" y="137" fill="#2d3142" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">ASYNC</text>
+        <text x="374" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Prefetch</text>
+        <text x="374" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">StartPrefetch · token</text>
+
+        <!-- Node 3: Execute & Reply (FOCAL CORAL) -->
+        <rect x="512" y="120" width="172" height="72" rx="6" fill="#f5f5f5"/>
+        <rect x="512" y="120" width="172" height="72" rx="6" fill="#bf4520" stroke="#bf4520" stroke-width="1" fill-opacity="0.08"/>
+        <rect x="520" y="128" width="48" height="12" rx="2" fill="none" stroke="#bf4520" stroke-width="0.8" stroke-opacity="0.50"/>
+        <text x="544" y="137" fill="#bf4520" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">COMMIT</text>
+        <text x="598" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Execute &amp; Reply</text>
+        <text x="598" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">SM.Commit + reply slot</text>
+
+        <!-- Node 4: Advance Commit -->
+        <rect x="736" y="120" width="168" height="72" rx="6" fill="#f5f5f5"/>
+        <rect x="736" y="120" width="168" height="72" rx="6" fill="#2d3142" stroke="#4f5d75" stroke-width="1" fill-opacity="0.05"/>
+        <rect x="744" y="128" width="44" height="12" rx="2" fill="none" stroke="#4f5d75" stroke-width="0.8" stroke-opacity="0.50"/>
+        <text x="766" y="137" fill="#4f5d75" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+        <text x="820" y="160" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Advance Commit</text>
+        <text x="820" y="176" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">commitMin = op · send</text>
+
+        <!-- Row 2 Nodes: Periodic maintenance -->
+        <!-- Node 5: Compact -->
+        <rect x="64" y="308" width="212" height="80" rx="6" fill="#f5f5f5"/>
+        <rect x="64" y="308" width="212" height="80" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <rect x="72" y="316" width="56" height="12" rx="2" fill="none" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.40"/>
+        <text x="100" y="325" fill="#2d3142" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">WINDOW</text>
+        <text x="170" y="348" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Compact</text>
+        <text x="170" y="364" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">(op + 1) % CompactionOps == 0</text>
+        <text x="170" y="378" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">encode session trailer at target</text>
+
+        <!-- Node 6: Checkpoint Data -->
+        <rect x="368" y="308" width="224" height="80" rx="6" fill="#f5f5f5"/>
+        <rect x="368" y="308" width="224" height="80" rx="6" fill="#2d3142" stroke="#4f5d75" stroke-width="1" fill-opacity="0.05"/>
+        <rect x="376" y="316" width="52" height="12" rx="2" fill="none" stroke="#4f5d75" stroke-width="0.8" stroke-opacity="0.50"/>
+        <text x="402" y="325" fill="#4f5d75" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BLOCKS</text>
+        <text x="480" y="348" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Checkpoint Data</text>
+        <text x="480" y="364" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">op == target + CompactionOps</text>
+        <text x="480" y="378" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">StartCheckpoint + 3 trailers</text>
+
+        <!-- Node 7: Checkpoint Durable (FOCAL CORAL) -->
+        <rect x="684" y="308" width="220" height="80" rx="6" fill="#f5f5f5"/>
+        <rect x="684" y="308" width="220" height="80" rx="6" fill="#bf4520" stroke="#bf4520" stroke-width="1" fill-opacity="0.08"/>
+        <rect x="692" y="316" width="60" height="12" rx="2" fill="none" stroke="#bf4520" stroke-width="0.8" stroke-opacity="0.50"/>
+        <text x="722" y="325" fill="#bf4520" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">DURABLE</text>
+        <text x="794" y="348" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', system-ui, sans-serif" text-anchor="middle">Superblock Durable</text>
+        <text x="794" y="364" fill="#4f5d75" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">persist CheckpointState</text>
+        <text x="794" y="378" fill="#5a6580" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">release superseded blocks</text>
+
+        <!-- Editorial note -->
+        <text x="40" y="448" fill="#2d3142" font-size="14" font-style="italic" font-family="'Instrument Serif', serif">Ordinary ops return to Idle after Advance Commit. Pending view changes yield before durable checkpoint.</text>
+
+        <!-- Legend strip -->
+        <line x1="40" y1="472" x2="920" y2="472" stroke="#2d3142" stroke-width="0.8" stroke-opacity="0.10"/>
+        <text x="40" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.18em">LEGEND</text>
+
+        <rect x="40" y="508" width="14" height="10" rx="2" fill="#bf4520" stroke="#bf4520" stroke-width="1" fill-opacity="0.08"/>
+        <text x="60" y="516" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Durability milestone</text>
+
+        <rect x="208" y="508" width="14" height="10" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="228" y="516" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Pipeline stage</text>
+
+        <rect x="348" y="508" width="14" height="10" rx="2" fill="#2d3142" stroke="#4f5d75" stroke-width="1" fill-opacity="0.05"/>
+        <text x="368" y="516" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">State / storage write</text>
+
+        <line x1="520" y1="513" x2="548" y2="513" stroke="#bf4520" stroke-width="1.4" marker-end="url(#commit-pipeline-arrow-accent)"/>
+        <text x="556" y="516" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Commit / checkpoint sync</text>
+
+        <line x1="728" y1="513" x2="756" y2="513" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#commit-pipeline-arrow)"/>
+        <text x="764" y="516" fill="#4f5d75" font-size="8.5" font-family="'Geist', system-ui, sans-serif">Control-op bypass</text>
+      </svg>
