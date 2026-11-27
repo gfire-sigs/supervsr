@@ -327,7 +327,7 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	replica.io = ioEngine
-	if _, err := ioEngine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{1}}); err != nil {
+	if _, err := ioEngine.Submit(ioOperation{Kind: ioWrite, Buffer: []byte{1}}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -363,7 +363,7 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	if executor.calls != 0 {
 		t.Fatal("release executed before IO completion")
 	}
-	replica.submitters.Add(1)
+	replica.submitMu.RLock()
 	close(blocked.release)
 
 	deadline := time.NewTimer(time.Second)
@@ -388,7 +388,7 @@ func TestReleaseActivationDrainsResetIOAndOwnedFrames(t *testing.T) {
 	if !replica.events.TryPush(replicaEvent{kind: replicaEventMessage, message: late}) {
 		t.Fatal("late admitted message was not queued")
 	}
-	replica.submitters.Add(-1)
+	replica.submitMu.RUnlock()
 	for executor.calls == 0 {
 		_, processErr := replica.Process(64)
 		if processErr != nil && !errors.Is(processErr, executeErr) {

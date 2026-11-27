@@ -301,15 +301,21 @@ func (replica *Replica) processReleaseActivation(limit int) (int, error) {
 	drained := false
 	for processed < limit {
 		var completion ioCompletion
-		if replica.io.Poll(&completion) {
+		polled, pollErr := replica.io.Poll(&completion)
+		if pollErr != nil {
+			replica.fail(pollErr)
+			return processed, pollErr
+		}
+		if polled {
 			processed++
 			continue
 		}
 		var event replicaEvent
 		if !replica.events.TryPop(&event) {
-			if replica.submitters.Load() != 0 {
+			if !replica.submitMu.TryLock() {
 				break
 			}
+			replica.submitMu.Unlock()
 			if !replica.events.TryPop(&event) {
 				drained = true
 				break
@@ -347,7 +353,11 @@ func (replica *Replica) releaseReadyToExecute(eventsDrained bool) bool {
 	if !replica.io.Drained() {
 		return false
 	}
-	return replica.submitters.Load() == 0
+	if !replica.submitMu.TryLock() {
+		return false
+	}
+	replica.submitMu.Unlock()
+	return true
 }
 
 func (replica *Replica) executeRelease(target protocol.Release) {

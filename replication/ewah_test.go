@@ -50,7 +50,7 @@ func TestEWAHRejectsNoncanonicalLiteralFillAndLengthOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := set.DecodeEWAH([]uint64{1 << 32, 0}); !errors.Is(err, ErrInvalidEWAH) {
+	if err := set.DecodeEWAH([]uint64{1 << 32, 0}); !errors.Is(err, errInvalidEWAH) {
 		t.Fatalf("literal fill error = %v", err)
 	}
 	if _, err := newFixedBitSet(math.MaxUint64); !errors.Is(err, ErrInvalidConfiguration) {
@@ -72,7 +72,7 @@ func TestFixedBitSetTailAndPopulation(t *testing.T) {
 		t.Fatalf("bitset count=%d tail=%t overflow=%t", set.Count(), set.Test(64), set.Test(65))
 	}
 	set.words[1] |= 1 << 1
-	if _, err := set.EncodeEWAH(make([]uint64, 4)); !errors.Is(err, ErrInvalidEWAH) {
+	if _, err := set.EncodeEWAH(make([]uint64, 4)); !errors.Is(err, errInvalidEWAH) {
 		t.Fatalf("tail error = %v", err)
 	}
 }

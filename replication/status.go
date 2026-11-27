@@ -9,7 +9,7 @@ import (
 
 var (
 	ErrReplicaInvariant = errors.New("replication: replica invariant violated")
-	ErrStatusTransition = errors.New("replication: invalid status transition")
+	errStatusTransition = errors.New("replication: invalid status transition")
 )
 
 // Status identifies the current operating mode of a Replica.

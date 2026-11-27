@@ -129,7 +129,7 @@ func exerciseFileAppendFault(t *testing.T, fault fileAppendFault) fileAppendReco
 	storage.writes, storage.syncs = 0, 0
 	storage.writeAtCall, storage.syncAtCall, storage.partial = fault.write, fault.sync, fault.partial
 	engine := fileIOEngine(t, storage, 1, 1)
-	completion := executeFileIO(t, engine, ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: attempted})
+	completion := executeFileIO(t, engine, ioOperation{Kind: ioWALAppend, walJournal: wal, Buffer: attempted})
 	if !storage.injected || !errors.Is(completion.Err, errInjectedFileIO) {
 		t.Fatalf("append completion = %v, injected = %t", completion.Err, storage.injected)
 	}
@@ -180,7 +180,7 @@ func TestFileWALInjectedCapacityFailurePreservesPrefix(t *testing.T) {
 	}
 	storage := &injectedFileStorage{FileStorage: file, capacity: size}
 	engine := fileIOEngine(t, storage, 2, 1)
-	completion := executeFileIO(t, engine, ioOperation{Kind: IOResize, Size: size + config.BlockSize})
+	completion := executeFileIO(t, engine, ioOperation{Kind: ioResize, Size: size + config.BlockSize})
 	if !storage.injected || !errors.Is(completion.Err, syscall.ENOSPC) || !errors.Is(completion.Err, errInjectedFileIO) {
 		t.Fatalf("extension completion = %v, injected = %t", completion.Err, storage.injected)
 	}
@@ -208,24 +208,24 @@ func TestFileWALSustainedIOKeepsResourcesBounded(t *testing.T) {
 		parent = decodeFilePrepare(t, config, frames[index])
 	}
 	engine := fileIOEngine(t, file, slots, 2)
-	var handles [slots]IOHandle
+	var handles [slots]ioHandle
 	var buffers [slots][SectorSize]byte
 	for round := range rounds {
 		for first := 0; first < len(frames); first += slots {
 			for index := range slots {
-				handle, err := engine.Submit(ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: frames[first+index]})
+				handle, err := engine.Submit(ioOperation{Kind: ioWALAppend, walJournal: wal, Buffer: frames[first+index]})
 				if err != nil {
 					t.Fatalf("round %d append %d: %v", round, first+index+1, err)
 				}
 				handles[index] = handle
 			}
-			if _, err := engine.Submit(ioOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
+			if _, err := engine.Submit(ioOperation{Kind: ioSync}); !errors.Is(err, ErrIOBackpressure) {
 				t.Fatalf("exhausted pool accepted work: %v", err)
 			}
 			finishFileBatch(t, engine, handles[:])
 			for index := range slots {
 				offset := wal.Layout().PrepareBase + uint64(first+index+1)*wal.Layout().PrepareStride
-				handle, err := engine.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: buffers[index][:]})
+				handle, err := engine.Submit(ioOperation{Kind: ioRead, Offset: offset, Buffer: buffers[index][:]})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -264,8 +264,8 @@ func BenchmarkFileWALAppendRead(b *testing.B) {
 	frame := connectedPrepareFrame(b, config, report.HeadHeader, 1)
 	engine := fileIOEngine(b, file, 4, 1)
 	buffer := make([]byte, wal.Layout().PrepareStride)
-	appendOperation := ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: frame}
-	readOperation := ioOperation{Kind: IORead, Offset: wal.Layout().PrepareBase + wal.Layout().PrepareStride, Buffer: buffer}
+	appendOperation := ioOperation{Kind: ioWALAppend, walJournal: wal, Buffer: frame}
+	readOperation := ioOperation{Kind: ioRead, Offset: wal.Layout().PrepareBase + wal.Layout().PrepareStride, Buffer: buffer}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(frame)))
 	b.ResetTimer()
@@ -389,14 +389,20 @@ func closeFileIO(t testing.TB, engine *storageIOEngine) {
 func awaitFileIO(t testing.TB, engine *storageIOEngine) ioCompletion {
 	t.Helper()
 	var completion ioCompletion
-	for !engine.Poll(&completion) {
+	for {
+		polled, err := engine.Poll(&completion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if polled {
+			return completion
+		}
 		select {
 		case <-engine.Ready():
 		case <-t.Context().Done():
 			t.Fatal("file IO completion canceled", t.Context().Err())
 		}
 	}
-	return completion
 }
 
 func executeFileIO(t testing.TB, engine *storageIOEngine, operation ioOperation) ioCompletion {
@@ -412,7 +418,7 @@ func executeFileIO(t testing.TB, engine *storageIOEngine, operation ioOperation)
 	return completion
 }
 
-func finishFileBatch(t testing.TB, engine *storageIOEngine, handles []IOHandle) {
+func finishFileBatch(t testing.TB, engine *storageIOEngine, handles []ioHandle) {
 	t.Helper()
 	var seen uint64
 	for range handles {

@@ -11,7 +11,7 @@ import (
 
 func TestReplyStoreSerializesOverlappingWorkerWrites(t *testing.T) {
 	config := compactTestClusterConfig()
-	layout, ok := DeriveWALLayout(config)
+	layout, ok := deriveWALLayout(config)
 	if !ok {
 		t.Fatal("invalid layout")
 	}
@@ -29,7 +29,7 @@ func TestReplyStoreSerializesOverlappingWorkerWrites(t *testing.T) {
 	firstFrame, firstHeader := makeReplyFrame(t, protocol.ClientID{1}, 5, []byte("first reply"))
 	secondFrame, secondHeader := makeReplyFrame(t, protocol.ClientID{2}, 6, []byte("second reply"))
 	for slot, frame := range [][]byte{firstFrame, secondFrame} {
-		if _, err := engine.Submit(ioOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame, durableReplyStore: store}); err != nil {
+		if _, err := engine.Submit(ioOperation{Kind: ioReplyWrite, Offset: uint64(slot), Buffer: frame, durableReplyStore: store}); err != nil {
 			t.Fatal(err)
 		}
 	}

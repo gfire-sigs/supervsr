@@ -58,6 +58,8 @@ const (
 	OperationReserved Operation = iota
 	OperationRoot
 	OperationRegister
+	// OperationReconfigure validates a proposed membership permutation in
+	// format version 1 without modifying membership or frame epoch.
 	OperationReconfigure
 	OperationPulse
 	OperationUpgrade

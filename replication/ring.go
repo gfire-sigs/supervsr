@@ -7,7 +7,7 @@ import (
 
 const cacheLineSize = 64
 
-var ErrInvalidRingCapacity = errors.New("replication: ring capacity must be a power of two greater than one")
+var errInvalidRingCapacity = errors.New("replication: ring capacity must be a power of two greater than one")
 
 type ringCursor struct {
 	position atomic.Uint64
@@ -34,7 +34,7 @@ type mpscRing[T any] struct {
 func newMPSCRing[T any](capacity uint64) (*mpscRing[T], error) {
 	maxInt := uint64(^uint(0) >> 1)
 	if capacity < 2 || capacity&(capacity-1) != 0 || capacity > maxInt {
-		return nil, ErrInvalidRingCapacity
+		return nil, errInvalidRingCapacity
 	}
 
 	ring := &mpscRing[T]{

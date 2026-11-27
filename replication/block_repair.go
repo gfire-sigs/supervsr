@@ -73,7 +73,7 @@ const (
 )
 
 type blockRepairIO struct {
-	handle  IOHandle
+	handle  ioHandle
 	buffer  []byte
 	target  uint32
 	address uint64
@@ -130,7 +130,15 @@ func (replica *Replica) continueBlockRepair(now uint64) bool {
 	if replica.checkpointTransitionActive() {
 		return false
 	}
-	replica.blockRepairBudget.Expire(now)
+	expired, err := replica.blockRepairBudget.Expire(now)
+	if err != nil {
+		replica.fail(err)
+		return false
+	}
+	if expired > 0 && replica.metrics != nil {
+		replica.metrics.repairStalls.Add(uint64(expired))
+		replica.metrics.repairPeerRotations.Add(uint64(expired))
+	}
 	for index := range replica.blockRepairTargets {
 		target := &replica.blockRepairTargets[index]
 		if target.state != blockRepairQueued {
@@ -232,7 +240,7 @@ func (replica *Replica) startBlockRepairRead(targetIndex uint32) bool {
 		if !ok {
 			return false
 		}
-		handle, err := replica.io.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		handle, err := replica.io.Submit(ioOperation{Kind: ioRead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}
@@ -280,6 +288,9 @@ func (replica *Replica) sendGetBlocks(peer protocol.ReplicaIndex, references []B
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetBlocks, Author: replica.local}
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
+		if replica.metrics != nil {
+			replica.metrics.repairRequests.Add(1)
+		}
 	}
 	message.Release()
 }
@@ -313,7 +324,7 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 		if !ok {
 			return
 		}
-		handle, err := replica.io.Submit(ioOperation{Kind: IOWrite, Offset: offset, Buffer: operation.buffer})
+		handle, err := replica.io.Submit(ioOperation{Kind: ioWrite, Offset: offset, Buffer: operation.buffer})
 		if err != nil {
 			return
 		}
@@ -322,6 +333,10 @@ func (replica *Replica) handleBlock(header protocol.Header, body []byte) {
 		operation.stage = blockRepairIOWrite
 		operation.busy = true
 		replica.blockRepairTargets[targetIndex].state = blockRepairWriting
+		if replica.metrics != nil {
+			replica.metrics.repairResponses.Add(1)
+			replica.metrics.repairBytes.Add(uint64(header.Size))
+		}
 		return
 	}
 }
@@ -420,7 +435,10 @@ func (replica *Replica) finishBlockRepairRead(operation *blockRepairIO, target *
 		return
 	}
 	target.state = blockRepairDurable
-	replica.blockRepairBudget.Fulfill(target.reference)
+	if _, err := replica.blockRepairBudget.Fulfill(target.reference); err != nil {
+		replica.fail(err)
+		return
+	}
 	replica.blockRepairCompleted(target, operation.buffer)
 
 }
@@ -432,7 +450,7 @@ func (replica *Replica) finishBlockRepairWrite(operation *blockRepairIO, target 
 		replica.fail(completion.Err)
 		return
 	}
-	handle, err := replica.io.Submit(ioOperation{Kind: IOSync})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioSync})
 	if err != nil {
 		operation.busy = false
 		target.state = blockRepairMissing
@@ -451,7 +469,10 @@ func (replica *Replica) finishBlockRepairSync(operation *blockRepairIO, target *
 		return
 	}
 	target.state = blockRepairDurable
-	replica.blockRepairBudget.Fulfill(target.reference)
+	if _, err := replica.blockRepairBudget.Fulfill(target.reference); err != nil {
+		replica.fail(err)
+		return
+	}
 	replica.blockRepairCompleted(target, operation.buffer)
 }
 
@@ -532,7 +553,10 @@ func (replica *Replica) discardReleasedBlockRepairs() {
 		if ok && replica.blockAllocator.acquired.Test(blockIndex) && !replica.blockAllocator.released.Test(blockIndex) {
 			continue
 		}
-		replica.blockRepairBudget.Fulfill(target.reference)
+		if _, err := replica.blockRepairBudget.Fulfill(target.reference); err != nil {
+			replica.fail(err)
+			return
+		}
 		*target = blockRepairTarget{}
 	}
 }

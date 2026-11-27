@@ -250,3 +250,72 @@ func TestFramePoolAcquiresExactEncodedBytes(t *testing.T) {
 	}
 	frame.Release()
 }
+
+func TestFrameDoubleReleaseDoesNotPanicOrCorruptPool(t *testing.T) {
+	pool, err := NewFramePool(2, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame.Release()
+	frame.Release()
+	if pool.Available() != pool.Capacity() {
+		t.Fatalf("available after double release = %d, want %d", pool.Available(), pool.Capacity())
+	}
+	first, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := pool.Acquire(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("double release corrupted pool freelist with duplicate frame")
+	}
+	if _, err := pool.Acquire(0); !errors.Is(err, ErrFramePoolEmpty) {
+		t.Fatalf("third acquire error = %v, want ErrFramePoolEmpty", err)
+	}
+	first.Release()
+	second.Release()
+	var zero Frame
+	zero.Release()
+	var nilFrame *Frame
+	nilFrame.Release()
+}
+
+func TestFramePoolReadEncodedCopiesHeaderAndBodyAndReleasesOnShortRead(t *testing.T) {
+	pool, err := NewFramePool(1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := make([]byte, HeaderSize+12)
+	for i := range encoded {
+		encoded[i] = byte(i)
+	}
+	frame, err := pool.ReadEncoded(encoded[:HeaderSize], uint32(len(encoded)), bytes.NewReader(encoded[HeaderSize:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := frame.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, encoded) {
+		t.Fatalf("ReadEncoded bytes mismatch")
+	}
+	frame.Release()
+	if pool.Available() != 1 {
+		t.Fatalf("pool available = %d, want 1", pool.Available())
+	}
+	// Short body read must return the frame to the pool without leaking.
+	if _, err := pool.ReadEncoded(encoded[:HeaderSize], uint32(len(encoded)), bytes.NewReader(encoded[HeaderSize:HeaderSize+4])); err == nil {
+		t.Fatal("expected short body read error")
+	}
+	if pool.Available() != 1 {
+		t.Fatalf("pool available after short read = %d, want 1", pool.Available())
+	}
+}

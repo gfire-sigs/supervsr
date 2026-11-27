@@ -14,7 +14,7 @@ var ErrInvalidReplyStore = errors.New("replication: invalid durable reply")
 type durableReplyStore struct {
 	mu                sync.Mutex
 	storage           Storage
-	layout            WALLayout
+	layout            walLayout
 	clientsMax        uint32
 	group             protocol.GroupID
 	memberCount       uint8
@@ -24,7 +24,7 @@ type durableReplyStore struct {
 }
 
 func newDurableReplyStore(storage Storage, config ClusterConfig, group protocol.GroupID, memberCount uint8) (*durableReplyStore, error) {
-	layout, ok := DeriveWALLayout(config)
+	layout, ok := deriveWALLayout(config)
 	if !ok || config.ClientsMax == 0 || config.ClientsMax > uint64(^uint32(0)) || memberCount == 0 || !config.ChecksumAlgorithm.Valid() {
 		return nil, ErrInvalidReplyStore
 	}
@@ -46,13 +46,13 @@ func newDurableReplyStore(storage Storage, config ClusterConfig, group protocol.
 func (store *durableReplyStore) Write(slot uint32, frame []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	operation := ioOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame}
+	operation := ioOperation{Kind: ioReplyWrite, Offset: uint64(slot), Buffer: frame}
 	var sequence ioSequence
 	if err := store.beginIO(&sequence, &operation); err != nil {
 		return err
 	}
 	defer func() { store.ioActive = false }()
-	for sequence.phase != IOPhaseCompletion {
+	for sequence.phase != ioPhaseCompletion {
 		if err := store.advanceIO(&sequence, &operation); err != nil {
 			return err
 		}
@@ -63,7 +63,7 @@ func (store *durableReplyStore) Write(slot uint32, frame []byte) error {
 func (store *durableReplyStore) Read(slot uint32, expected protocol.Header, destination []byte) ([]byte, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	operation := ioOperation{Kind: IOReplyRead, Offset: uint64(slot), Buffer: destination, ExpectedHeader: expected}
+	operation := ioOperation{Kind: ioReplyRead, Offset: uint64(slot), Buffer: destination, ExpectedHeader: expected}
 	var sequence ioSequence
 	if err := store.beginIO(&sequence, &operation); err != nil {
 		return nil, err
@@ -88,12 +88,12 @@ func (store *durableReplyStore) beginIO(sequence *ioSequence, operation *ioOpera
 		return ErrInvalidReplyStore
 	}
 	*sequence = ioSequence{storage: store.storage, offset: offset, size: store.layout.ReplyStride}
-	if operation.Kind == IOReplyRead {
+	if operation.Kind == ioReplyRead {
 		operation.Size = 0
 		if uint64(len(operation.Buffer)) < store.layout.ReplyStride {
 			return ErrInvalidReplyStore
 		}
-		sequence.phase, sequence.buffer = IOPhaseRead, operation.Buffer[:store.layout.ReplyStride]
+		sequence.phase, sequence.buffer = ioPhaseRead, operation.Buffer[:store.layout.ReplyStride]
 		store.ioActive = true
 		return nil
 	}
@@ -108,7 +108,7 @@ func (store *durableReplyStore) beginIO(sequence *ioSequence, operation *ioOpera
 	}
 	clear(store.buffer)
 	copy(store.buffer, frame)
-	sequence.phase, sequence.buffer = IOPhaseWrite, store.buffer
+	sequence.phase, sequence.buffer = ioPhaseWrite, store.buffer
 	store.ioActive = true
 	return nil
 }
@@ -117,12 +117,12 @@ func (store *durableReplyStore) advanceIO(sequence *ioSequence, operation *ioOpe
 	if err := sequence.physical(); err != nil {
 		return fmt.Errorf("%w: reply slot %d phase %d: %w", ErrStorage, operation.Offset, sequence.phase, err)
 	}
-	if operation.Kind == IOReplyWrite && sequence.phase == IOPhaseWrite {
+	if operation.Kind == ioReplyWrite && sequence.phase == ioPhaseWrite {
 		sequence.syncNext()
 		return nil
 	}
-	sequence.phase = IOPhaseCompletion
-	if operation.Kind == IOReplyWrite {
+	sequence.phase = ioPhaseCompletion
+	if operation.Kind == ioReplyWrite {
 		return nil
 	}
 	physical := sequence.buffer

@@ -189,7 +189,7 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 		next.State.SyncMin = 0
 		next.State.SyncMax = 0
 	}
-	handle, err := replica.io.Submit(ioOperation{Kind: IOSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
 	if err != nil {
 		replica.abortCheckpointCandidate()
 		replica.fail(err)
@@ -199,7 +199,7 @@ func (replica *Replica) applyCheckpoint(entry *pipelineEntry, manifest Checkpoin
 	replica.checkpointManifest = manifest
 	entry.stage = CommitStageCheckpointSuperblock
 	entry.io = handle
-	entry.ioKind = IOSuperblockPersist
+	entry.ioKind = ioSuperblockPersist
 }
 
 func (replica *Replica) buildCheckpointState(candidate blockCheckpointCandidate, acquired, released, sessions trailerReference, manifest CheckpointManifest) (CheckpointState, error) {

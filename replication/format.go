@@ -46,7 +46,7 @@ func formatAtView(ctx context.Context, cfg FormatConfig, storage Storage, view, 
 	if size != 0 {
 		return ErrStorageNotEmpty
 	}
-	layout, ok := DeriveWALLayout(cfg.Cluster)
+	layout, ok := deriveWALLayout(cfg.Cluster)
 	if !ok {
 		return ErrInvalidConfiguration
 	}

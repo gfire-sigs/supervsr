@@ -10,7 +10,7 @@ import (
 
 const (
 	superblockStateSize      = 2048
-	SuperblockReservationEnd = 4096
+	superblockReservationEnd = 4096
 	superblockHeadersOffset  = 4096
 	superblockHeadersMax     = 16
 )
@@ -227,7 +227,7 @@ func (state *durableReplicaState) encode(destination []byte) error {
 		return ErrInvalidSuperblock
 	}
 	clear(destination)
-	if err := state.Checkpoint.encode(destination[:CheckpointStateSize]); err != nil {
+	if err := state.Checkpoint.encode(destination[:checkpointStateSize]); err != nil {
 		return err
 	}
 	copy(destination[1024:1040], state.LocalMember[:])

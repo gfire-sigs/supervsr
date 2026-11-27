@@ -128,7 +128,7 @@ func (store *superblockStore) Persist(next superblockRecord) error {
 		return err
 	}
 	defer func() { store.ioActive = false }()
-	for sequence.phase != IOPhaseCompletion {
+	for sequence.phase != ioPhaseCompletion {
 		if err := store.advancePersist(&sequence, &next); err != nil {
 			return err
 		}
@@ -163,19 +163,19 @@ func (store *superblockStore) prepareCopy(sequence *ioSequence, next *superblock
 	if err := next.Encode(store.buffer, physicalIndex, store.validation); err != nil {
 		return err
 	}
-	sequence.phase, sequence.buffer = IOPhaseWrite, store.buffer
+	sequence.phase, sequence.buffer = ioPhaseWrite, store.buffer
 	sequence.offset, sequence.size = uint64(physicalIndex)*SuperblockBytes, SuperblockBytes
 	return nil
 }
 
 func (store *superblockStore) advancePersist(sequence *ioSequence, next *superblockRecord) error {
 	if err := sequence.physical(); err != nil {
-		if sequence.phase == IOPhaseWrite {
+		if sequence.phase == ioPhaseWrite {
 			return fmt.Errorf("%w: superblock copy %d: %w", ErrStorage, sequence.offset/SuperblockBytes, err)
 		}
 		return err
 	}
-	if sequence.phase == IOPhaseWrite {
+	if sequence.phase == ioPhaseWrite {
 		sequence.syncNext()
 		return nil
 	}
@@ -185,7 +185,7 @@ func (store *superblockStore) advancePersist(sequence *ioSequence, next *superbl
 		return store.prepareCopy(sequence, next)
 	}
 	store.current = superblockCandidate{superblockRecord: *next, PhysicalIndex: uint16(sequence.index)}
-	sequence.phase = IOPhaseCompletion
+	sequence.phase = ioPhaseCompletion
 	return nil
 }
 

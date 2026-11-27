@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"errors"
+	"io"
 	"math"
 	"sync/atomic"
 )
@@ -106,6 +107,37 @@ func (pool *FramePool) AcquireEncoded(encoded []byte) (*Frame, error) {
 	}
 	frame.size = uint32(len(encoded))
 	copy(frame.buffer[:frame.size], encoded)
+	frame.sealed.Store(true)
+	frame.refs.Store(1)
+	return frame, nil
+}
+
+// ReadEncoded borrows a frame of totalSize bytes after header validation, copies
+// the 256-byte header prefix, reads the remaining totalSize-HeaderSize body
+// bytes from bodyReader directly into the pooled buffer, and returns a sealed
+// read-only frame. On any read failure the frame is returned to the pool.
+func (pool *FramePool) ReadEncoded(header []byte, totalSize uint32, bodyReader io.Reader) (*Frame, error) {
+	if len(header) != HeaderSize || totalSize < HeaderSize {
+		return nil, ErrFrameEncoding
+	}
+	if totalSize > pool.messageSizeMax {
+		return nil, ErrFrameTooLarge
+	}
+	if totalSize > HeaderSize && bodyReader == nil {
+		return nil, ErrFrameEncoding
+	}
+	frame := pool.pop()
+	if frame == nil {
+		return nil, ErrFramePoolEmpty
+	}
+	copy(frame.buffer[:HeaderSize], header)
+	if totalSize > HeaderSize {
+		if _, err := io.ReadFull(bodyReader, frame.buffer[HeaderSize:totalSize]); err != nil {
+			pool.push(frame)
+			return nil, err
+		}
+	}
+	frame.size = totalSize
 	frame.sealed.Store(true)
 	frame.refs.Store(1)
 	return frame, nil
@@ -219,20 +251,29 @@ func (frame *Frame) Retain() bool {
 }
 
 // Release decrements the frame reference count and returns the buffer to its
-// FramePool when the count reaches zero.
+// FramePool when the count reaches zero. Redundant calls after zero are ignored
+// so double release neither panics nor corrupts the pool.
 func (frame *Frame) Release() {
-	remaining := frame.refs.Add(-1)
-	if remaining > 0 {
+	if frame == nil || frame.pool == nil {
 		return
 	}
-	if remaining < 0 {
-		panic("protocol: frame reference underflow")
+	for {
+		current := frame.refs.Load()
+		if current <= 0 {
+			return
+		}
+		if frame.refs.CompareAndSwap(current, current-1) {
+			if current > 1 {
+				return
+			}
+			frame.sealed.Store(false)
+			frame.source.Store(0)
+			frame.member = MemberID{}
+			frame.size = 0
+			frame.pool.push(frame)
+			return
+		}
 	}
-	frame.sealed.Store(false)
-	frame.source.Store(0)
-	frame.member = MemberID{}
-	frame.size = 0
-	frame.pool.push(frame)
 }
 
 func (pool *FramePool) pop() *Frame {

@@ -10,8 +10,8 @@ import (
 func TestMPSCRingRejectsInvalidCapacity(t *testing.T) {
 	for _, capacity := range []uint64{0, 1, 3, 6, 1 << 63} {
 		_, err := newMPSCRing[uint64](capacity)
-		if !errors.Is(err, ErrInvalidRingCapacity) {
-			t.Fatalf("capacity %d: error = %v, want %v", capacity, err, ErrInvalidRingCapacity)
+		if !errors.Is(err, errInvalidRingCapacity) {
+			t.Fatalf("capacity %d: error = %v, want %v", capacity, err, errInvalidRingCapacity)
 		}
 	}
 }

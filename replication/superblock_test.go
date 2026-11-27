@@ -12,7 +12,7 @@ import (
 func TestCheckpointStateRoundTrip(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	checkpointValidation := checkpointValidationFor(t, validation)
-	var encoded [CheckpointStateSize]byte
+	var encoded [checkpointStateSize]byte
 	if err := superblock.State.Checkpoint.encode(encoded[:]); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 func TestCheckpointRejectsInvalidReferenceAndReservation(t *testing.T) {
 	validation, superblock := validSuperblockFixture(t)
 	checkpointValidation := checkpointValidationFor(t, validation)
-	var encoded [CheckpointStateSize]byte
+	var encoded [checkpointStateSize]byte
 	if err := superblock.State.Checkpoint.encode(encoded[:]); err != nil {
 		t.Fatal(err)
 	}

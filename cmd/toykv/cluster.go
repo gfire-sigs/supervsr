@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -59,7 +59,7 @@ type localTransport struct {
 	memberCount uint8
 	client      *replication.ManagedClient
 	clientID    protocol.ClientID
-	logger      zerolog.Logger
+	logger      *slog.Logger
 }
 
 type localBus struct {
@@ -110,10 +110,7 @@ func (transport *localTransport) sendReplica(member protocol.MemberID, from prot
 		if frame != nil {
 			frame.Release()
 		}
-		event := transport.logger.Warn()
-		event.Err(err)
-		event.Uint8("replica", uint8(to))
-		event.Msg("local transport dropped frame")
+		transport.logger.Warn("local transport dropped frame", "error", err, "replica", uint8(to))
 		return
 	}
 	transport.mu.RLock()
@@ -128,10 +125,7 @@ func (transport *localTransport) sendReplica(member protocol.MemberID, from prot
 	}
 	if err := target.Submit(frame); err != nil {
 		frame.Release()
-		event := transport.logger.Warn()
-		event.Err(err)
-		event.Uint8("replica", uint8(to))
-		event.Msg("local transport dropped frame")
+		transport.logger.Warn("local transport dropped frame", "error", err, "replica", uint8(to))
 	}
 }
 
@@ -158,10 +152,13 @@ type localCluster struct {
 	runResults chan error
 	runs       int
 	client     *replication.ManagedClient
-	logger     zerolog.Logger
+	logger     *slog.Logger
 }
 
-func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*localCluster, error) {
+func openCluster(ctx context.Context, opts options, logger *slog.Logger) (*localCluster, error) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	if opts.replicas == 0 || opts.replicas > replication.ActiveMax {
 		return nil, fmt.Errorf("replicas must be between 1 and %d", replication.ActiveMax)
 	}
@@ -189,7 +186,7 @@ func openCluster(ctx context.Context, opts options, logger zerolog.Logger) (*loc
 	}
 	transport := &localTransport{
 		pool: pool, memberCount: uint8(len(identity.members)),
-		logger: logger.With().Str("component", "transport").Logger(),
+		logger: logger.With("component", "transport"),
 	}
 	cluster := &localCluster{
 		group: identity.group, config: clusterConfig, process: processConfig, transport: transport,
@@ -242,9 +239,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 			_ = storage.Close()
 			return err
 		}
-		loggerContext := cluster.logger.With()
-		loggerContext = loggerContext.Uint8("replica", uint8(index))
-		replicaLogger := loggerContext.Logger()
+		replicaLogger := cluster.logger.With("replica", uint8(index))
 		machine := newKVMachine(
 			machineDir,
 			identity.group,
@@ -256,7 +251,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 		)
 		replica, err := replication.Open(ctx, config, replication.Dependencies{
 			Storage: storage, MessageBus: localBus{transport: cluster.transport, member: identity.members[index], from: protocol.ReplicaIndex(index), fromMember: true},
-			Clock: clock, Entropy: rand.Reader, StateMachine: machine, Logger: &replicaLogger,
+			Clock: clock, Entropy: rand.Reader, StateMachine: machine, Logger: replicaLogger,
 		})
 		if err != nil {
 			_ = storage.Close()
@@ -264,12 +259,12 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 		}
 		cluster.replicas[index] = replica
 		snapshot := replica.Snapshot()
-		event := replicaLogger.Info()
-		event.Uint8("status", uint8(snapshot.Status))
-		event.Uint32("view", uint32(snapshot.View))
-		event.Uint64("head", uint64(snapshot.HeadOp))
-		event.Uint64("commit", uint64(snapshot.CommitMin))
-		event.Msg("replica recovered")
+		replicaLogger.Info("replica recovered",
+			"status", uint8(snapshot.Status),
+			"view", uint32(snapshot.View),
+			"head", uint64(snapshot.HeadOp),
+			"commit", uint64(snapshot.CommitMin),
+		)
 	}
 	cluster.transport.mu.Lock()
 	for index, replica := range cluster.replicas {
@@ -281,10 +276,7 @@ func (cluster *localCluster) openReplicas(ctx context.Context, opts options, ide
 		go func(index int, replica *replication.Replica) {
 			err := replica.Run(context.Background())
 			if err != nil {
-				event := cluster.logger.Error()
-				event.Err(err)
-				event.Int("replica", index)
-				event.Msg("replica stopped")
+				cluster.logger.Error("replica stopped", "error", err, "replica", index)
 			}
 			cluster.runResults <- err
 		}(index, replica)

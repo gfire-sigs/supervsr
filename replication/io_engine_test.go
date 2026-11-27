@@ -16,7 +16,7 @@ func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 	}
 	defer closeIOEngine(t, engine)
 
-	first, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{1}})
+	first, err := engine.Submit(ioOperation{Kind: ioWrite, Buffer: []byte{1}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,14 +25,14 @@ func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first write did not start")
 	}
-	second, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{2}})
+	second, err := engine.Submit(ioOperation{Kind: ioWrite, Buffer: []byte{2}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !engine.Cancel(second) {
 		t.Fatal("queued cancellation failed")
 	}
-	if _, err := engine.Submit(ioOperation{Kind: IOSync}); !errors.Is(err, ErrIOBackpressure) {
+	if _, err := engine.Submit(ioOperation{Kind: ioSync}); !errors.Is(err, ErrIOBackpressure) {
 		t.Fatalf("third submit error = %v, want %v", err, ErrIOBackpressure)
 	}
 	close(storage.release)
@@ -48,8 +48,8 @@ func TestIOEngineBackpressureCancellationAndCompletion(t *testing.T) {
 			}
 		case second:
 			secondSeen = true
-			if !errors.Is(completion.Err, ErrIOCanceled) {
-				t.Fatalf("second completion error = %v, want %v", completion.Err, ErrIOCanceled)
+			if !errors.Is(completion.Err, errIOCanceled) {
+				t.Fatalf("second completion error = %v, want %v", completion.Err, errIOCanceled)
 			}
 		default:
 			t.Fatalf("unexpected completion: %+v", completion)
@@ -72,12 +72,12 @@ func TestIOEngineRejectsStaleHandleAfterReuse(t *testing.T) {
 	}
 	defer closeIOEngine(t, engine)
 
-	old, err := engine.Submit(ioOperation{Kind: IOSync})
+	old, err := engine.Submit(ioOperation{Kind: ioSync})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = collectIOCompletions(t, engine, 1)
-	current, err := engine.Submit(ioOperation{Kind: IOSync})
+	current, err := engine.Submit(ioOperation{Kind: ioSync})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,13 +100,14 @@ func TestSynchronousIOEngineCompletesInline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeIOEngine(t, engine)
-	handle, err := engine.Submit(ioOperation{Kind: IOWrite, Buffer: []byte{7}})
+	handle, err := engine.Submit(ioOperation{Kind: ioWrite, Buffer: []byte{7}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var completion ioCompletion
-	if !engine.Poll(&completion) || completion.Handle != handle || completion.Err != nil {
-		t.Fatalf("completion=%+v", completion)
+	polled, err := engine.Poll(&completion)
+	if err != nil || !polled || completion.Handle != handle || completion.Err != nil {
+		t.Fatalf("polled=%t err=%v completion=%+v", polled, err, completion)
 	}
 	if storage.working[0] != 7 {
 		t.Fatalf("stored byte=%d, want 7", storage.working[0])
@@ -123,7 +124,11 @@ func collectIOCompletions(t testing.TB, engine *storageIOEngine, count int) []io
 		case <-engine.Ready():
 			for {
 				var completion ioCompletion
-				if !engine.Poll(&completion) {
+				polled, err := engine.Poll(&completion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !polled {
 					break
 				}
 				completions = append(completions, completion)
@@ -169,3 +174,25 @@ func (storage *blockingStorage) Resize(_ uint64) error { return nil }
 func (storage *blockingStorage) Size() (uint64, error) { return 0, nil }
 func (storage *blockingStorage) SyncParent() error     { return nil }
 func (storage *blockingStorage) Close() error          { return nil }
+
+func TestIOEngineInvariantFaultReturnsErrorInsteadOfPanicking(t *testing.T) {
+	storage := newBlockingStorage()
+	close(storage.release)
+	engine, err := newIOEngine(storage, 1, 0, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = engine.Close(context.Background()) }()
+
+	// Simulate an incomplete slot entering the ready ring.
+	if !engine.ready.TryPush(0) {
+		t.Fatal("push ready index failed")
+	}
+	var completion ioCompletion
+	if polled, pollErr := engine.Poll(&completion); polled || !errors.Is(pollErr, ErrReplicaInvariant) {
+		t.Fatalf("Poll = (%t, %v), want (false, ErrReplicaInvariant)", polled, pollErr)
+	}
+	if _, submitErr := engine.Submit(ioOperation{Kind: ioSync}); !errors.Is(submitErr, ErrReplicaInvariant) {
+		t.Fatalf("Submit after fault = %v, want ErrReplicaInvariant", submitErr)
+	}
+}

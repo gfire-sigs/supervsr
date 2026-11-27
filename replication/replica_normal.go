@@ -119,6 +119,7 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 			case ready && cached.Release != header.Release:
 				replica.sendEviction(client, protocol.EvictionSessionReleaseMismatch)
 			case ready && replyRequestChecksum(&cached) == header.HeaderChecksum:
+				replica.metrics.clientDuplicates.Add(1)
 				replica.sendCachedReply(client, session, 0)
 			default:
 				replica.metrics.clientForks.Add(1)
@@ -136,6 +137,7 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		})
 		switch decision {
 		case sessionDuplicate:
+			replica.metrics.clientDuplicates.Add(1)
 			replica.sendCachedReply(client, protocol.Session(binary.LittleEndian.Uint64(header.Fields[48:56])), protocol.RequestNo(binary.LittleEndian.Uint32(header.Fields[64:68])))
 			return false
 		case sessionClientFork:
@@ -193,7 +195,12 @@ func (replica *Replica) handleRequest(message *Message, header protocol.Header, 
 		return replica.queueRequest(message, sample)
 	}
 	if err := replica.createPrepare(header, body, sample); err != nil {
-		if errors.Is(err, ErrIOBackpressure) || errors.Is(err, protocol.ErrFramePoolEmpty) {
+		if errors.Is(err, ErrIOBackpressure) {
+			replica.metrics.ioBackpressure.Add(1)
+			return replica.queueRequest(message, sample)
+		}
+		if errors.Is(err, protocol.ErrFramePoolEmpty) {
+			replica.metrics.framePoolBackpressure.Add(1)
 			return replica.queueRequest(message, sample)
 		}
 		replica.fail(err)
@@ -288,6 +295,9 @@ func (replica *Replica) sendEviction(client protocol.ClientID, reason protocol.E
 	header.Fields[127] = byte(reason)
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendClient(client, message)
+		if replica.metrics != nil {
+			replica.metrics.clientEvictions.Add(1)
+		}
 	}
 	message.Release()
 }
@@ -362,6 +372,9 @@ func (replica *Replica) createPrepare(request protocol.Header, requestBody []byt
 		prepare.Release()
 		return ErrReplicaBackpressure
 	}
+	if replica.pipelineLen > 0 {
+		replica.pipelineEntry(replica.pipelineLen - 1).createdMonotonic = sample.Monotonic
+	}
 	replica.metrics.preparesCreated.Add(1)
 	replica.deps.MessageBus.BroadcastReplicas(prepare)
 	replica.failureDetector.Signal(sample.Monotonic)
@@ -412,7 +425,7 @@ func (replica *Replica) acceptPrepare(message *Message, header protocol.Header) 
 		return false
 	}
 	handle, err := replica.io.Submit(ioOperation{
-		Kind:            IOWALAppend,
+		Kind:            ioWALAppend,
 		Buffer:          frame,
 		walJournal:      replica.wal,
 		ReusableThrough: replica.checkpoint.PrepareOp(),
@@ -426,7 +439,7 @@ func (replica *Replica) acceptPrepare(message *Message, header protocol.Header) 
 		return false
 	}
 	entry.io = handle
-	entry.ioKind = IOWALAppend
+	entry.ioKind = ioWALAppend
 	replica.lastPrepareTimestamp = prepareTimestamp(&header)
 	return true
 }
@@ -446,19 +459,19 @@ func (replica *Replica) handleIOCompletion(completion ioCompletion) {
 	}
 	for index := range replica.repairReads {
 		read := &replica.repairReads[index]
-		if !read.busy || read.handle != completion.Handle || completion.Kind != IORead {
+		if !read.busy || read.handle != completion.Handle || completion.Kind != ioRead {
 			continue
 		}
 		replica.finishRepairRead(read, completion)
 		return
 	}
-	if replica.repairWrite.busy && replica.repairWrite.handle == completion.Handle && completion.Kind == IOWALAppend {
+	if replica.repairWrite.busy && replica.repairWrite.handle == completion.Handle && completion.Kind == ioWALAppend {
 		replica.finishRepairWrite(completion)
 		return
 	}
 	for index := range replica.duplicateReads {
 		read := &replica.duplicateReads[index]
-		if !read.busy || read.handle != completion.Handle || completion.Kind != IOReplyRead {
+		if !read.busy || read.handle != completion.Handle || completion.Kind != ioReplyRead {
 			continue
 		}
 		replica.finishDuplicateRead(read, completion)
@@ -469,10 +482,10 @@ func (replica *Replica) handleIOCompletion(completion ioCompletion) {
 		if entry.io != completion.Handle || entry.ioKind != completion.Kind {
 			continue
 		}
-		entry.io = IOHandle{}
+		entry.io = ioHandle{}
 		entry.ioKind = 0
 		if completion.Err != nil {
-			if completion.Kind == IOReplyWrite {
+			if completion.Kind == ioReplyWrite {
 				replica.sessions.Abort(entry.replyPlan)
 			}
 			replica.metrics.storageFailures.Add(1)
@@ -480,8 +493,9 @@ func (replica *Replica) handleIOCompletion(completion ioCompletion) {
 			return
 		}
 		switch completion.Kind {
-		case IOWALAppend:
+		case ioWALAppend:
 			entry.durable = true
+			replica.metrics.walWrites.Add(1)
 			replica.metrics.preparesDurable.Add(1)
 			if !replica.canAcknowledge(entry) {
 				return
@@ -491,9 +505,9 @@ func (replica *Replica) handleIOCompletion(completion ioCompletion) {
 			} else {
 				replica.sendPrepareOK(entry)
 			}
-		case IOReplyWrite:
+		case ioReplyWrite:
 			replica.finishCommit(entry)
-		case IOSuperblockPersist:
+		case ioSuperblockPersist:
 			replica.finishCheckpointPersistence(entry)
 		default:
 			replica.fail(ErrReplicaInvariant)
@@ -560,8 +574,14 @@ func (replica *Replica) countPrepareAck(entry *pipelineEntry, author protocol.Re
 	}
 	entry.acks |= bit
 	replica.metrics.prepareAcks.Add(1)
-	if countAckBits(entry.acks) >= replica.quorums.Replication {
+	if !entry.quorum && countAckBits(entry.acks) >= replica.quorums.Replication {
 		entry.quorum = true
+		if entry.createdMonotonic != 0 && replica.deps.Clock != nil && replica.metrics != nil {
+			latency := elapsedSince(entry.createdMonotonic, replica.deps.Clock.Now().Monotonic)
+			replica.metrics.quorumLatencyNanos.Store(latency)
+			replica.metrics.quorumLatencySamples.Add(1)
+			replica.metrics.quorumLatencyTotalNanos.Add(latency)
+		}
 		if replica.pipelineLen > 0 && entry == replica.pipelineEntry(0) {
 			replica.timers.abdication.Reset()
 			replica.timers.prepare.Reset()
@@ -661,7 +681,7 @@ func (replica *Replica) acknowledgeDurablePrepares() {
 
 func (replica *Replica) canAcknowledge(entry *pipelineEntry) bool {
 	normalView := replica.status == StatusNormal && replica.view == replica.durableView && replica.logView == replica.view
-	if !entry.durable || !normalView || replica.viewIO != (IOHandle{}) || uint8(replica.local) >= replica.membership.ActiveCount {
+	if !entry.durable || !normalView || replica.viewIO != (ioHandle{}) || uint8(replica.local) >= replica.membership.ActiveCount {
 		return false
 	}
 	checkpoint := replica.checkpoint.PrepareOp()
@@ -793,7 +813,7 @@ func (replica *Replica) executeEntry(entry *pipelineEntry) {
 		session, found = replica.sessions.Session(client)
 		if !found {
 			reply.Release()
-			replica.fail(errors.Join(ErrReplicaInvariant, ErrSessionEncoding))
+			replica.fail(errors.Join(ErrReplicaInvariant, errSessionEncoding))
 			return
 		}
 	}
@@ -816,14 +836,14 @@ func (replica *Replica) executeEntry(entry *pipelineEntry) {
 		replica.fail(err)
 		return
 	}
-	handle, err := replica.io.Submit(ioOperation{Kind: IOReplyWrite, Offset: uint64(plan.Slot), Buffer: frame, durableReplyStore: replica.replies})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioReplyWrite, Offset: uint64(plan.Slot), Buffer: frame, durableReplyStore: replica.replies})
 	if err != nil {
 		replica.sessions.Abort(plan)
 		replica.fail(err)
 		return
 	}
 	entry.io = handle
-	entry.ioKind = IOReplyWrite
+	entry.ioKind = ioReplyWrite
 }
 
 func (replica *Replica) commitApplication(entry *pipelineEntry, reply []byte) (int, error) {
@@ -930,7 +950,7 @@ func (replica *Replica) sendCachedReply(client protocol.ClientID, session protoc
 			continue
 		}
 		handle, err := replica.io.Submit(ioOperation{
-			Kind:              IOReplyRead,
+			Kind:              ioReplyRead,
 			Offset:            uint64(slot),
 			Buffer:            read.buffer,
 			durableReplyStore: replica.replies,
@@ -966,7 +986,7 @@ func (replica *Replica) finishDuplicateRead(read *duplicateRead, completion ioCo
 	header := read.header
 	client := read.client
 	read.busy = false
-	read.handle = IOHandle{}
+	read.handle = ioHandle{}
 	read.header = protocol.Header{}
 	read.client = protocol.ClientID{}
 	if completion.Err != nil || completion.Size < protocol.HeaderSize || completion.Size != uint64(header.Size) {

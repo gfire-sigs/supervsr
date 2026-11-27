@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -26,17 +27,31 @@ func TestBlockRepairBudgetRetryExpiryAndFulfillment(t *testing.T) {
 	if !budget.Reserve(2, []BlockReference{first}, uint64(101*time.Millisecond)) {
 		t.Fatal("eligible cross-peer retry rejected")
 	}
-	if released := budget.Fulfill(first); released != 2 {
-		t.Fatalf("released = %d, want 2", released)
+	if released, err := budget.Fulfill(first); err != nil || released != 2 {
+		t.Fatalf("released = %d, err = %v; want 2, nil", released, err)
 	}
 	if budget.Outstanding(first) {
 		t.Fatal("fulfilled reference remains outstanding")
 	}
-	if expired := budget.Expire(uint64(251 * time.Millisecond)); expired != 1 {
-		t.Fatalf("expired = %d, want 1", expired)
+	if expired, err := budget.Expire(uint64(251 * time.Millisecond)); err != nil || expired != 1 {
+		t.Fatalf("expired = %d, err = %v; want 1, nil", expired, err)
 	}
 	if !budget.valid() {
 		t.Fatal("budget invariant failed")
+	}
+}
+
+func TestBlockRepairBudgetInvariantViolationReturnsError(t *testing.T) {
+	budget, err := newBlockRepairBudget(3, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget.requestsAvailable = budget.batchMax + 1
+	if _, err := budget.Fulfill(BlockReference{Address: 1, Checksum: protocol.Checksum{1}}); !errors.Is(err, ErrReplicaInvariant) {
+		t.Fatalf("Fulfill error = %v, want ErrReplicaInvariant", err)
+	}
+	if _, err := budget.Expire(1); !errors.Is(err, ErrReplicaInvariant) {
+		t.Fatalf("Expire error = %v, want ErrReplicaInvariant", err)
 	}
 }
 
@@ -75,6 +90,8 @@ func BenchmarkBlockRepairBudget(b *testing.B) {
 		if !ok || !budget.Reserve(peer, []BlockReference{reference}, uint64(index)*blockRepairExpires) {
 			b.Fatal("budget operation failed")
 		}
-		budget.Fulfill(reference)
+		if _, err := budget.Fulfill(reference); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

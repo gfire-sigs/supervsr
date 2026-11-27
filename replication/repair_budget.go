@@ -39,9 +39,9 @@ func newJournalRepairBudget(active uint8, local protocol.ReplicaIndex) (journalR
 	return budget, nil
 }
 
-func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *deterministicRandom) (protocol.ReplicaIndex, bool) {
+func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *deterministicRandom) (protocol.ReplicaIndex, bool, error) {
 	if random == nil || budget.outstanding == budget.capacity {
-		return 0, false
+		return 0, false, nil
 	}
 	explore := random.Uniform(10) == 0
 	selected := protocol.ReplicaIndex(0)
@@ -68,7 +68,7 @@ func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *d
 		}
 	}
 	if !found {
-		return 0, false
+		return 0, false, nil
 	}
 	for index := range budget.entries {
 		entry := &budget.entries[index]
@@ -77,13 +77,15 @@ func (budget *journalRepairBudget) Reserve(op protocol.Op, now uint64, random *d
 		}
 		*entry = journalRepairEntry{busy: true, peer: selected, op: op, started: now}
 		budget.outstanding++
-		budget.assertInvariant()
-		return selected, true
+		if err := budget.checkInvariant(); err != nil {
+			return 0, false, err
+		}
+		return selected, true, nil
 	}
-	panic("replication: journal repair budget has no free entry")
+	return 0, false, ErrReplicaInvariant
 }
 
-func (budget *journalRepairBudget) Complete(op protocol.Op, now uint64) uint8 {
+func (budget *journalRepairBudget) Complete(op protocol.Op, now uint64) (uint8, error) {
 	released := uint8(0)
 	for index := range budget.entries {
 		entry := &budget.entries[index]
@@ -94,12 +96,17 @@ func (budget *journalRepairBudget) Complete(op protocol.Op, now uint64) uint8 {
 		*entry = journalRepairEntry{}
 		released++
 	}
+	if released > budget.outstanding {
+		return 0, ErrReplicaInvariant
+	}
 	budget.outstanding -= released
-	budget.assertInvariant()
-	return released
+	if err := budget.checkInvariant(); err != nil {
+		return 0, err
+	}
+	return released, nil
 }
 
-func (budget *journalRepairBudget) Expire(now uint64) uint8 {
+func (budget *journalRepairBudget) Expire(now uint64) (uint8, error) {
 	expired := uint8(0)
 	for index := range budget.entries {
 		entry := &budget.entries[index]
@@ -118,9 +125,14 @@ func (budget *journalRepairBudget) Expire(now uint64) uint8 {
 		*entry = journalRepairEntry{}
 		expired++
 	}
+	if expired > budget.outstanding {
+		return 0, ErrReplicaInvariant
+	}
 	budget.outstanding -= expired
-	budget.assertInvariant()
-	return expired
+	if err := budget.checkInvariant(); err != nil {
+		return 0, err
+	}
+	return expired, nil
 }
 
 func (budget *journalRepairBudget) peerEligible(peer protocol.ReplicaIndex, op protocol.Op) bool {
@@ -144,9 +156,9 @@ func (budget *journalRepairBudget) observe(peer protocol.ReplicaIndex, sample ui
 	budget.ewma[peer] = (old/5)*4 + (old%5*4+sample)/5
 }
 
-func (budget *journalRepairBudget) assertInvariant() {
+func (budget *journalRepairBudget) checkInvariant() error {
 	if budget.outstanding > budget.capacity {
-		panic("replication: journal repair budget exhausted")
+		return ErrReplicaInvariant
 	}
 	count := uint8(0)
 	for index := range budget.entries {
@@ -155,8 +167,9 @@ func (budget *journalRepairBudget) assertInvariant() {
 		}
 	}
 	if count != budget.outstanding {
-		panic("replication: journal repair budget invariant")
+		return ErrReplicaInvariant
 	}
+	return nil
 }
 
 func (budget *journalRepairBudget) HasPending(op protocol.Op) bool {
@@ -168,12 +181,12 @@ func (budget *journalRepairBudget) HasPending(op protocol.Op) bool {
 	return false
 }
 
-func (budget *journalRepairBudget) Reset() {
+func (budget *journalRepairBudget) Reset() error {
 	for index := range budget.entries {
 		budget.entries[index] = journalRepairEntry{}
 	}
 	budget.outstanding = 0
-	budget.assertInvariant()
+	return budget.checkInvariant()
 }
 
 func elapsedSince(start, now uint64) uint64 {

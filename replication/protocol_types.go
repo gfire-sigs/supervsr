@@ -30,9 +30,11 @@ const (
 )
 
 const (
-	OperationReserved       = protocol.OperationReserved
-	OperationRoot           = protocol.OperationRoot
-	OperationRegister       = protocol.OperationRegister
+	OperationReserved = protocol.OperationReserved
+	OperationRoot     = protocol.OperationRoot
+	OperationRegister = protocol.OperationRegister
+	// OperationReconfigure is validation-only in format version 1: it returns
+	// a ReconfigurationResult code without changing membership or frame epoch.
 	OperationReconfigure    = protocol.OperationReconfigure
 	OperationPulse          = protocol.OperationPulse
 	OperationUpgrade        = protocol.OperationUpgrade

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -77,7 +78,7 @@ func TestOpenResumesInstalledCheckpointWithMissingCommittedSuffix(t *testing.T) 
 	storage.Crash()
 	config := Config{Group: format.Group, Membership: format.Membership, Cluster: format.Cluster, Process: DefaultProcessConfig(), CurrentRelease: 1, ClientReleaseMin: 1}
 	machine := &testStateMachine{capacities: StateMachineCapacities{RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax), PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1}}
-	replica, err := Open(context.Background(), config, Dependencies{Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{}, Entropy: bytes.NewReader(make([]byte, 8)), StateMachine: machine, SynchronousIO: true})
+	replica, err := Open(simhook.WithIOOptions(context.Background(), simhook.IOOptions{SynchronousIO: true}), config, Dependencies{Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{}, Entropy: bytes.NewReader(make([]byte, 8)), StateMachine: machine})
 	if err != nil {
 		t.Fatalf("installed checkpoint rejected before suffix repair: %v", err)
 	}
@@ -213,10 +214,10 @@ func TestStateSyncActivatesCheckpointReleaseBeforeOpeningBlocks(t *testing.T) {
 		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 	}}
-	replica, err := newReplica(config, Dependencies{
+	replica, err := newReplicaWithBlocks(config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
-		Entropy: bytes.NewReader(make([]byte, 8)), StateMachine: machine, ReleaseExecutor: executor, SynchronousIO: true,
-	}, initial, wal, replies, sessions, superblocks)
+		Entropy: bytes.NewReader(make([]byte, 8)), StateMachine: machine, ReleaseExecutor: executor,
+	}, simhook.IOOptions{SynchronousIO: true}, initial, wal, replies, sessions, superblocks, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

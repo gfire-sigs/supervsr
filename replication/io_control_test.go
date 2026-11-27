@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -28,9 +29,9 @@ func (storage *phaseStorage) Sync() error {
 	return nil
 }
 
-func controlledEngine(t testing.TB, storage Storage, count uint32) (*storageIOEngine, *IOController) {
+func controlledEngine(t testing.TB, storage Storage, count uint32) (*storageIOEngine, *ioController) {
 	t.Helper()
-	controller := NewIOController()
+	controller := simhook.NewIOController()
 	engine, err := newIOEngine(storage, count, 0, false, controller)
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +40,7 @@ func controlledEngine(t testing.TB, storage Storage, count uint32) (*storageIOEn
 	return engine, controller
 }
 
-func submitControlled(t testing.TB, engine *storageIOEngine, operation ioOperation) IOHandle {
+func submitControlled(t testing.TB, engine *storageIOEngine, operation ioOperation) ioHandle {
 	t.Helper()
 	handle, err := engine.Submit(operation)
 	if err != nil {
@@ -48,9 +49,9 @@ func submitControlled(t testing.TB, engine *storageIOEngine, operation ioOperati
 	return handle
 }
 
-func advancePhase(t testing.TB, controller *IOController, handle IOHandle, phase IOPhase) {
+func advancePhase(t testing.TB, controller *ioController, handle ioHandle, phase ioPhase) {
 	t.Helper()
-	events := make([]IOEvent, controller.PendingCount())
+	events := make([]ioEvent, controller.PendingCount())
 	n := controller.Pending(events)
 	found := false
 	for _, event := range events[:n] {
@@ -70,10 +71,14 @@ func advancePhase(t testing.TB, controller *IOController, handle IOHandle, phase
 	}
 }
 
-func pollControlled(t testing.TB, engine *storageIOEngine, handle IOHandle, want error) {
+func pollControlled(t testing.TB, engine *storageIOEngine, handle ioHandle, want error) {
 	t.Helper()
 	var completion ioCompletion
-	if !engine.Poll(&completion) {
+	polled, err := engine.Poll(&completion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !polled {
 		t.Fatal("missing published completion")
 	}
 	if completion.Handle != handle || !errors.Is(completion.Err, want) {
@@ -85,7 +90,7 @@ func TestIOControllerWALCrashBoundaries(t *testing.T) {
 	for physicalSteps := 0; physicalSteps <= 4; physicalSteps++ {
 		t.Run(fmt.Sprintf("after_%d_effects", physicalSteps), func(t *testing.T) {
 			config := compactTestClusterConfig()
-			layout, _ := DeriveWALLayout(config)
+			layout, _ := deriveWALLayout(config)
 			storage := newPhaseStorage(t, layout.BlockBase)
 			wal, err := newWAL(storage, config, protocol.GroupID{1}, 3)
 			if err != nil {
@@ -93,15 +98,15 @@ func TestIOControllerWALCrashBoundaries(t *testing.T) {
 			}
 			engine, controller := controlledEngine(t, storage, 1)
 			frame := validPrepareFrame(t, config, 1)
-			handle := submitControlled(t, engine, ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: frame})
-			advancePhase(t, controller, handle, IOPhaseQueued)
-			phases := [...]IOPhase{IOPhaseWrite, IOPhaseSync, IOPhaseWrite, IOPhaseSync}
+			handle := submitControlled(t, engine, ioOperation{Kind: ioWALAppend, walJournal: wal, Buffer: frame})
+			advancePhase(t, controller, handle, ioPhaseQueued)
+			phases := [...]ioPhase{ioPhaseWrite, ioPhaseSync, ioPhaseWrite, ioPhaseSync}
 			for _, phase := range phases[:physicalSteps] {
 				advancePhase(t, controller, handle, phase)
 			}
 			var completion ioCompletion
-			if engine.Poll(&completion) {
-				t.Fatal("completion escaped before delivery phase")
+			if polled, err := engine.Poll(&completion); err != nil || polled {
+				t.Fatalf("completion escaped before delivery phase: polled=%t err=%v", polled, err)
 			}
 			if err := controller.Crash(); err != nil {
 				t.Fatal(err)
@@ -109,7 +114,7 @@ func TestIOControllerWALCrashBoundaries(t *testing.T) {
 			if err := controller.Drain(); err != nil {
 				t.Fatal(err)
 			}
-			pollControlled(t, engine, handle, ErrIOCanceled)
+			pollControlled(t, engine, handle, errIOCanceled)
 			copy(storage.bytes, storage.durable)
 			prepareOffset := layout.PrepareBase + layout.PrepareStride
 			headerOffset := layout.HeaderBase + protocol.HeaderSize
@@ -129,7 +134,7 @@ func TestIOControllerReplySyncAndCompletionAreSeparate(t *testing.T) {
 	for _, syncReply := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sync_%t", syncReply), func(t *testing.T) {
 			config := compactTestClusterConfig()
-			layout, _ := DeriveWALLayout(config)
+			layout, _ := deriveWALLayout(config)
 			storage := newPhaseStorage(t, layout.BlockBase)
 			store, err := newDurableReplyStore(storage, config, protocol.GroupID{9}, 3)
 			if err != nil {
@@ -137,15 +142,15 @@ func TestIOControllerReplySyncAndCompletionAreSeparate(t *testing.T) {
 			}
 			engine, controller := controlledEngine(t, storage, 1)
 			frame, header := makeReplyFrame(t, protocol.ClientID{1}, 1, []byte("reply"))
-			handle := submitControlled(t, engine, ioOperation{Kind: IOReplyWrite, durableReplyStore: store, Buffer: frame})
-			advancePhase(t, controller, handle, IOPhaseQueued)
-			advancePhase(t, controller, handle, IOPhaseWrite)
+			handle := submitControlled(t, engine, ioOperation{Kind: ioReplyWrite, durableReplyStore: store, Buffer: frame})
+			advancePhase(t, controller, handle, ioPhaseQueued)
+			advancePhase(t, controller, handle, ioPhaseWrite)
 			if syncReply {
-				advancePhase(t, controller, handle, IOPhaseSync)
+				advancePhase(t, controller, handle, ioPhaseSync)
 			}
 			var completion ioCompletion
-			if engine.Poll(&completion) {
-				t.Fatal("reply completion delivered without scheduler permission")
+			if polled, err := engine.Poll(&completion); err != nil || polled {
+				t.Fatalf("reply completion delivered without scheduler permission: polled=%t err=%v", polled, err)
 			}
 			if err := controller.Crash(); err != nil {
 				t.Fatal(err)
@@ -166,24 +171,24 @@ func TestIOControllerReplySyncAndCompletionAreSeparate(t *testing.T) {
 func TestIOControllerCancellationReorderingAndStaleHandles(t *testing.T) {
 	storage := newPhaseStorage(t, 32)
 	engine, controller := controlledEngine(t, storage, 2)
-	first := submitControlled(t, engine, ioOperation{Kind: IOWrite, Buffer: []byte{1}})
-	second := submitControlled(t, engine, ioOperation{Kind: IOWrite, Offset: 1, Buffer: []byte{2}})
+	first := submitControlled(t, engine, ioOperation{Kind: ioWrite, Buffer: []byte{1}})
+	second := submitControlled(t, engine, ioOperation{Kind: ioWrite, Offset: 1, Buffer: []byte{2}})
 	if !engine.Cancel(first) {
 		t.Fatal("queued request not canceled")
 	}
-	advancePhase(t, controller, second, IOPhaseQueued)
+	advancePhase(t, controller, second, ioPhaseQueued)
 	if engine.Cancel(second) {
 		t.Fatal("running request canceled")
 	}
-	advancePhase(t, controller, second, IOPhaseWrite)
-	advancePhase(t, controller, second, IOPhaseCompletion)
+	advancePhase(t, controller, second, ioPhaseWrite)
+	advancePhase(t, controller, second, ioPhaseCompletion)
 	pollControlled(t, engine, second, nil)
-	reused := submitControlled(t, engine, ioOperation{Kind: IOWrite, Offset: 2, Buffer: []byte{3}})
-	if engine.Cancel(second) || !errors.Is(controller.Advance(second), ErrIOHandle) {
+	reused := submitControlled(t, engine, ioOperation{Kind: ioWrite, Offset: 2, Buffer: []byte{3}})
+	if engine.Cancel(second) || !errors.Is(controller.Advance(second), errIOHandle) {
 		t.Fatal("stale handle affected reused slot")
 	}
-	advancePhase(t, controller, first, IOPhaseCompletion)
-	pollControlled(t, engine, first, ErrIOCanceled)
+	advancePhase(t, controller, first, ioPhaseCompletion)
+	pollControlled(t, engine, first, errIOCanceled)
 	if err := controller.Drain(); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +200,7 @@ func TestIOControllerCancellationReorderingAndStaleHandles(t *testing.T) {
 
 func TestIOControllerStoreScratchWaitsButCompletionDoesNot(t *testing.T) {
 	config := compactTestClusterConfig()
-	layout, _ := DeriveWALLayout(config)
+	layout, _ := deriveWALLayout(config)
 	storage := newPhaseStorage(t, layout.BlockBase)
 	store, err := newDurableReplyStore(storage, config, protocol.GroupID{9}, 3)
 	if err != nil {
@@ -204,19 +209,19 @@ func TestIOControllerStoreScratchWaitsButCompletionDoesNot(t *testing.T) {
 	engine, controller := controlledEngine(t, storage, 2)
 	firstFrame, firstHeader := makeReplyFrame(t, protocol.ClientID{1}, 1, []byte("first"))
 	secondFrame, secondHeader := makeReplyFrame(t, protocol.ClientID{2}, 2, []byte("second"))
-	first := submitControlled(t, engine, ioOperation{Kind: IOReplyWrite, durableReplyStore: store, Buffer: firstFrame})
-	second := submitControlled(t, engine, ioOperation{Kind: IOReplyWrite, durableReplyStore: store, Offset: 1, Buffer: secondFrame})
-	advancePhase(t, controller, first, IOPhaseQueued)
+	first := submitControlled(t, engine, ioOperation{Kind: ioReplyWrite, durableReplyStore: store, Buffer: firstFrame})
+	second := submitControlled(t, engine, ioOperation{Kind: ioReplyWrite, durableReplyStore: store, Offset: 1, Buffer: secondFrame})
+	advancePhase(t, controller, first, ioPhaseQueued)
 	if !errors.Is(controller.Advance(second), ErrIOBackpressure) {
 		t.Fatal("second writer reused scratch before first write")
 	}
-	advancePhase(t, controller, first, IOPhaseWrite)
-	advancePhase(t, controller, first, IOPhaseSync)
-	for _, phase := range []IOPhase{IOPhaseQueued, IOPhaseWrite, IOPhaseSync, IOPhaseCompletion} {
+	advancePhase(t, controller, first, ioPhaseWrite)
+	advancePhase(t, controller, first, ioPhaseSync)
+	for _, phase := range []ioPhase{ioPhaseQueued, ioPhaseWrite, ioPhaseSync, ioPhaseCompletion} {
 		advancePhase(t, controller, second, phase)
 	}
 	pollControlled(t, engine, second, nil)
-	advancePhase(t, controller, first, IOPhaseCompletion)
+	advancePhase(t, controller, first, ioPhaseCompletion)
 	pollControlled(t, engine, first, nil)
 	for slot, expected := range []struct {
 		frame  []byte
@@ -233,7 +238,7 @@ func TestIOControllerFailedWALPhaseDoesNotPublishDurability(t *testing.T) {
 	for failure := 1; failure <= 4; failure++ {
 		t.Run(fmt.Sprintf("effect_%d", failure), func(t *testing.T) {
 			config := compactTestClusterConfig()
-			layout, _ := DeriveWALLayout(config)
+			layout, _ := deriveWALLayout(config)
 			storage := newPhaseStorage(t, layout.BlockBase)
 			storage.failAt = failure
 			wal, err := newWAL(storage, config, protocol.GroupID{1}, 3)
@@ -241,7 +246,7 @@ func TestIOControllerFailedWALPhaseDoesNotPublishDurability(t *testing.T) {
 				t.Fatal(err)
 			}
 			engine, controller := controlledEngine(t, storage, 1)
-			handle := submitControlled(t, engine, ioOperation{Kind: IOWALAppend, walJournal: wal, Buffer: validPrepareFrame(t, config, 1)})
+			handle := submitControlled(t, engine, ioOperation{Kind: ioWALAppend, walJournal: wal, Buffer: validPrepareFrame(t, config, 1)})
 			if err := controller.Drain(); err != nil {
 				t.Fatal(err)
 			}
@@ -279,16 +284,16 @@ func TestIOControllerOldBlockWriteOverlapsCheckpointPersist(t *testing.T) {
 	next.Sequence++
 	next.ParentChecksum = initial.Checksum
 	engine, controller := controlledEngine(t, storage, 2)
-	old := submitControlled(t, engine, ioOperation{Kind: IOWrite, Offset: blockOffset, Buffer: bytes.Repeat([]byte{7}, SectorSize)})
-	advancePhase(t, controller, old, IOPhaseQueued)
-	checkpoint := submitControlled(t, engine, ioOperation{Kind: IOSuperblockPersist, superblockStore: store, superblockRecord: next})
-	advancePhase(t, controller, checkpoint, IOPhaseQueued)
+	old := submitControlled(t, engine, ioOperation{Kind: ioWrite, Offset: blockOffset, Buffer: bytes.Repeat([]byte{7}, SectorSize)})
+	advancePhase(t, controller, old, ioPhaseQueued)
+	checkpoint := submitControlled(t, engine, ioOperation{Kind: ioSuperblockPersist, superblockStore: store, superblockRecord: next})
+	advancePhase(t, controller, checkpoint, ioPhaseQueued)
 	copies, _ := superblockWriteCopies(validation.Cluster.SuperblockCopies)
 	for range copies {
-		advancePhase(t, controller, checkpoint, IOPhaseWrite)
-		advancePhase(t, controller, checkpoint, IOPhaseSync)
+		advancePhase(t, controller, checkpoint, ioPhaseWrite)
+		advancePhase(t, controller, checkpoint, ioPhaseSync)
 	}
-	advancePhase(t, controller, checkpoint, IOPhaseCompletion)
+	advancePhase(t, controller, checkpoint, ioPhaseCompletion)
 	pollControlled(t, engine, checkpoint, nil)
 	if store.Current().Sequence != next.Sequence {
 		t.Fatal("checkpoint blocked behind unrelated old block write")
@@ -296,8 +301,8 @@ func TestIOControllerOldBlockWriteOverlapsCheckpointPersist(t *testing.T) {
 	if !allZeroBytes(storage.bytes[blockOffset:]) {
 		t.Fatal("held block write ran during checkpoint work")
 	}
-	advancePhase(t, controller, old, IOPhaseWrite)
-	advancePhase(t, controller, old, IOPhaseCompletion)
+	advancePhase(t, controller, old, ioPhaseWrite)
+	advancePhase(t, controller, old, ioPhaseCompletion)
 	pollControlled(t, engine, old, nil)
 	if !bytes.Equal(storage.bytes[blockOffset:], bytes.Repeat([]byte{7}, SectorSize)) {
 		t.Fatal("old block write was excluded instead of executed")
@@ -305,7 +310,7 @@ func TestIOControllerOldBlockWriteOverlapsCheckpointPersist(t *testing.T) {
 	current := store.Current()
 	current.Sequence++
 	current.ParentChecksum = store.Current().Checksum
-	followup := submitControlled(t, engine, ioOperation{Kind: IOSuperblockPersist, superblockStore: store, superblockRecord: current})
+	followup := submitControlled(t, engine, ioOperation{Kind: ioSuperblockPersist, superblockStore: store, superblockRecord: current})
 	if err := controller.Drain(); err != nil {
 		t.Fatal(err)
 	}
@@ -317,31 +322,31 @@ func TestIOControllerReadAndResizeAwaitPhysicalPhase(t *testing.T) {
 	copy(storage.bytes[2:], []byte{4, 5})
 	engine, controller := controlledEngine(t, storage, 1)
 	buffer := []byte{9, 9}
-	read := submitControlled(t, engine, ioOperation{Kind: IORead, Offset: 2, Buffer: buffer})
-	advancePhase(t, controller, read, IOPhaseQueued)
+	read := submitControlled(t, engine, ioOperation{Kind: ioRead, Offset: 2, Buffer: buffer})
+	advancePhase(t, controller, read, ioPhaseQueued)
 	if !bytes.Equal(buffer, []byte{9, 9}) {
 		t.Fatal("read ran in start phase")
 	}
-	advancePhase(t, controller, read, IOPhaseRead)
+	advancePhase(t, controller, read, ioPhaseRead)
 	if !bytes.Equal(buffer, []byte{4, 5}) {
 		t.Fatalf("read data = %v", buffer)
 	}
 	var completion ioCompletion
-	if engine.Poll(&completion) {
-		t.Fatal("read published before completion phase")
+	if polled, err := engine.Poll(&completion); err != nil || polled {
+		t.Fatalf("read published before completion phase: polled=%t err=%v", polled, err)
 	}
-	advancePhase(t, controller, read, IOPhaseCompletion)
+	advancePhase(t, controller, read, ioPhaseCompletion)
 	pollControlled(t, engine, read, nil)
-	resize := submitControlled(t, engine, ioOperation{Kind: IOResize, Size: 16})
-	advancePhase(t, controller, resize, IOPhaseQueued)
+	resize := submitControlled(t, engine, ioOperation{Kind: ioResize, Size: 16})
+	advancePhase(t, controller, resize, ioPhaseQueued)
 	if size, _ := storage.Size(); size != 8 {
 		t.Fatalf("resize ran in start phase: %d", size)
 	}
-	advancePhase(t, controller, resize, IOPhaseResize)
+	advancePhase(t, controller, resize, ioPhaseResize)
 	if size, _ := storage.Size(); size != 16 {
 		t.Fatalf("resized size = %d", size)
 	}
-	advancePhase(t, controller, resize, IOPhaseCompletion)
+	advancePhase(t, controller, resize, ioPhaseCompletion)
 	pollControlled(t, engine, resize, nil)
 }
 
@@ -349,7 +354,7 @@ func TestIOControllerReplyFailureIsTerminal(t *testing.T) {
 	for failure := 1; failure <= 2; failure++ {
 		t.Run(fmt.Sprintf("effect_%d", failure), func(t *testing.T) {
 			config := compactTestClusterConfig()
-			layout, _ := DeriveWALLayout(config)
+			layout, _ := deriveWALLayout(config)
 			storage := newPhaseStorage(t, layout.BlockBase)
 			storage.failAt = failure
 			store, err := newDurableReplyStore(storage, config, protocol.GroupID{9}, 3)
@@ -358,7 +363,7 @@ func TestIOControllerReplyFailureIsTerminal(t *testing.T) {
 			}
 			engine, controller := controlledEngine(t, storage, 1)
 			frame, header := makeReplyFrame(t, protocol.ClientID{1}, 1, []byte("reply"))
-			handle := submitControlled(t, engine, ioOperation{Kind: IOReplyWrite, durableReplyStore: store, Buffer: frame})
+			handle := submitControlled(t, engine, ioOperation{Kind: ioReplyWrite, durableReplyStore: store, Buffer: frame})
 			if err := controller.Drain(); err != nil {
 				t.Fatal(err)
 			}
@@ -383,13 +388,13 @@ func TestIOControllerCannotRebindAcrossIncarnations(t *testing.T) {
 	if err := controller.Crash(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := engine.Submit(ioOperation{Kind: IOSync}); !errors.Is(err, ErrStorageClosed) {
+	if _, err := engine.Submit(ioOperation{Kind: ioSync}); !errors.Is(err, ErrStorageClosed) {
 		t.Fatalf("submit after crash: %v", err)
 	}
 	if _, err := newIOEngine(storage, 1, 0, false, controller); err == nil {
 		t.Fatal("controller rebound to new incarnation")
 	}
-	if _, err := newIOEngine(storage, 1, 0, true, NewIOController()); !errors.Is(err, ErrInvalidConfiguration) {
+	if _, err := newIOEngine(storage, 1, 0, true, simhook.NewIOController()); !errors.Is(err, ErrInvalidConfiguration) {
 		t.Fatalf("mixed synchronous/controlled mode: %v", err)
 	}
 }

@@ -6,14 +6,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 const processHelperEnvironment = "TOYKV_PROCESS_HELPER"
@@ -86,7 +85,7 @@ func runToyKVProcessHelper(t testing.TB) {
 	cluster, err := openCluster(ctx, options{
 		dataDir: os.Getenv("TOYKV_DATA_DIR"), replicas: uint(replicas), commandTimeout: 15 * time.Second,
 		checksumMode: os.Getenv("TOYKV_CHECKSUM"),
-	}, zerolog.Nop())
+	}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

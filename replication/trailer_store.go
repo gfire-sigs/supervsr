@@ -56,7 +56,7 @@ func (store *trailerStore) WriteReserved(allocator *blockSpaceAllocator, address
 	for _, address := range addresses {
 		index, ok := allocator.index(address)
 		if !ok || !allocator.reserved.Test(index) {
-			return trailerReference{}, ErrBlockReservation
+			return trailerReference{}, errBlockReservation
 		}
 	}
 	var previous BlockReference

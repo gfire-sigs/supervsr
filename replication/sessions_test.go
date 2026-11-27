@@ -107,7 +107,7 @@ func TestSessionTableDecodeValidatesBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recovered.DecodeTrailer(corrupt, corruptChecksum); !errors.Is(err, ErrSessionEncoding) {
+	if err := recovered.DecodeTrailer(corrupt, corruptChecksum); !errors.Is(err, errSessionEncoding) {
 		t.Fatalf("free slot mismatch error = %v", err)
 	}
 	if recovered.Count() != 0 {

@@ -10,7 +10,7 @@ import (
 
 func TestWALLayoutMatchesBlockBase(t *testing.T) {
 	cfg := compactTestClusterConfig()
-	layout, ok := DeriveWALLayout(cfg)
+	layout, ok := deriveWALLayout(cfg)
 	if !ok {
 		t.Fatal("layout derivation failed")
 	}
@@ -28,7 +28,7 @@ func TestWALLayoutMatchesBlockBase(t *testing.T) {
 
 func TestWALAppendPersistsBodyBeforeRedundantHeader(t *testing.T) {
 	cfg := compactTestClusterConfig()
-	layout, _ := DeriveWALLayout(cfg)
+	layout, _ := deriveWALLayout(cfg)
 	storage := newScriptedStorage(t, layout.BlockBase)
 	wal, err := newWAL(storage, cfg, protocol.GroupID{1}, 3)
 	if err != nil {
@@ -58,7 +58,7 @@ func TestWALAppendPersistsBodyBeforeRedundantHeader(t *testing.T) {
 
 func TestWALAppendFailureNeverClearsDirty(t *testing.T) {
 	cfg := compactTestClusterConfig()
-	layout, _ := DeriveWALLayout(cfg)
+	layout, _ := deriveWALLayout(cfg)
 	for failAt := 1; failAt <= 4; failAt++ {
 		t.Run(fmt.Sprintf("operation_%d", failAt), func(t *testing.T) {
 			storage := newScriptedStorage(t, layout.BlockBase)
@@ -79,7 +79,7 @@ func TestWALAppendFailureNeverClearsDirty(t *testing.T) {
 
 func TestWALRefusesUnsafeSlotReuse(t *testing.T) {
 	cfg := compactTestClusterConfig()
-	layout, _ := DeriveWALLayout(cfg)
+	layout, _ := deriveWALLayout(cfg)
 	storage := newScriptedStorage(t, layout.BlockBase)
 	wal, err := newWAL(storage, cfg, protocol.GroupID{1}, 3)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -16,70 +17,10 @@ var (
 	ErrWALUncertainSolo = errors.New("replication: solo WAL uncertainty")
 )
 
-type WALLayout struct {
-	HeaderBase    uint64
-	HeaderSize    uint64
-	PrepareBase   uint64
-	PrepareStride uint64
-	PrepareSize   uint64
-	ReplyBase     uint64
-	ReplyStride   uint64
-	ReplySize     uint64
-	BlockBase     uint64
-}
+type walLayout = simhook.WALLayout
 
-func DeriveWALLayout(cfg ClusterConfig) (WALLayout, bool) {
-	superblockSize, ok := checkedMul(cfg.SuperblockCopies, SuperblockBytes)
-	if !ok {
-		return WALLayout{}, false
-	}
-	headerBytes, ok := checkedMul(cfg.JournalSlots, protocol.HeaderSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	headerSize, ok := checkedAlignUp(headerBytes, SectorSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	prepareBase, ok := checkedAdd(superblockSize, headerSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	prepareStride, ok := checkedAlignUp(cfg.MessageSizeMax, SectorSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	prepareSize, ok := checkedMul(cfg.JournalSlots, prepareStride)
-	if !ok {
-		return WALLayout{}, false
-	}
-	replyBase, ok := checkedAdd(prepareBase, prepareSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	replySize, ok := checkedMul(cfg.ClientsMax, prepareStride)
-	if !ok {
-		return WALLayout{}, false
-	}
-	end, ok := checkedAdd(replyBase, replySize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	blockBase, ok := checkedAlignUp(end, cfg.BlockSize)
-	if !ok {
-		return WALLayout{}, false
-	}
-	return WALLayout{
-		HeaderBase:    superblockSize,
-		HeaderSize:    headerSize,
-		PrepareBase:   prepareBase,
-		PrepareStride: prepareStride,
-		PrepareSize:   prepareSize,
-		ReplyBase:     replyBase,
-		ReplyStride:   prepareStride,
-		ReplySize:     replySize,
-		BlockBase:     blockBase,
-	}, true
+func deriveWALLayout(cfg ClusterConfig) (walLayout, bool) {
+	return simhook.DeriveWALLayout(cfg.SuperblockCopies, cfg.JournalSlots, cfg.MessageSizeMax, cfg.ClientsMax, cfg.BlockSize)
 }
 
 type walSlot struct {
@@ -99,7 +40,7 @@ type walJournal struct {
 	config        ClusterConfig
 	group         protocol.GroupID
 	memberCount   uint8
-	layout        WALLayout
+	layout        walLayout
 	slots         []walSlot
 	headerRing    []byte
 	prepareBuffer []byte
@@ -107,7 +48,7 @@ type walJournal struct {
 }
 
 func newWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCount uint8) (*walJournal, error) {
-	layout, ok := DeriveWALLayout(cfg)
+	layout, ok := deriveWALLayout(cfg)
 	if !ok || cfg.JournalSlots > uint64(int(^uint(0)>>1)) || cfg.MessageSizeMax > uint64(int(^uint(0)>>1)) || memberCount == 0 {
 		return nil, ErrInvalidWAL
 	}
@@ -141,7 +82,7 @@ func newWAL(storage Storage, cfg ClusterConfig, group protocol.GroupID, memberCo
 	return wal, nil
 }
 
-func (wal *walJournal) Layout() WALLayout {
+func (wal *walJournal) Layout() walLayout {
 	return wal.layout
 }
 
@@ -164,7 +105,7 @@ func (wal *walJournal) Append(frame []byte, reusableThrough protocol.Op) error {
 		return err
 	}
 	defer func() { wal.ioActive = false }()
-	for sequence.phase != IOPhaseCompletion {
+	for sequence.phase != ioPhaseCompletion {
 		if err := wal.advanceAppend(&sequence, frame); err != nil {
 			return err
 		}
@@ -196,7 +137,7 @@ func (wal *walJournal) beginAppend(sequence *ioSequence, frame []byte, reusableT
 	if !ok {
 		return ErrInvalidWAL
 	}
-	*sequence = ioSequence{phase: IOPhaseWrite, storage: wal.storage, buffer: wal.prepareBuffer, offset: prepareOffset, size: uint64(len(wal.prepareBuffer)), index: index, generation: slot.Generation, checksum: header.HeaderChecksum}
+	*sequence = ioSequence{phase: ioPhaseWrite, storage: wal.storage, buffer: wal.prepareBuffer, offset: prepareOffset, size: uint64(len(wal.prepareBuffer)), index: index, generation: slot.Generation, checksum: header.HeaderChecksum}
 	wal.ioActive = true
 	return nil
 }
@@ -214,7 +155,7 @@ func (wal *walJournal) advanceAppend(sequence *ioSequence, frame []byte) error {
 		headerOffset := sequence.index * protocol.HeaderSize
 		copy(wal.headerRing[headerOffset:headerOffset+protocol.HeaderSize], frame[:protocol.HeaderSize])
 		sectorOffset := headerOffset &^ (SectorSize - 1)
-		sequence.phase = IOPhaseWrite
+		sequence.phase = ioPhaseWrite
 		sequence.buffer = wal.headerRing[sectorOffset : sectorOffset+SectorSize]
 		sequence.offset = wal.layout.HeaderBase + sectorOffset
 		sequence.size = SectorSize
@@ -227,7 +168,7 @@ func (wal *walJournal) advanceAppend(sequence *ioSequence, frame []byte) error {
 		slot.Inhabited = true
 		slot.Dirty = false
 		slot.Faulty = false
-		sequence.phase = IOPhaseCompletion
+		sequence.phase = ioPhaseCompletion
 	}
 	sequence.step++
 	return nil

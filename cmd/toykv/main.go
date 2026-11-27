@@ -6,13 +6,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -58,19 +58,14 @@ func run() error {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if closeErr := cluster.Close(closeCtx); closeErr != nil {
-			event := logger.Error()
-			event.Err(closeErr)
-			event.Msg("cluster shutdown failed")
+			logger.Error("cluster shutdown failed", "error", closeErr)
 		}
 	}()
 
 	if err := cluster.RegisterClient(ctx, max(cfg.commandTimeout, 30*time.Second)); err != nil {
 		return err
 	}
-	event := logger.Info()
-	event.Uint("replicas", cfg.replicas)
-	event.Str("data_dir", cfg.dataDir)
-	event.Msg("toykv ready")
+	logger.Info("toykv ready", "replicas", cfg.replicas, "data_dir", cfg.dataDir)
 	return serveCommands(ctx, cluster, cfg.commandTimeout)
 }
 
@@ -81,7 +76,7 @@ func parseFlags() options {
 	flag.DurationVar(&cfg.commandTimeout, "timeout", 10*time.Second, "per-command response timeout")
 	flag.BoolVar(&cfg.directIO, "direct-io", false, "enable direct I/O for replica files")
 	flag.BoolVar(&cfg.prettyLogs, "pretty-logs", false, "render human-readable logs")
-	flag.StringVar(&cfg.logLevel, "log-level", "info", "zerolog level")
+	flag.StringVar(&cfg.logLevel, "log-level", "info", "log level: debug, info, warn, error")
 	flag.StringVar(&cfg.checksumMode, "checksum", "aegis", "checksum algorithm: aegis or wyhash")
 	flag.Parse()
 	return cfg
@@ -105,22 +100,19 @@ func checksumModeName(algorithm protocol.ChecksumAlgorithm) string {
 	return "aegis"
 }
 
-func newLogger(cfg options) (zerolog.Logger, error) {
-	level, err := zerolog.ParseLevel(cfg.logLevel)
-	if err != nil {
-		return zerolog.Logger{}, fmt.Errorf("parse log level: %w", err)
+func newLogger(cfg options) (*slog.Logger, error) {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(strings.TrimSpace(cfg.logLevel))); err != nil {
+		return nil, fmt.Errorf("parse log level: %w", err)
 	}
-	var logger zerolog.Logger
+	handlerOpts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
 	if cfg.prettyLogs {
-		logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339Nano})
+		handler = slog.NewTextHandler(os.Stderr, handlerOpts)
 	} else {
-		logger = zerolog.New(os.Stderr)
+		handler = slog.NewJSONHandler(os.Stderr, handlerOpts)
 	}
-	logger = logger.Level(level)
-	context := logger.With()
-	context = context.Timestamp()
-	context = context.Str("service", "toykv")
-	return context.Logger(), nil
+	return slog.New(handler).With("service", "toykv"), nil
 }
 
 func serveCommands(ctx context.Context, cluster *localCluster, timeout time.Duration) error {

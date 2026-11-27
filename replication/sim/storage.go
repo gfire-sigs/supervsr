@@ -32,7 +32,7 @@ const (
 type StorageFault struct {
 	At uint64
 	// Kind zero targets exactly At; otherwise target the first matching operation at or after At.
-	Kind   replication.IOKind
+	Kind   IOKind
 	Effect FaultEffect
 	Prefix uint64
 	Target uint64
@@ -62,7 +62,7 @@ func NewStorage() *Storage {
 func (storage *Storage) Arm(fault StorageFault) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.fault.Effect != 0 || fault.At <= storage.operation || fault.Effect < FaultFail || fault.Effect > FaultDelayedWrite || fault.Kind > replication.IOResize {
+	if storage.fault.Effect != 0 || fault.At <= storage.operation || fault.Effect < FaultFail || fault.Effect > FaultDelayedWrite || fault.Kind > IOResize {
 		return replication.ErrInvalidConfiguration
 	}
 	storage.fault = fault
@@ -101,7 +101,7 @@ func (storage *Storage) SetCapacityLimit(bytes uint64) error {
 func (storage *Storage) ReadAt(buffer []byte, offset uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault(replication.IORead)
+	fault := storage.nextFault(IORead)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -139,7 +139,7 @@ func (storage *Storage) ReadAt(buffer []byte, offset uint64) error {
 func (storage *Storage) WriteAt(buffer []byte, offset uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault(replication.IOWrite)
+	fault := storage.nextFault(IOWrite)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -182,7 +182,7 @@ func (storage *Storage) WriteAt(buffer []byte, offset uint64) error {
 func (storage *Storage) Sync() error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	fault := storage.nextFault(replication.IOSync)
+	fault := storage.nextFault(IOSync)
 	if fault.Effect == FaultFail {
 		return ErrInjectedFault
 	}
@@ -210,7 +210,7 @@ func (storage *Storage) Sync() error {
 func (storage *Storage) Resize(size uint64) error {
 	storage.mu.Lock()
 	defer storage.mu.Unlock()
-	if storage.nextFault(replication.IOResize).Effect != 0 {
+	if storage.nextFault(IOResize).Effect != 0 {
 		return ErrInjectedFault
 	}
 	if storage.capacityLimit != 0 && size > storage.capacityLimit {
@@ -317,7 +317,7 @@ func (storage *Storage) DurableBytes() []byte {
 	return append([]byte(nil), storage.durable...)
 }
 
-func (storage *Storage) nextFault(kind replication.IOKind) StorageFault {
+func (storage *Storage) nextFault(kind IOKind) StorageFault {
 	storage.operation++
 	if storage.fault.At > storage.operation {
 		return StorageFault{}

@@ -21,7 +21,7 @@ func TestTimeoutRequiresResetAfterFire(t *testing.T) {
 			t.Fatalf("tick %d fired=%t", tick, fired)
 		}
 	}
-	if _, err := timeout.Tick(); !errors.Is(err, ErrTimeoutInvariant) {
+	if _, err := timeout.Tick(); !errors.Is(err, errTimeoutInvariant) {
 		t.Fatalf("late tick error = %v", err)
 	}
 	timeout.Reset()

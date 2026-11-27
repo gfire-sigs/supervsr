@@ -549,6 +549,81 @@ func TestReplicaConcurrentCloseOwnsShutdownOnce(t *testing.T) {
 	}
 }
 
+type closeTrackingStorage struct {
+	Storage
+	closes atomic.Uint32
+}
+
+func (storage *closeTrackingStorage) Close() error {
+	storage.closes.Add(1)
+	return storage.Storage.Close()
+}
+
+func TestReplicaCloseCancelsDelayedStartResetAndClosesResources(t *testing.T) {
+	config, rawStorage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
+	storage := &closeTrackingStorage{Storage: rawStorage}
+	machine := &testStateMachine{
+		capacities: StateMachineCapacities{
+			RequestBytes:  uint32(config.Cluster.ApplicationBatchSizeMax),
+			ReplyBytes:    uint32(config.Cluster.ApplicationReplySizeMax),
+			PrefetchMax:   uint32(config.Cluster.PipelineMax),
+			CheckpointMax: 1,
+		},
+		resetPending: true,
+		resetStarted: make(chan struct{}),
+	}
+	replica, err := newReplica(config, Dependencies{
+		Storage:      storage,
+		MessageBus:   &captureBus{},
+		Clock:        fixedClock{sample: TimeSample{Wall: 1, Synchronized: true}},
+		Entropy:      bytes.NewReader([]byte{1, 0, 0, 0, 0, 0, 0, 0}),
+		StateMachine: machine,
+	}, initial, wal, replies, sessions, superblocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := protocol.NewFramePool(1, uint32(config.Cluster.MessageSizeMax))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := makeClientRequest(t, pool, config.Group, protocol.ClientID{4}, 0, 0, protocol.Checksum{}, protocol.OperationRegister, nil)
+	if err := replica.Submit(message); err != nil {
+		t.Fatal(err)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	closeErr := replica.Close(closeCtx)
+	if !errors.Is(closeErr, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context.DeadlineExceeded", closeErr)
+	}
+	select {
+	case <-machine.resetStarted:
+	default:
+		t.Fatal("StartReset was not invoked")
+	}
+	select {
+	case <-replica.done:
+	default:
+		t.Fatal("shutdown goroutine did not exit after context cancellation")
+	}
+	if pool.Available() != 1 {
+		t.Fatalf("owned frame not released on canceled Close: available=%d", pool.Available())
+	}
+	if machine.closes.Load() != 1 {
+		t.Fatalf("StateMachine.Close calls = %d, want 1", machine.closes.Load())
+	}
+	if storage.closes.Load() != 1 {
+		t.Fatalf("Storage.Close calls = %d, want 1", storage.closes.Load())
+	}
+	if err := machine.resetCompletion.Complete(SMResult{Kind: SMCompletionReset}); !errors.Is(err, ErrCompletionGeneration) {
+		t.Fatalf("late reset completion error = %v, want ErrCompletionGeneration", err)
+	}
+	if err := replica.Close(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Close error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
 func TestReplicaCheckpointPersistsSessionTrailersAndReopens(t *testing.T) {
 	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
 	bus := &captureBus{}

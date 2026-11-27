@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -86,8 +87,15 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 	if err != nil {
 		return nil, err
 	}
-	if dependencies.Metrics != nil && recovery.FaultySlots != 0 {
-		dependencies.Metrics.storageCorruptions.Add(uint64(recovery.FaultySlots))
+	if dependencies.Metrics != nil {
+		dependencies.Metrics.walRecoveryClean.Add(recovery.Counts.Clean)
+		dependencies.Metrics.walRecoveryCleanEmpty.Add(recovery.Counts.CleanEmpty)
+		dependencies.Metrics.walRecoveryLocalRepair.Add(recovery.Counts.LocalRepair)
+		dependencies.Metrics.walRecoveryTruncated.Add(recovery.Counts.Truncated)
+		dependencies.Metrics.walRecoveryRemoteRepair.Add(recovery.Counts.RemoteRepair)
+		if recovery.FaultySlots != 0 {
+			dependencies.Metrics.storageCorruptions.Add(uint64(recovery.FaultySlots))
+		}
 	}
 	if !resumeStateSync && config.Membership.ActiveCount == 1 && recovery.FaultySlots == 0 {
 		durable.State.CommitMax = recovery.HeadOp
@@ -142,7 +150,8 @@ func Open(ctx context.Context, config Config, dependencies Dependencies) (replic
 		return nil, err
 	}
 	initial.checkpointSession = replayed.checkpointSession
-	replica, err = newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, blocks)
+	ioOptions, _ := simhook.IOOptionsFromContext(ctx)
+	replica, err = newReplicaWithBlocks(config, dependencies, ioOptions, initial, wal, replyStore, sessions, superblocks, blocks)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +543,7 @@ func replayExecute(config Config, machine StateMachine, replies *durableReplySto
 		var found bool
 		session, found = sessions.Session(client)
 		if !found {
-			return ErrSessionEncoding
+			return errSessionEncoding
 		}
 	}
 	plan, err := sessions.PlanCommit(reply, session)

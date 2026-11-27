@@ -143,15 +143,15 @@ func (hasher ChecksumHasher) Sum() Checksum {
 	return checksum
 }
 
-func aegisChecksumBytes(input []byte) Checksum {
+func aegisChecksumBytes(input []byte) (Checksum, error) {
 	hasher, err := NewChecksumHasher(ChecksumAEGIS128L)
 	if err != nil {
-		panic(err)
+		return Checksum{}, err
 	}
 	if _, err := hasher.Write(input); err != nil {
-		panic(err)
+		return Checksum{}, err
 	}
-	return hasher.Sum()
+	return hasher.Sum(), nil
 }
 
 // ChecksumBytes computes the 128-bit digest of input using algorithm.
@@ -159,8 +159,11 @@ func ChecksumBytes(algorithm ChecksumAlgorithm, input []byte) (Checksum, error) 
 	if !algorithm.Valid() {
 		return Checksum{}, ErrInvalidChecksumAlgorithm
 	}
+	if uint64(len(input)) > checksumInputBytesMax {
+		return Checksum{}, ErrChecksumLengthOverflow
+	}
 	if algorithm == ChecksumAEGIS128L {
-		return aegisChecksumBytes(input), nil
+		return aegisChecksumBytes(input)
 	}
 	state := [4]uint64{wySecret0, wySecret1, wySecret2, wySecret3}
 	totalLen := uint64(len(input))

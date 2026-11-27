@@ -6,35 +6,37 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
 var (
 	ErrIOBackpressure = errors.New("replication: storage request pool exhausted")
-	ErrIOCanceled     = errors.New("replication: storage request canceled")
-	ErrIOHandle       = errors.New("replication: invalid storage request handle")
+	errIOCanceled     = errors.New("replication: storage request canceled")
+	errIOHandle       = simhook.ErrIOHandle
 )
 
-type IOKind uint8
+type (
+	ioKind       = simhook.IOKind
+	ioHandle     = simhook.IOHandle
+	ioPhase      = simhook.IOPhase
+	ioEvent      = simhook.IOEvent
+	ioController = simhook.IOController
+)
 
 const (
-	IORead IOKind = iota + 1
-	IOWrite
-	IOSync
-	IOResize
-	IOWALAppend
-	IOReplyWrite
-	IOReplyRead
-	IOSuperblockPersist
+	ioRead              = simhook.IORead
+	ioWrite             = simhook.IOWrite
+	ioSync              = simhook.IOSync
+	ioResize            = simhook.IOResize
+	ioWALAppend         = simhook.IOWALAppend
+	ioReplyWrite        = simhook.IOReplyWrite
+	ioReplyRead         = simhook.IOReplyRead
+	ioSuperblockPersist = simhook.IOSuperblockPersist
 )
 
-type IOHandle struct {
-	Index      uint32
-	Generation uint64
-}
-
 type ioOperation struct {
-	Kind              IOKind
+	Kind              ioKind
 	Offset            uint64
 	Buffer            []byte
 	Size              uint64
@@ -48,8 +50,8 @@ type ioOperation struct {
 }
 
 type ioCompletion struct {
-	Handle  IOHandle
-	Kind    IOKind
+	Handle  ioHandle
+	Kind    ioKind
 	Offset  uint64
 	Buffer  []byte
 	Size    uint64
@@ -79,6 +81,7 @@ type storageIOEngine struct {
 	done      chan struct{}
 	notify    chan struct{}
 	closed    atomic.Bool
+	faulted   atomic.Bool
 	lifecycle sync.Mutex
 
 	workers     sync.WaitGroup
@@ -87,14 +90,14 @@ type storageIOEngine struct {
 	freeLen     int
 	ready       *mpscRing[uint32]
 	synchronous bool
-	controller  *IOController
+	controller  *ioController
 }
 
 func newDefaultIOEngine(storage Storage, requestCount, workerCount uint32) (*storageIOEngine, error) {
 	return newIOEngine(storage, requestCount, workerCount, false, nil)
 }
 
-func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool, controller *IOController) (*storageIOEngine, error) {
+func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous bool, controller *ioController) (*storageIOEngine, error) {
 	if storage == nil || requestCount == 0 {
 		return nil, ErrInvalidConfiguration
 	}
@@ -102,7 +105,7 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 		if synchronous {
 			return nil, ErrInvalidConfiguration
 		}
-		if controller.engine != nil {
+		if controller.Bound() {
 			return nil, errIOControllerBound
 		}
 	}
@@ -129,7 +132,9 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 		engine.free[index] = uint32(len(engine.free) - index - 1)
 	}
 	if controller != nil {
-		controller.engine = engine
+		if err := controller.Bind(&ioControllerBackend{engine: engine}); err != nil {
+			return nil, err
+		}
 	}
 	if synchronous || controller != nil {
 		close(engine.done)
@@ -147,32 +152,35 @@ func newIOEngine(storage Storage, requestCount, workerCount uint32, synchronous 
 }
 
 // Submit is single-consumer owned by the replica event loop.
-func (engine *storageIOEngine) Submit(operation ioOperation) (IOHandle, error) {
+func (engine *storageIOEngine) Submit(operation ioOperation) (ioHandle, error) {
 	engine.lifecycle.Lock()
 	defer engine.lifecycle.Unlock()
+	if engine.faulted.Load() {
+		return ioHandle{}, ErrReplicaInvariant
+	}
 	if engine.closed.Load() {
-		return IOHandle{}, ErrStorageClosed
+		return ioHandle{}, ErrStorageClosed
 	}
 	if engine.freeLen == 0 {
-		return IOHandle{}, ErrIOBackpressure
+		return ioHandle{}, ErrIOBackpressure
 	}
-	if operation.Kind < IORead || operation.Kind > IOSuperblockPersist {
-		return IOHandle{}, ErrIOHandle
+	if operation.Kind < ioRead || operation.Kind > ioSuperblockPersist {
+		return ioHandle{}, errIOHandle
 	}
-	if (operation.Kind == IORead || operation.Kind == IOWrite) && len(operation.Buffer) == 0 {
-		return IOHandle{}, ErrIOHandle
+	if (operation.Kind == ioRead || operation.Kind == ioWrite) && len(operation.Buffer) == 0 {
+		return ioHandle{}, errIOHandle
 	}
-	if operation.Kind == IOWALAppend && (operation.walJournal == nil || len(operation.Buffer) == 0) {
-		return IOHandle{}, ErrIOHandle
+	if operation.Kind == ioWALAppend && (operation.walJournal == nil || len(operation.Buffer) == 0) {
+		return ioHandle{}, errIOHandle
 	}
-	replyOperation := operation.Kind == IOReplyWrite || operation.Kind == IOReplyRead
+	replyOperation := operation.Kind == ioReplyWrite || operation.Kind == ioReplyRead
 	if replyOperation {
 		if operation.durableReplyStore == nil || len(operation.Buffer) == 0 {
-			return IOHandle{}, ErrIOHandle
+			return ioHandle{}, errIOHandle
 		}
 	}
-	if operation.Kind == IOSuperblockPersist && operation.superblockStore == nil {
-		return IOHandle{}, ErrIOHandle
+	if operation.Kind == ioSuperblockPersist && operation.superblockStore == nil {
+		return ioHandle{}, errIOHandle
 	}
 	engine.freeLen--
 	index := engine.free[engine.freeLen]
@@ -182,7 +190,7 @@ func (engine *storageIOEngine) Submit(operation ioOperation) (IOHandle, error) {
 	slot.err = nil
 	slot.sequence = ioSequence{}
 	slot.state.Store(ioSlotQueued)
-	handle := IOHandle{Index: index, Generation: generation}
+	handle := ioHandle{Index: index, Generation: generation}
 	if engine.synchronous {
 		slot.state.Store(ioSlotRunning)
 		slot.err = engine.execute(&slot.operation)
@@ -193,7 +201,7 @@ func (engine *storageIOEngine) Submit(operation ioOperation) (IOHandle, error) {
 	return handle, nil
 }
 
-func (engine *storageIOEngine) Cancel(handle IOHandle) bool {
+func (engine *storageIOEngine) Cancel(handle ioHandle) bool {
 	if int(handle.Index) >= len(engine.slots) {
 		return false
 	}
@@ -205,17 +213,21 @@ func (engine *storageIOEngine) Cancel(handle IOHandle) bool {
 }
 
 // Poll is single-consumer owned by the replica event loop.
-func (engine *storageIOEngine) Poll(completion *ioCompletion) bool {
+func (engine *storageIOEngine) Poll(completion *ioCompletion) (bool, error) {
+	if engine.faulted.Load() {
+		return false, ErrReplicaInvariant
+	}
 	var index uint32
 	if !engine.ready.TryPop(&index) {
-		return false
+		return false, nil
 	}
 	slot := &engine.slots[index]
 	if slot.state.Load() != ioSlotComplete {
-		panic("replication: incomplete storage request reached event loop")
+		engine.faulted.Store(true)
+		return false, ErrReplicaInvariant
 	}
 	*completion = ioCompletion{
-		Handle: IOHandle{
+		Handle: ioHandle{
 			Index:      index,
 			Generation: slot.generation.Load(),
 		},
@@ -232,7 +244,7 @@ func (engine *storageIOEngine) Poll(completion *ioCompletion) bool {
 	slot.state.Store(ioSlotFree)
 	engine.free[engine.freeLen] = index
 	engine.freeLen++
-	return true
+	return true, nil
 }
 
 func (engine *storageIOEngine) Available() int {
@@ -260,9 +272,20 @@ func (engine *storageIOEngine) Close(ctx context.Context) error {
 	}
 	select {
 	case <-engine.done:
+		if engine.faulted.Load() {
+			return ErrReplicaInvariant
+		}
+		return nil
+	default:
+	}
+	select {
+	case <-engine.done:
+		if engine.faulted.Load() {
+			return ErrReplicaInvariant
+		}
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 }
 
@@ -271,11 +294,12 @@ func (engine *storageIOEngine) runWorker() {
 	for index := range engine.work {
 		slot := &engine.slots[index]
 		if slot.state.CompareAndSwap(ioSlotCanceled, ioSlotRunning) {
-			slot.err = ErrIOCanceled
+			slot.err = errIOCanceled
 		} else if slot.state.CompareAndSwap(ioSlotQueued, ioSlotRunning) {
 			slot.err = engine.execute(&slot.operation)
 		} else {
-			panic("replication: storage request entered worker twice")
+			engine.recordInvariantFault()
+			continue
 		}
 		engine.complete(index, slot)
 	}
@@ -284,8 +308,17 @@ func (engine *storageIOEngine) runWorker() {
 func (engine *storageIOEngine) complete(index uint32, slot *ioSlot) {
 	slot.state.Store(ioSlotComplete)
 	if !engine.ready.TryPush(index) {
-		panic("replication: storage completion ring exhausted")
+		engine.recordInvariantFault()
+		return
 	}
+	select {
+	case engine.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (engine *storageIOEngine) recordInvariantFault() {
+	engine.faulted.Store(true)
 	select {
 	case engine.notify <- struct{}{}:
 	default:
@@ -294,25 +327,25 @@ func (engine *storageIOEngine) complete(index uint32, slot *ioSlot) {
 
 func (engine *storageIOEngine) execute(operation *ioOperation) error {
 	switch operation.Kind {
-	case IORead:
+	case ioRead:
 		return engine.storage.ReadAt(operation.Buffer, operation.Offset)
-	case IOWrite:
+	case ioWrite:
 		return engine.storage.WriteAt(operation.Buffer, operation.Offset)
-	case IOSync:
+	case ioSync:
 		return engine.storage.Sync()
-	case IOResize:
+	case ioResize:
 		return engine.storage.Resize(operation.Size)
-	case IOWALAppend:
+	case ioWALAppend:
 		return operation.walJournal.Append(operation.Buffer, operation.ReusableThrough)
-	case IOReplyWrite:
+	case ioReplyWrite:
 		return operation.durableReplyStore.Write(uint32(operation.Offset), operation.Buffer)
-	case IOReplyRead:
+	case ioReplyRead:
 		frame, err := operation.durableReplyStore.Read(uint32(operation.Offset), operation.ExpectedHeader, operation.Buffer)
 		operation.Size = uint64(len(frame))
 		return err
-	case IOSuperblockPersist:
+	case ioSuperblockPersist:
 		return operation.superblockStore.Persist(operation.superblockRecord)
 	default:
-		return ErrIOHandle
+		return errIOHandle
 	}
 }

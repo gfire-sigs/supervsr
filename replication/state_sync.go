@@ -22,8 +22,8 @@ type stateSyncRuntime struct {
 	checkpoint          CheckpointState
 	headers             []protocol.Header
 	completion          SMCompletion
-	io                  IOHandle
-	ioKind              IOKind
+	io                  ioHandle
+	ioKind              ioKind
 	view                protocol.View
 	commit              protocol.Op
 	head                protocol.Op
@@ -44,6 +44,7 @@ type stateSyncRuntime struct {
 	recoveryState       superblockRecord
 	opening             bool
 	repliesPending      bool
+	started             uint64
 }
 
 func (replica *Replica) stateSyncAwaitingOpen() bool {
@@ -73,6 +74,9 @@ func (replica *Replica) beginStateSync(checkpoint CheckpointState, view protocol
 	replica.stateSync.persistDone = false
 	replica.stateSync.resumeRecovery = false
 	replica.stateSync.repliesPending = false
+	if replica.deps.Clock != nil {
+		replica.stateSync.started = replica.deps.Clock.Now().Monotonic
+	}
 	replica.clearRepairView()
 	replica.status = StatusRecovering
 	replica.abdicated = false
@@ -122,7 +126,7 @@ func (replica *Replica) dispatchStateSyncCancelingStorage() {
 }
 
 func (replica *Replica) cancelStateSyncReads() {
-	if replica.replyRepair.kind == IOReplyRead {
+	if replica.replyRepair.kind == ioReplyRead {
 		replica.io.Cancel(replica.replyRepair.handle)
 	}
 	for index := range replica.duplicateReads {
@@ -150,7 +154,7 @@ func (replica *Replica) handleStateSyncDrainIO(completion ioCompletion) {
 		return
 	}
 	if replica.viewIO == completion.Handle {
-		replica.viewIO = IOHandle{}
+		replica.viewIO = ioHandle{}
 		if completion.Err != nil {
 			replica.fail(completion.Err)
 		}
@@ -179,7 +183,7 @@ func (replica *Replica) handleStateSyncDrainIO(completion ioCompletion) {
 			replica.repairWrite.message.Release()
 		}
 		replica.repairWrite = repairWrite{}
-		if completion.Err != nil && !errors.Is(completion.Err, ErrIOCanceled) {
+		if completion.Err != nil && !errors.Is(completion.Err, errIOCanceled) {
 			replica.fail(completion.Err)
 		}
 		return
@@ -201,12 +205,12 @@ func (replica *Replica) handleStateSyncDrainIO(completion ioCompletion) {
 			continue
 		}
 		kind := entry.ioKind
-		entry.io = IOHandle{}
+		entry.io = ioHandle{}
 		entry.ioKind = 0
-		if kind == IOReplyWrite {
+		if kind == ioReplyWrite {
 			replica.sessions.Abort(entry.replyPlan)
 		}
-		if completion.Err != nil && !errors.Is(completion.Err, ErrIOCanceled) {
+		if completion.Err != nil && !errors.Is(completion.Err, errIOCanceled) {
 			replica.fail(completion.Err)
 		}
 		return
@@ -227,7 +231,7 @@ func (replica *Replica) handleStateSyncDrainSM(event replicaEvent) {
 }
 
 func (replica *Replica) dispatchStateSyncCheckpoint() {
-	if replica.stateSync.io != (IOHandle{}) {
+	if replica.stateSync.io != (ioHandle{}) {
 		return
 	}
 	switch replica.stateSync.persistPhase {
@@ -264,18 +268,18 @@ func (replica *Replica) dispatchStateSyncCheckpoint() {
 	}
 }
 func (replica *Replica) dispatchStateSyncResize() {
-	if replica.stateSync.io != (IOHandle{}) {
+	if replica.stateSync.io != (ioHandle{}) {
 		return
 	}
 	switch replica.stateSync.persistPhase {
 	case 0:
-		replica.startStateSyncIO(IOResize, replica.stateSync.checkpoint.LogicalStorageSize, 1)
+		replica.startStateSyncIO(ioResize, replica.stateSync.checkpoint.LogicalStorageSize, 1)
 	case 1:
 		if !replica.stateSync.persistDone {
 			return
 		}
 		replica.stateSync.persistDone = false
-		replica.startStateSyncIO(IOSync, 0, 2)
+		replica.startStateSyncIO(ioSync, 0, 2)
 	case 2:
 		if !replica.stateSync.persistDone {
 			return
@@ -294,7 +298,7 @@ func (replica *Replica) dispatchStateSyncResize() {
 	}
 }
 
-func (replica *Replica) startStateSyncIO(kind IOKind, size uint64, phase uint8) {
+func (replica *Replica) startStateSyncIO(kind ioKind, size uint64, phase uint8) {
 	handle, err := replica.io.Submit(ioOperation{Kind: kind, Size: size})
 	if err != nil {
 		if !errors.Is(err, ErrIOBackpressure) {
@@ -329,7 +333,7 @@ func (replica *Replica) startStateSyncReset() bool {
 }
 
 func (replica *Replica) startStateSyncPersistence(next superblockRecord, phase uint8) {
-	handle, err := replica.io.Submit(ioOperation{Kind: IOSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
 	if err != nil {
 		if !errors.Is(err, ErrIOBackpressure) {
 			replica.fail(err)
@@ -337,7 +341,7 @@ func (replica *Replica) startStateSyncPersistence(next superblockRecord, phase u
 		return
 	}
 	replica.stateSync.io = handle
-	replica.stateSync.ioKind = IOSuperblockPersist
+	replica.stateSync.ioKind = ioSuperblockPersist
 	replica.stateSync.persistPhase = phase
 }
 
@@ -363,10 +367,10 @@ func (replica *Replica) stateSyncSuperblock() (superblockRecord, error) {
 }
 
 func (replica *Replica) handleStateSyncPersistence(completion ioCompletion) bool {
-	if replica.stateSync.io == (IOHandle{}) || completion.Handle != replica.stateSync.io || completion.Kind != replica.stateSync.ioKind {
+	if replica.stateSync.io == (ioHandle{}) || completion.Handle != replica.stateSync.io || completion.Kind != replica.stateSync.ioKind {
 		return false
 	}
-	replica.stateSync.io = IOHandle{}
+	replica.stateSync.io = ioHandle{}
 	replica.stateSync.ioKind = 0
 	if completion.Err != nil {
 		replica.fail(completion.Err)
@@ -700,7 +704,7 @@ func (replica *Replica) finishInterruptedStateSyncOpen() {
 		}
 		return result
 	}
-	if replica.deps.SynchronousIO || replica.deps.IOController != nil {
+	if replica.io.synchronous || replica.io.controller != nil {
 		replica.finishInterruptedReplay(replay())
 		replica.recoveryWorkers.Done()
 		return

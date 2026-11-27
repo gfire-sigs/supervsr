@@ -3,6 +3,7 @@ package replication
 import (
 	"errors"
 	"math"
+	"sync"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -35,8 +36,10 @@ type ClockInterval struct {
 }
 
 // ClockSynchronizer computes quorum-tolerant synchronized cluster timestamps
-// anchored to local monotonic time.
+// anchored to local monotonic time. All exported methods are safe for
+// concurrent use by multiple goroutines.
 type ClockSynchronizer struct {
+	mu           sync.Mutex
 	local        LocalClock
 	localIndex   protocol.ReplicaIndex
 	activeCount  uint8
@@ -83,12 +86,16 @@ func NewClockSynchronizer(local LocalClock, localIndex protocol.ReplicaIndex, ac
 }
 
 func (clock *ClockSynchronizer) BeginPing() uint64 {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	monotonic := clock.local.Monotonic()
 	clock.rotateWindow(monotonic, clock.local.Wall())
 	return monotonic
 }
 
 func (clock *ClockSynchronizer) Observe(source protocol.ReplicaIndex, pingMonotonic, peerWall, receiveMonotonic uint64) error {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	if uint8(source) >= clock.activeCount || source == clock.localIndex || pingMonotonic > receiveMonotonic || pingMonotonic < clock.windowMono {
 		return ErrClockSample
 	}
@@ -109,6 +116,8 @@ func (clock *ClockSynchronizer) Observe(source protocol.ReplicaIndex, pingMonoto
 }
 
 func (clock *ClockSynchronizer) Now() TimeSample {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	monotonic := clock.local.Monotonic()
 	wall := clock.local.Wall()
 	clock.rotateWindow(monotonic, wall)
@@ -123,6 +132,8 @@ func (clock *ClockSynchronizer) Now() TimeSample {
 }
 
 func (clock *ClockSynchronizer) Interval() (ClockInterval, bool) {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
 	return clock.installed, clock.synchronized
 }
 

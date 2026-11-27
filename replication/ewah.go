@@ -5,7 +5,7 @@ import (
 	"math"
 )
 
-var ErrInvalidEWAH = errors.New("replication: invalid EWAH bitset")
+var errInvalidEWAH = errors.New("replication: invalid EWAH bitset")
 
 const (
 	ewahFillMax    = uint64((1 << 31) - 1)
@@ -77,7 +77,7 @@ func (set fixedBitSet) Count() uint64 {
 
 func (set *fixedBitSet) EncodeEWAH(destination []uint64) (int, error) {
 	if !set.validTail() {
-		return 0, ErrInvalidEWAH
+		return 0, errInvalidEWAH
 	}
 	written := 0
 	for cursor := 0; cursor < len(set.words); {
@@ -102,7 +102,7 @@ func (set *fixedBitSet) EncodeEWAH(destination []uint64) (int, error) {
 			continue
 		}
 		if written >= len(destination) || literals > uint64(len(destination)-written-1) {
-			return 0, ErrInvalidEWAH
+			return 0, errInvalidEWAH
 		}
 		marker := fill << 1
 		if fillWord == math.MaxUint64 {
@@ -126,10 +126,10 @@ func (set *fixedBitSet) DecodeEWAH(encoded []uint64) error {
 		fill := (marker >> 1) & ewahFillMax
 		literals := marker >> 32
 		if fill == 0 && literals == 0 {
-			return ErrInvalidEWAH
+			return errInvalidEWAH
 		}
 		if literals > uint64(len(encoded)-offset) || fill > uint64(len(set.words)-cursor) {
-			return ErrInvalidEWAH
+			return errInvalidEWAH
 		}
 		fillWord := uint64(0)
 		if marker&1 != 0 {
@@ -140,11 +140,11 @@ func (set *fixedBitSet) DecodeEWAH(encoded []uint64) error {
 			cursor++
 		}
 		if literals > uint64(len(set.words)-cursor) {
-			return ErrInvalidEWAH
+			return errInvalidEWAH
 		}
 		for _, literal := range encoded[offset : offset+int(literals)] {
 			if literal == 0 || literal == math.MaxUint64 {
-				return ErrInvalidEWAH
+				return errInvalidEWAH
 			}
 			set.words[cursor] = literal
 			cursor++
@@ -152,7 +152,7 @@ func (set *fixedBitSet) DecodeEWAH(encoded []uint64) error {
 		offset += int(literals)
 	}
 	if cursor != len(set.words) || !set.validTail() {
-		return ErrInvalidEWAH
+		return errInvalidEWAH
 	}
 	return nil
 }

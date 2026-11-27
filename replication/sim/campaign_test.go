@@ -35,22 +35,22 @@ func TestFoundationDBFaultCampaign(t *testing.T) {
 	storageFaults := []struct {
 		name   string
 		effect FaultEffect
-		kind   replication.IOKind
+		kind   IOKind
 	}{
-		{"read_error", FaultFail, replication.IORead},
-		{"write_error", FaultFail, replication.IOWrite},
-		{"sync_error", FaultFail, replication.IOSync},
-		{"torn_read", FaultTornRead, replication.IORead},
-		{"stale_read", FaultStaleRead, replication.IORead},
-		{"corrupt_read", FaultCorruptRead, replication.IORead},
-		{"misdirected_read", FaultMisdirectedRead, replication.IORead},
-		{"torn_write", FaultTornWrite, replication.IOWrite},
-		{"lost_write", FaultLostWrite, replication.IOWrite},
-		{"corrupt_write", FaultCorruptWrite, replication.IOWrite},
-		{"misdirected_write", FaultMisdirectedWrite, replication.IOWrite},
-		{"delayed_write", FaultDelayedWrite, replication.IOWrite},
-		{"torn_sync", FaultTornSync, replication.IOSync},
-		{"lost_sync", FaultLostSync, replication.IOSync},
+		{"read_error", FaultFail, IORead},
+		{"write_error", FaultFail, IOWrite},
+		{"sync_error", FaultFail, IOSync},
+		{"torn_read", FaultTornRead, IORead},
+		{"stale_read", FaultStaleRead, IORead},
+		{"corrupt_read", FaultCorruptRead, IORead},
+		{"misdirected_read", FaultMisdirectedRead, IORead},
+		{"torn_write", FaultTornWrite, IOWrite},
+		{"lost_write", FaultLostWrite, IOWrite},
+		{"corrupt_write", FaultCorruptWrite, IOWrite},
+		{"misdirected_write", FaultMisdirectedWrite, IOWrite},
+		{"delayed_write", FaultDelayedWrite, IOWrite},
+		{"torn_sync", FaultTornSync, IOSync},
+		{"lost_sync", FaultLostSync, IOSync},
 	}
 	for _, fault := range storageFaults {
 		scenarios = append(scenarios, struct {
@@ -341,15 +341,15 @@ func (campaign *faultCampaign) correlatedReboot() {
 	}
 }
 
-func (campaign *faultCampaign) storageFault(effect FaultEffect, kind replication.IOKind) {
+func (campaign *faultCampaign) storageFault(effect FaultEffect, kind IOKind) {
 	victim := campaign.primary()
 	storage := campaign.cluster.Storage(victim)
-	if kind == replication.IORead {
+	if kind == IORead {
 		campaign.check(campaign.cluster.Crash(context.Background(), victim))
 	}
 	campaign.check(storage.Arm(StorageFault{At: storage.NextOperation(), Kind: kind, Effect: effect, Prefix: 17, Target: 4096, Mask: 0x80}))
 	campaign.failedNode = &victim
-	if kind == replication.IORead {
+	if kind == IORead {
 		err := campaign.cluster.Restart(context.Background(), victim)
 		if err != nil {
 			if !errors.Is(err, ErrInjectedFault) {

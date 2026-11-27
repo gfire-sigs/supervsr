@@ -96,7 +96,9 @@ func TestWALDiscardAfterSurvivesNeighborHeaderWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wal.DiscardAfter(0)
+	if err := wal.DiscardAfter(0); err != nil {
+		t.Fatal(err)
+	}
 	if _, present, nack := wal.JoinEvidence(1); present || !nack {
 		t.Fatalf("discarded tail evidence: present=%t nack=%t", present, nack)
 	}

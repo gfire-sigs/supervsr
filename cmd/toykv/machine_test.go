@@ -6,11 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"reflect"
 	"testing"
 
-	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -300,5 +300,5 @@ func persistCurrentSnapshot(t *testing.T, machine *kvMachine, op protocol.Op) {
 }
 
 func newSnapshotTestMachine(directory string) *kvMachine {
-	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, protocol.ChecksumAEGIS128L, zerolog.Nop())
+	return newKVMachine(directory, protocol.GroupID{1}, 3, 128<<10, 32, protocol.ChecksumAEGIS128L, slog.New(slog.DiscardHandler))
 }

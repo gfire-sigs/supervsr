@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-var ErrTimeoutInvariant = errors.New("replication: timeout handler did not reset or stop")
+var errTimeoutInvariant = errors.New("replication: timeout handler did not reset or stop")
 
 type tickTimeout struct {
 	running   bool
@@ -53,7 +53,7 @@ func (timeout *tickTimeout) Tick() (bool, error) {
 		return false, nil
 	}
 	if timeout.elapsed >= timeout.threshold {
-		return false, ErrTimeoutInvariant
+		return false, errTimeoutInvariant
 	}
 	timeout.elapsed++
 	return timeout.elapsed == timeout.threshold, nil
@@ -61,7 +61,7 @@ func (timeout *tickTimeout) Tick() (bool, error) {
 
 func (timeout *tickTimeout) Backoff(process ProcessConfig, measuredRTT time.Duration, random *deterministicRandom) error {
 	if !timeout.running || random == nil {
-		return ErrTimeoutInvariant
+		return errTimeoutInvariant
 	}
 	rttTicks, ok := durationTicks(measuredRTT, process.Tick)
 	if !ok {
@@ -94,7 +94,7 @@ func (timeout *tickTimeout) Backoff(process ProcessConfig, measuredRTT time.Dura
 
 func (timeout *tickTimeout) ResetJitter(random *deterministicRandom) error {
 	if !timeout.running || random == nil {
-		return ErrTimeoutInvariant
+		return errTimeoutInvariant
 	}
 	timeout.attempts++
 	half := max(uint64(1), timeout.initial/2)

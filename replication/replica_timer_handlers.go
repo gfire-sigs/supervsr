@@ -7,10 +7,6 @@ import (
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
-type clockSampleObserver interface {
-	Observe(source protocol.ReplicaIndex, pingMonotonic, peerWall, receiveMonotonic uint64) error
-}
-
 func (replica *Replica) tickTimers(sample TimeSample) {
 	if replica.tickTimer(&replica.timers.ping) {
 		replica.sendPing(sample)
@@ -116,7 +112,15 @@ func (replica *Replica) handleAbdicationTimeout(sample TimeSample) {
 		return
 	}
 	replica.abdicated = true
-	replica.metrics.quorumUnavailable.Add(1)
+	if replica.metrics != nil {
+		replica.metrics.primaryAbdications.Add(1)
+		if replica.pipelineLen > 0 && !replica.pipelineEntry(0).quorum {
+			replica.metrics.quorumUnavailable.Add(1)
+		}
+		if !sample.Synchronized {
+			replica.metrics.clockDisagreements.Add(1)
+		}
+	}
 	replica.sendExitView(sample.Monotonic)
 }
 
@@ -236,11 +240,14 @@ func (replica *Replica) handlePing(header protocol.Header, body []byte) {
 }
 
 func (replica *Replica) handlePong(header protocol.Header, sample TimeSample) {
-	observer, ok := replica.deps.Clock.(clockSampleObserver)
-	if !ok {
+	pingMonotonic := binary.LittleEndian.Uint64(header.Fields[:8])
+	if replica.metrics != nil && sample.Monotonic >= pingMonotonic {
+		replica.metrics.peerRTTNanos.Store(sample.Monotonic - pingMonotonic)
+	}
+	if replica.clockObserver == nil {
 		return
 	}
-	_ = observer.Observe(header.Author, binary.LittleEndian.Uint64(header.Fields[:8]), binary.LittleEndian.Uint64(header.Fields[8:16]), sample.Monotonic)
+	_ = replica.clockObserver.Observe(header.Author, pingMonotonic, binary.LittleEndian.Uint64(header.Fields[8:16]), sample.Monotonic)
 }
 
 func (replica *Replica) sendCommit(sample TimeSample) {

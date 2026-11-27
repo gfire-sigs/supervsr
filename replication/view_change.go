@@ -114,7 +114,7 @@ func (replica *Replica) beginViewChange(target protocol.View) {
 	if target <= replica.view || !replica.canEnterViewChange() {
 		return
 	}
-	if replica.viewIO != (IOHandle{}) || replica.commitInFlight() {
+	if replica.viewIO != (ioHandle{}) || replica.commitInFlight() {
 		replica.pendingView = max(replica.pendingView, target)
 		return
 	}
@@ -151,6 +151,9 @@ func (replica *Replica) beginViewChangeNow(target protocol.View) {
 		return
 	}
 	replica.metrics.viewChanges.Add(1)
+	if replica.viewChangeStarted == 0 && replica.deps.Clock != nil {
+		replica.viewChangeStarted = replica.deps.Clock.Now().Monotonic
+	}
 }
 
 func (replica *Replica) releaseQueuedRequests() {
@@ -184,7 +187,7 @@ func (replica *Replica) collectLocalSuffix(destination []protocol.Header) int {
 }
 
 func (replica *Replica) persistView(install bool, commit, head protocol.Op, headers []protocol.Header) error {
-	if replica.viewIO != (IOHandle{}) || len(headers) == 0 || len(headers) > int(replica.config.Cluster.PipelineMax+1) {
+	if replica.viewIO != (ioHandle{}) || len(headers) == 0 || len(headers) > int(replica.config.Cluster.PipelineMax+1) {
 		return ErrReplicaBackpressure
 	}
 	next := replica.superblocks.Current()
@@ -216,7 +219,7 @@ func (replica *Replica) persistView(install bool, commit, head protocol.Op, head
 			next.ViewHeaders[index] = encoded
 		}
 	}
-	handle, err := replica.io.Submit(ioOperation{Kind: IOSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioSuperblockPersist, superblockStore: replica.superblocks, superblockRecord: next})
 	if err != nil {
 		return err
 	}
@@ -228,10 +231,10 @@ func (replica *Replica) persistView(install bool, commit, head protocol.Op, head
 }
 
 func (replica *Replica) handleViewPersistence(completion ioCompletion) bool {
-	if completion.Kind != IOSuperblockPersist || completion.Handle != replica.viewIO {
+	if completion.Kind != ioSuperblockPersist || completion.Handle != replica.viewIO {
 		return false
 	}
-	replica.viewIO = IOHandle{}
+	replica.viewIO = ioHandle{}
 	if completion.Err != nil {
 		replica.metrics.storageFailures.Add(1)
 		replica.fail(completion.Err)
@@ -247,9 +250,23 @@ func (replica *Replica) handleViewPersistence(completion ioCompletion) bool {
 		replica.sendJoinView()
 		return true
 	}
-	replica.wal.DiscardAfter(replica.viewHead)
+	if err := replica.wal.DiscardAfter(replica.viewHead); err != nil {
+		replica.fail(err)
+		return true
+	}
 	replica.lastPrimaryCommit = 0
-	replica.failureDetector = newLivenessDetector(replica.deps.Clock.Now().Monotonic)
+	now := uint64(0)
+	if replica.deps.Clock != nil {
+		now = replica.deps.Clock.Now().Monotonic
+	}
+	replica.failureDetector = newLivenessDetector(now)
+	if replica.metrics != nil {
+		replica.metrics.viewChangeTruncationOp.Store(uint64(replica.viewHead))
+		if replica.viewChangeStarted != 0 {
+			replica.metrics.viewChangeDurationNanos.Store(elapsedSince(replica.viewChangeStarted, now))
+		}
+	}
+	replica.viewChangeStarted = 0
 	replica.logView = replica.view
 	replica.commitMax = max(replica.commitMax, replica.viewCommit)
 	replica.status = StatusNormal
@@ -448,7 +465,7 @@ func (replica *Replica) tryInstallCanonicalView() {
 		}
 		return
 	}
-	if replica.viewIO != (IOHandle{}) {
+	if replica.viewIO != (ioHandle{}) {
 		return
 	}
 	if !replica.validRecoveringView(replica.view, commit, head, replica.canonicalHeaders[:count]) {
@@ -657,7 +674,7 @@ func (replica *Replica) joinHeaderAt(sender uint8, op protocol.Op) (protocol.Hea
 func (replica *Replica) pipelineBusyForRepair() bool {
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
-		if entry.io != (IOHandle{}) || entry.stage != CommitStageIdle {
+		if entry.io != (ioHandle{}) || entry.stage != CommitStageIdle {
 			return true
 		}
 	}
@@ -675,7 +692,10 @@ func (replica *Replica) clearRepairView() {
 			replica.repairFrames[index] = nil
 		}
 	}
-	replica.repairBudget.Reset()
+	if err := replica.repairBudget.Reset(); err != nil {
+		replica.fail(err)
+		return
+	}
 	replica.repairHeader = protocol.Header{}
 	replica.repairHeaderValid = false
 	replica.repairViewValid = false
@@ -691,8 +711,8 @@ func (replica *Replica) clearRepairView() {
 }
 
 func (replica *Replica) handleView(header protocol.Header, body []byte) {
-	invalidSource := header.Author != replica.membership.Primary(header.View) || header.View < replica.view || len(body) < CheckpointStateSize
-	busy := replica.viewIO != (IOHandle{}) || replica.repairWrite.busy
+	invalidSource := header.Author != replica.membership.Primary(header.View) || header.View < replica.view || len(body) < checkpointStateSize
+	busy := replica.viewIO != (ioHandle{}) || replica.repairWrite.busy
 	blockedRepair := replica.repairViewValid && !replica.canSupersedeRepairView(header.View)
 	if invalidSource || busy || blockedRepair {
 		return
@@ -727,19 +747,19 @@ func (replica *Replica) handleView(header protocol.Header, body []byte) {
 		ChecksumAlgorithm: replica.config.Cluster.ChecksumAlgorithm,
 	}
 	validation.BlockBase, _ = replica.config.Cluster.BlockBase()
-	checkpoint, err := decodeCheckpointState(body[:CheckpointStateSize], validation)
+	checkpoint, err := decodeCheckpointState(body[:checkpointStateSize], validation)
 	if err != nil || checkpoint.PrepareOp() < replica.checkpoint.PrepareOp() {
 		return
 	}
-	count := (len(body) - CheckpointStateSize) / protocol.HeaderSize
+	count := (len(body) - checkpointStateSize) / protocol.HeaderSize
 	maxHeaders := min(len(replica.canonicalHeaders), superblockHeadersMax)
-	if count == 0 || count > maxHeaders || CheckpointStateSize+count*protocol.HeaderSize != len(body) {
+	if count == 0 || count > maxHeaders || checkpointStateSize+count*protocol.HeaderSize != len(body) {
 		return
 	}
 	var incomingBuf [superblockHeadersMax]protocol.Header
 	incoming := incomingBuf[:count]
 	for index := range count {
-		candidate, reason := protocol.DecodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
+		candidate, reason := protocol.DecodeHeader(body[checkpointStateSize+index*protocol.HeaderSize:checkpointStateSize+(index+1)*protocol.HeaderSize], replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), replica.membership.ActiveCount+replica.membership.StandbyCount, replica.config.Cluster.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || candidate.View > header.View {
 			return
 		}
@@ -823,7 +843,7 @@ func (replica *Replica) validRecoveringView(view protocol.View, commit, head pro
 	if replica.commitInFlight() || count == 0 || head < replica.commitMin {
 		return false
 	}
-	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
+	if replica.repairWrite.busy || replica.viewIO != (ioHandle{}) {
 		return false
 	}
 	minimumCommit := protocol.Op(0)
@@ -956,7 +976,7 @@ func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	message, err := replica.frames.Acquire(uint32(CheckpointStateSize + count*protocol.HeaderSize))
+	message, err := replica.frames.Acquire(uint32(checkpointStateSize + count*protocol.HeaderSize))
 	if err != nil {
 		return nil, err
 	}
@@ -965,13 +985,13 @@ func (replica *Replica) buildView(nonce protocol.Nonce) (*Message, error) {
 		message.Release()
 		return nil, err
 	}
-	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		message.Release()
 		return nil, err
 	}
 	for index := range count {
 		header := replica.canonicalHeaders[index]
-		if err := protocol.EncodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
+		if err := protocol.EncodeHeader(body[checkpointStateSize+index*protocol.HeaderSize:checkpointStateSize+(index+1)*protocol.HeaderSize], &header, replica.config.Cluster.ChecksumAlgorithm); err != nil {
 			message.Release()
 			return nil, err
 		}

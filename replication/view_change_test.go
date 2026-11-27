@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
-
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -208,7 +206,6 @@ func canonicalFixture(t testing.TB) (*Replica, protocol.Header, protocol.Header,
 		joins:            make([]joinRecord, 3),
 		joinHeaders:      make([]protocol.Header, 3*int(cluster.PipelineMax+1)),
 		canonicalHeaders: make([]protocol.Header, int(cluster.PipelineMax+1)),
-		logger:           zerolog.Nop(),
 	}
 	return replica, root, first, second
 }
@@ -237,7 +234,7 @@ func TestViewChangeWaitsForCheckpointTransition(t *testing.T) {
 	replica.pipeline[0].header = initial.HeadHeader
 	replica.pipeline[0].stage = CommitStageCheckpointData
 	replica.beginViewChange(1)
-	if replica.view != 0 || replica.pendingView != 1 || replica.viewIO != (IOHandle{}) {
+	if replica.view != 0 || replica.pendingView != 1 || replica.viewIO != (ioHandle{}) {
 		t.Fatalf("checkpoint did not defer view: view=%d pending=%d io=%+v", replica.view, replica.pendingView, replica.viewIO)
 	}
 	replica.pipelineLen = 0
@@ -300,7 +297,6 @@ func TestStandbyAndRecoveringIgnoreExitViewAndStateSyncView(t *testing.T) {
 		failureDetector: newLivenessDetector(1),
 		frames:          frames,
 		deps:            Dependencies{MessageBus: bus},
-		logger:          zerolog.Nop(),
 	}
 	standby.handleExitTimeout(TimeSample{Wall: 1000, Monotonic: uint64(10 * time.Second), Synchronized: true})
 	if standby.status != StatusNormal || standby.view != 0 || standby.durableView != 0 || bus.replicaCount() != 0 {
@@ -326,7 +322,6 @@ func TestStandbyAndRecoveringIgnoreExitViewAndStateSyncView(t *testing.T) {
 			MessageBus: bus,
 			Clock:      fixedClock{sample: TimeSample{Wall: 1, Monotonic: 100, Synchronized: true}},
 		},
-		logger: zerolog.Nop(),
 	}
 	active.handleExitView(protocol.Header{Command: protocol.CommandExitView, View: 6, Author: 3}, 100)
 	active.handleJoinView(protocol.Header{Command: protocol.CommandJoinView, View: 6, Author: 3}, nil)

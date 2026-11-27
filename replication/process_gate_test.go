@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -365,11 +364,10 @@ func runReplicaProcessHelper() error {
 	config.CurrentRelease = release
 	executor := &processReleaseExecutor{current: release, mode: os.Getenv(processReplicaUpgrade), emitter: emitter, exit: make(chan struct{})}
 	bus := &processReplicaBus{index: index, activeCount: 3, gate: gate, emitter: emitter}
-	logger := zerolog.Nop()
 	metrics := &ReplicaMetrics{}
 	replica, err := Open(context.Background(), config, Dependencies{
 		Storage: gatedStorage, MessageBus: bus, Clock: newProcessGateClock(), Entropy: bytes.NewReader(bytes.Repeat([]byte{byte(index) + 1}, 32)),
-		StateMachine: machine, Metrics: metrics, Logger: &logger, ReleaseExecutor: executor,
+		StateMachine: machine, Metrics: metrics, ReleaseExecutor: executor,
 	})
 	if err != nil {
 		_ = storage.Close()

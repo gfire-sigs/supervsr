@@ -99,13 +99,13 @@ func loadSessionTrailer(runtime *blockRuntime, checkpoint CheckpointState, sessi
 		return nil
 	}
 	if checkpoint.SessionTrailerEncodedSize != uint64(sessions.TrailerSize()) {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	encoded := make([]byte, sessions.TrailerSize())
 	capacity := runtime.store.cluster.BlockSize - protocol.HeaderSize
 	count := (checkpoint.SessionTrailerEncodedSize + capacity - 1) / capacity
 	if count == 0 || count > uint64(^uint32(0)) {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	reference := trailerReference{
 		Last:      BlockReference{Checksum: checkpoint.SessionTrailerLastChecksum, Address: checkpoint.SessionTrailerLastAddress},

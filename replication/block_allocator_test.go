@@ -135,7 +135,7 @@ func TestBlockAllocatorRejectsReachableReleaseAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	reachable.Set(0)
-	if err := allocator.CheckpointDurable(candidate, &reachable); !errors.Is(err, ErrBlockReservation) {
+	if err := allocator.CheckpointDurable(candidate, &reachable); !errors.Is(err, errBlockReservation) {
 		t.Fatalf("reachable release error = %v", err)
 	}
 	if allocator.ReleasedCount() != 0 {

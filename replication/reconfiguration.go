@@ -28,6 +28,13 @@ const (
 	ReconfigurationIsNoOp
 )
 
+// ValidateReconfiguration classifies a 256-byte OperationReconfigure request
+// body against current membership and epoch in precedence order.
+//
+// In storage format version 1, reconfiguration is validation-only: returning
+// ReconfigurationOK reports a valid permutation for currentEpoch+1 without
+// mutating membership, member indices, counts, configuration checksum, or
+// frame epoch.
 func ValidateReconfiguration(body []byte, current Membership, currentEpoch protocol.Epoch) ReconfigurationResult {
 	if len(body) != 256 {
 		return ReconfigurationReservedField

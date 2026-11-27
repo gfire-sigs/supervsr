@@ -8,7 +8,7 @@ import (
 
 var (
 	ErrStorageExhausted = errors.New("replication: storage size limit exhausted")
-	ErrBlockReservation = errors.New("replication: invalid block reservation")
+	errBlockReservation = errors.New("replication: invalid block reservation")
 )
 
 type blockCheckpointCandidate struct {
@@ -215,7 +215,7 @@ func (allocator *blockSpaceAllocator) Reserve() (uint64, error) {
 func (allocator *blockSpaceAllocator) Publish(address uint64) error {
 	index, ok := allocator.index(address)
 	if !ok || !allocator.reserved.Test(index) {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	allocator.reserved.Clear(index)
 	allocator.reservedReleased.Clear(index)
@@ -227,7 +227,7 @@ func (allocator *blockSpaceAllocator) Publish(address uint64) error {
 func (allocator *blockSpaceAllocator) Forfeit(address uint64) error {
 	index, ok := allocator.index(address)
 	if !ok || !allocator.reserved.Test(index) {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	allocator.reserved.Clear(index)
 
@@ -239,10 +239,10 @@ func (allocator *blockSpaceAllocator) Forfeit(address uint64) error {
 }
 func (allocator *blockSpaceAllocator) PrepareCheckpoint(sessionEncodedSize, payloadSize uint64) (blockCheckpointCandidate, error) {
 	if allocator.checkpointActive || allocator.prefix(&allocator.reserved).Count() != 0 {
-		return blockCheckpointCandidate{}, ErrBlockReservation
+		return blockCheckpointCandidate{}, errBlockReservation
 	}
 	if payloadSize == 0 || sessionEncodedSize == 0 {
-		return blockCheckpointCandidate{}, ErrBlockReservation
+		return blockCheckpointCandidate{}, errBlockReservation
 	}
 	sessionBlocks := int((sessionEncodedSize + payloadSize - 1) / payloadSize)
 	allocator.candidateAddresses = slices.Grow(allocator.candidateAddresses[:0], sessionBlocks+2)
@@ -310,7 +310,7 @@ func (allocator *blockSpaceAllocator) PrepareCheckpoint(sessionEncodedSize, payl
 		}, nil
 	}
 	allocator.forfeitAddresses(addresses)
-	return blockCheckpointCandidate{}, ErrBlockReservation
+	return blockCheckpointCandidate{}, errBlockReservation
 }
 
 func (allocator *blockSpaceAllocator) checkpointSets(addresses []uint64) (fixedBitSet, fixedBitSet, error) {
@@ -326,7 +326,7 @@ func (allocator *blockSpaceAllocator) checkpointSets(addresses []uint64) (fixedB
 	for _, address := range addresses {
 		index, ok := allocator.index(address)
 		if !ok {
-			return fixedBitSet{}, fixedBitSet{}, ErrBlockReservation
+			return fixedBitSet{}, fixedBitSet{}, errBlockReservation
 		}
 		acquired.Set(index)
 		released.Clear(index)
@@ -374,7 +374,7 @@ func (allocator *blockSpaceAllocator) encodeEWAHBytes(set fixedBitSet, destinati
 func (allocator *blockSpaceAllocator) Release(address uint64) error {
 	index, ok := allocator.index(address)
 	if !ok || !allocator.acquired.Test(index) || allocator.reserved.Test(index) || allocator.released.Test(index) || allocator.pending.Test(index) {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	allocator.pending.Set(index)
 	return nil
@@ -383,7 +383,7 @@ func (allocator *blockSpaceAllocator) Release(address uint64) error {
 func (allocator *blockSpaceAllocator) cancelRelease(address uint64) error {
 	index, ok := allocator.index(address)
 	if !ok || !allocator.acquired.Test(index) || allocator.reserved.Test(index) || allocator.released.Test(index) || !allocator.pending.Test(index) {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	allocator.pending.Clear(index)
 	return nil
@@ -391,7 +391,7 @@ func (allocator *blockSpaceAllocator) cancelRelease(address uint64) error {
 
 func (allocator *blockSpaceAllocator) BeginCheckpoint() (blockCheckpointCandidate, error) {
 	if allocator.checkpointActive || allocator.prefix(&allocator.reserved).Count() != 0 {
-		return blockCheckpointCandidate{}, ErrBlockReservation
+		return blockCheckpointCandidate{}, errBlockReservation
 	}
 	clear(allocator.checkpoint.words)
 	clear(allocator.checkpointAcquired.words)
@@ -414,20 +414,20 @@ func (allocator *blockSpaceAllocator) BeginCheckpoint() (blockCheckpointCandidat
 
 func (allocator *blockSpaceAllocator) CheckpointDurable(candidate blockCheckpointCandidate, reachable *fixedBitSet) error {
 	if !allocator.checkpointActive || candidate.generation != allocator.checkpointGeneration || candidate.blockCount > allocator.blockCount {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	if reachable == nil || reachable.Len() < candidate.blockCount {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	for _, address := range candidate.addresses {
 		index, ok := allocator.index(address)
 		if !ok || allocator.reserved.Test(index) || !allocator.acquired.Test(index) || allocator.released.Test(index) || allocator.pending.Test(index) {
-			return ErrBlockReservation
+			return errBlockReservation
 		}
 	}
 	for index := uint64(0); index < candidate.blockCount; index++ {
 		if allocator.checkpoint.Test(index) && reachable.Test(index) {
-			return ErrBlockReservation
+			return errBlockReservation
 		}
 	}
 	for index := uint64(0); index < candidate.blockCount; index++ {
@@ -446,12 +446,12 @@ func (allocator *blockSpaceAllocator) CheckpointDurable(candidate blockCheckpoin
 
 func (allocator *blockSpaceAllocator) AbortCheckpoint(candidate blockCheckpointCandidate) error {
 	if !allocator.checkpointActive || candidate.generation != allocator.checkpointGeneration {
-		return ErrBlockReservation
+		return errBlockReservation
 	}
 	for _, address := range candidate.addresses {
 		index, ok := allocator.index(address)
 		if !ok {
-			return ErrBlockReservation
+			return errBlockReservation
 		}
 		if allocator.reserved.Test(index) {
 			if err := allocator.Forfeit(address); err != nil {

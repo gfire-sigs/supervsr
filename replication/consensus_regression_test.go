@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -66,9 +67,9 @@ func consensusBackup(t testing.TB) (*Replica, *captureBus) {
 		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 	}}
-	replica, err := Open(context.Background(), config, Dependencies{
+	replica, err := Open(simhook.WithIOOptions(context.Background(), simhook.IOOptions{SynchronousIO: true}), config, Dependencies{
 		Storage: storage, MessageBus: bus, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true,
+		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -187,14 +188,14 @@ func TestCanonicalInstallationPreservesCommittedPrefixAndTruncatesTraffic(t *tes
 		t.Fatal("third rejected")
 	}
 	consensusProcess(t, replica)
-	body := make([]byte, CheckpointStateSize+2*protocol.HeaderSize)
-	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	body := make([]byte, checkpointStateSize+2*protocol.HeaderSize)
+	if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:CheckpointStateSize+protocol.HeaderSize], &second, protocol.ChecksumAEGIS128L); err != nil {
+	if err := protocol.EncodeHeader(body[checkpointStateSize:checkpointStateSize+protocol.HeaderSize], &second, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize+protocol.HeaderSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
+	if err := protocol.EncodeHeader(body[checkpointStateSize+protocol.HeaderSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	view := protocol.Header{Group: replica.config.Group, View: 2, Author: 2, Command: protocol.CommandView}
@@ -225,11 +226,11 @@ func TestViewNonceRejectedBeforeRepairWindowMutation(t *testing.T) {
 	replica.status = StatusRecoveringHead
 	replica.getViewNonce = protocol.Nonce{1}
 	root := consensusRoot(t, replica)
-	body := make([]byte, CheckpointStateSize+protocol.HeaderSize)
-	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	body := make([]byte, checkpointStateSize+protocol.HeaderSize)
+	if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
+	if err := protocol.EncodeHeader(body[checkpointStateSize:], &root, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	header := protocol.Header{Group: replica.config.Group, View: 2, Author: 2, Command: protocol.CommandView}
@@ -318,12 +319,12 @@ func TestSameViewLaggingBackupRequestsAndInstallsView(t *testing.T) {
 	if reason != protocol.RejectNone || request.Command != protocol.CommandGetView {
 		t.Fatalf("gap response=%+v reason=%v", request, reason)
 	}
-	body := make([]byte, CheckpointStateSize+3*protocol.HeaderSize)
-	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	body := make([]byte, checkpointStateSize+3*protocol.HeaderSize)
+	if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
 	for index, header := range []protocol.Header{second, first, root} {
-		if err := protocol.EncodeHeader(body[CheckpointStateSize+index*protocol.HeaderSize:CheckpointStateSize+(index+1)*protocol.HeaderSize], &header, protocol.ChecksumAEGIS128L); err != nil {
+		if err := protocol.EncodeHeader(body[checkpointStateSize+index*protocol.HeaderSize:checkpointStateSize+(index+1)*protocol.HeaderSize], &header, protocol.ChecksumAEGIS128L); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -341,7 +342,7 @@ func TestRegistrationAdmissionCannotEvictPendingApplicationSession(t *testing.T)
 	config, storage, initial, wal, replies, sessions, superblocks := replicaFixture(t)
 	bus := &captureBus{}
 	machine := &testStateMachine{capacities: StateMachineCapacities{RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax), PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1}}
-	replica, err := newReplica(config, Dependencies{Storage: storage, MessageBus: bus, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}}, Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true}, initial, wal, replies, sessions, superblocks)
+	replica, err := newReplicaWithBlocks(config, Dependencies{Storage: storage, MessageBus: bus, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}}, Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine}, simhook.IOOptions{SynchronousIO: true}, initial, wal, replies, sessions, superblocks, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,12 +423,12 @@ func TestHandleViewSupersedesStaleRepairView(t *testing.T) {
 	replica, _ := consensusBackup(t)
 	root := consensusRoot(t, replica)
 	encodeViewBody := func(headers ...protocol.Header) []byte {
-		body := make([]byte, CheckpointStateSize+len(headers)*protocol.HeaderSize)
-		if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+		body := make([]byte, checkpointStateSize+len(headers)*protocol.HeaderSize)
+		if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 			t.Fatal(err)
 		}
 		for index := range headers {
-			start := CheckpointStateSize + index*protocol.HeaderSize
+			start := checkpointStateSize + index*protocol.HeaderSize
 			if err := protocol.EncodeHeader(body[start:start+protocol.HeaderSize], &headers[index], protocol.ChecksumAEGIS128L); err != nil {
 				t.Fatal(err)
 			}
@@ -501,12 +502,12 @@ func TestHandleViewSupersedesStaleRepairView(t *testing.T) {
 
 func encodeTestViewBody(t testing.TB, replica *Replica, headers ...protocol.Header) []byte {
 	t.Helper()
-	body := make([]byte, CheckpointStateSize+len(headers)*protocol.HeaderSize)
-	if err := replica.checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	body := make([]byte, checkpointStateSize+len(headers)*protocol.HeaderSize)
+	if err := replica.checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
 	for index := range headers {
-		start := CheckpointStateSize + index*protocol.HeaderSize
+		start := checkpointStateSize + index*protocol.HeaderSize
 		if err := protocol.EncodeHeader(body[start:start+protocol.HeaderSize], &headers[index], protocol.ChecksumAEGIS128L); err != nil {
 			t.Fatal(err)
 		}
@@ -737,9 +738,9 @@ func TestLaggingPrimarySelectCanonicalSuffixBridgesCommittedGap(t *testing.T) {
 		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 	}}
-	replica, err := Open(context.Background(), config, Dependencies{
+	replica, err := Open(simhook.WithIOOptions(context.Background(), simhook.IOOptions{SynchronousIO: true}), config, Dependencies{
 		Storage: storage, MessageBus: &captureBus{}, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: true}},
-		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true,
+		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -935,9 +936,9 @@ func consensusPrimary(t testing.TB, synchronized bool) (*Replica, *captureBus) {
 		RequestBytes: uint32(config.Cluster.ApplicationBatchSizeMax), ReplyBytes: uint32(config.Cluster.ApplicationReplySizeMax),
 		PrefetchMax: uint32(config.Cluster.PipelineMax), CheckpointMax: 1,
 	}}
-	replica, err := Open(context.Background(), config, Dependencies{
+	replica, err := Open(simhook.WithIOOptions(context.Background(), simhook.IOOptions{SynchronousIO: true}), config, Dependencies{
 		Storage: storage, MessageBus: bus, Clock: fixedClock{sample: TimeSample{Wall: 100, Monotonic: 10, Synchronized: synchronized}},
-		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine, SynchronousIO: true,
+		Entropy: bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8}), StateMachine: machine,
 	})
 	if err != nil {
 		t.Fatal(err)

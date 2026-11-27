@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/rs/zerolog"
 	"z.gfire.dev/supervsr/replication"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -73,10 +73,13 @@ type kvMachine struct {
 	lastObservedOp  protocol.Op
 	pendingSnapshot protocol.Op
 	frozenSnapshots [2]frozenSnapshot
-	logger          zerolog.Logger
+	logger          *slog.Logger
 }
 
-func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, compactionOps uint64, checksum protocol.ChecksumAlgorithm, logger zerolog.Logger) *kvMachine {
+func newKVMachine(directory string, group protocol.GroupID, memberCount uint8, messageSizeMax uint32, compactionOps uint64, checksum protocol.ChecksumAlgorithm, logger *slog.Logger) *kvMachine {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	return &kvMachine{
 		values: make(map[string][]byte, maxKeys), directory: directory, group: group,
 		memberCount: memberCount, messageSizeMax: messageSizeMax,
@@ -215,9 +218,7 @@ func (machine *kvMachine) StartCheckpoint(input replication.CheckpointInput, _ *
 		return replication.StartResult[replication.CheckpointManifest]{}, err
 	}
 	machine.pendingSnapshot = input.Op
-	event := machine.logger.Info()
-	event.Uint64("op", uint64(input.Op))
-	event.Msg("application checkpoint durable")
+	machine.logger.Info("application checkpoint durable", "op", uint64(input.Op))
 	return replication.Ready(replication.CheckpointManifest{}), nil
 }
 

@@ -242,19 +242,19 @@ func TestStateSyncPersistsRangeRepairsBlocksAndOpensCheckpoint(t *testing.T) {
 }
 
 func TestStateSyncDrainDoesNotAcknowledgeCompletedWALAppend(t *testing.T) {
-	handle := IOHandle{Index: 1, Generation: 2}
+	handle := ioHandle{Index: 1, Generation: 2}
 	replica := Replica{pipeline: make([]pipelineEntry, 1), pipelineLen: 1}
 	replica.pipeline[0].io = handle
-	replica.pipeline[0].ioKind = IOWALAppend
+	replica.pipeline[0].ioKind = ioWALAppend
 	replica.handleStateSyncDrainIO(ioCompletion{Handle: handle})
 	entry := &replica.pipeline[0]
-	if entry.io != (IOHandle{}) || entry.ioKind != 0 || entry.durable || entry.acks != 0 {
+	if entry.io != (ioHandle{}) || entry.ioKind != 0 || entry.durable || entry.acks != 0 {
 		t.Fatalf("drained entry=%+v", entry)
 	}
 }
 
 func TestStateSyncDrainFailsOnViewPersistenceError(t *testing.T) {
-	handle := IOHandle{Index: 1, Generation: 2}
+	handle := ioHandle{Index: 1, Generation: 2}
 	failure := errors.New("view persistence failed")
 	replica := Replica{viewIO: handle}
 	replica.handleStateSyncDrainIO(ioCompletion{Handle: handle, Err: failure})
@@ -284,15 +284,15 @@ func (*pendingReplayMachine) StartPrefetch(PrefetchInput, *SMCompletion) (StartR
 
 func makeStateSyncViewBody(t testing.TB, config Config, checkpoint CheckpointState) []byte {
 	t.Helper()
-	body := make([]byte, CheckpointStateSize+protocol.HeaderSize)
-	if err := checkpoint.encode(body[:CheckpointStateSize]); err != nil {
+	body := make([]byte, checkpointStateSize+protocol.HeaderSize)
+	if err := checkpoint.encode(body[:checkpointStateSize]); err != nil {
 		t.Fatal(err)
 	}
 	header, reason := protocol.DecodeHeader(checkpoint.Header[:], config.Group, uint32(config.Cluster.MessageSizeMax), config.Membership.ActiveCount+config.Membership.StandbyCount, protocol.ChecksumAEGIS128L)
 	if reason != protocol.RejectNone {
 		t.Fatalf("checkpoint header reason = %d", reason)
 	}
-	if err := protocol.EncodeHeader(body[CheckpointStateSize:], &header, protocol.ChecksumAEGIS128L); err != nil {
+	if err := protocol.EncodeHeader(body[checkpointStateSize:], &header, protocol.ChecksumAEGIS128L); err != nil {
 		t.Fatal(err)
 	}
 	return body

@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"testing"
-
-	"z.gfire.dev/supervsr/replication"
 )
 
 func TestStorageFaultWaitsForMatchingOperation(t *testing.T) {
@@ -19,7 +17,7 @@ func TestStorageFaultWaitsForMatchingOperation(t *testing.T) {
 	if err := storage.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.Arm(StorageFault{At: storage.NextOperation(), Kind: replication.IOWrite, Effect: FaultFail}); err != nil {
+	if err := storage.Arm(StorageFault{At: storage.NextOperation(), Kind: IOWrite, Effect: FaultFail}); err != nil {
 		t.Fatal(err)
 	}
 	var body [4]byte

@@ -176,7 +176,7 @@ func commonDivisor(left, right uint8) uint8 {
 	return left
 }
 
-func (budget *blockRepairBudget) Fulfill(reference BlockReference) int {
+func (budget *blockRepairBudget) Fulfill(reference BlockReference) (int, error) {
 	released := 0
 	for peer := range budget.memberCount {
 		entries := budget.peerEntries(protocol.ReplicaIndex(peer))
@@ -205,12 +205,12 @@ func (budget *blockRepairBudget) Fulfill(reference BlockReference) int {
 		}
 	}
 	if !budget.valid() {
-		panic(ErrReplicaInvariant)
+		return 0, ErrReplicaInvariant
 	}
-	return released
+	return released, nil
 }
 
-func (budget *blockRepairBudget) Expire(now uint64) int {
+func (budget *blockRepairBudget) Expire(now uint64) (int, error) {
 	expired := 0
 	for index := range budget.requests {
 		record := &budget.requests[index]
@@ -228,9 +228,9 @@ func (budget *blockRepairBudget) Expire(now uint64) int {
 		budget.releaseRequest(record)
 	}
 	if !budget.valid() {
-		panic(ErrReplicaInvariant)
+		return 0, ErrReplicaInvariant
 	}
-	return expired
+	return expired, nil
 }
 
 func (budget *blockRepairBudget) releaseEntry(peer protocol.ReplicaIndex, reference BlockReference, started uint64) bool {

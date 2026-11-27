@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"z.gfire.dev/supervsr/replication"
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -66,8 +67,8 @@ type node struct {
 	metrics        *replication.ReplicaMetrics
 	generation     uint64
 	pauseTicks     uint32
-	controller     *replication.IOController
-	ioEvents       []replication.IOEvent
+	controller     *simhook.IOController
+	ioEvents       []simhook.IOEvent
 	lastCheckpoint replication.CheckpointState
 }
 
@@ -89,7 +90,7 @@ type Cluster struct {
 	clients      []clientProcess
 	closed       bool
 	invariants   invariantState
-	layout       replication.WALLayout
+	layout       simhook.WALLayout
 	proofBuffer  []byte
 }
 
@@ -110,7 +111,10 @@ func NewCluster(ctx context.Context, config Config, factory MachineFactory) (*Cl
 	if config.ClientProcessesMax > config.MaximumPackets {
 		return nil, replication.ErrInvalidConfiguration
 	}
-	layout, ok := replication.DeriveWALLayout(config.Cluster)
+	layout, ok := simhook.DeriveWALLayout(
+		config.Cluster.SuperblockCopies, config.Cluster.JournalSlots, config.Cluster.MessageSizeMax,
+		config.Cluster.ClientsMax, config.Cluster.BlockSize,
+	)
 	if !ok {
 		return nil, replication.ErrInvalidConfiguration
 	}
@@ -406,14 +410,17 @@ func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaInde
 	var seed [8]byte
 	binary.LittleEndian.PutUint64(seed[:], node.generation<<8|(uint64(index)+1))
 	metrics := &replication.ReplicaMetrics{}
-	var controller *replication.IOController
+	var controller *simhook.IOController
 	if cluster.config.ControlledIO {
-		controller = replication.NewIOController()
+		controller = simhook.NewIOController()
 	}
-	replica, err := replication.Open(ctx, node.config, replication.Dependencies{
+	openCtx := simhook.WithIOOptions(ctx, simhook.IOOptions{
+		SynchronousIO: !cluster.config.ControlledIO,
+		Controller:    controller,
+	})
+	replica, err := replication.Open(openCtx, node.config, replication.Dependencies{
 		Storage: cluster.stores[index], MessageBus: cluster.network.ReplicaBus(index), Clock: cluster.memberClocks[index],
 		Entropy: bytes.NewReader(seed[:]), StateMachine: machine, Metrics: metrics,
-		SynchronousIO: !cluster.config.ControlledIO, IOController: controller,
 		BlockValidator: cluster.config.BlockValidator,
 	})
 	if err != nil {
@@ -424,7 +431,7 @@ func (cluster *Cluster) openNode(ctx context.Context, index protocol.ReplicaInde
 	node.metrics = metrics
 	node.controller = controller
 	if controller != nil {
-		node.ioEvents = make([]replication.IOEvent, controller.Capacity())
+		node.ioEvents = make([]simhook.IOEvent, controller.Capacity())
 	}
 	if err := cluster.network.RegisterReplica(index, replica.Submit); err != nil {
 		_ = replica.Close(context.Background())

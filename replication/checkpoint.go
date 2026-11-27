@@ -7,7 +7,7 @@ import (
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
-const CheckpointStateSize = 1024
+const checkpointStateSize = 1024
 
 var ErrInvalidCheckpoint = errors.New("replication: invalid checkpoint state")
 
@@ -51,7 +51,7 @@ type checkpointRules struct {
 }
 
 func (state *CheckpointState) encode(destination []byte) error {
-	if len(destination) != CheckpointStateSize {
+	if len(destination) != checkpointStateSize {
 		return ErrInvalidCheckpoint
 	}
 	clear(destination)
@@ -83,7 +83,7 @@ func (state *CheckpointState) encode(destination []byte) error {
 }
 
 func decodeCheckpointState(source []byte, validation checkpointRules) (CheckpointState, error) {
-	if len(source) != CheckpointStateSize || !checkpointReservationsZero(source) {
+	if len(source) != checkpointStateSize || !checkpointReservationsZero(source) {
 		return CheckpointState{}, ErrInvalidCheckpoint
 	}
 	var state CheckpointState
@@ -156,7 +156,7 @@ func (state *CheckpointState) validate(validation checkpointRules) error {
 }
 
 func (state *CheckpointState) ID(algorithm ChecksumAlgorithm) (protocol.CheckpointID, error) {
-	var encoded [CheckpointStateSize]byte
+	var encoded [checkpointStateSize]byte
 	if err := state.encode(encoded[:]); err != nil {
 		return protocol.CheckpointID{}, err
 	}
@@ -226,7 +226,7 @@ func allZeroBytes(input []byte) bool {
 }
 
 func checkpointReservationsZero(source []byte) bool {
-	if len(source) != CheckpointStateSize {
+	if len(source) != checkpointStateSize {
 		return false
 	}
 	return allZeroBytes(source[272:288]) &&

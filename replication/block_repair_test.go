@@ -306,7 +306,11 @@ func drainBlockRepairIO(t testing.TB, replica *Replica) {
 		case <-replica.io.Ready():
 			for {
 				var completion ioCompletion
-				if !replica.io.Poll(&completion) {
+				polled, err := replica.io.Poll(&completion)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !polled {
 					break
 				}
 				replica.handleBlockRepairIO(completion)

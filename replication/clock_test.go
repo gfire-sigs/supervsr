@@ -1,6 +1,8 @@
 package replication
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,3 +140,45 @@ type manualLocalClock struct {
 
 func (clock *manualLocalClock) Wall() uint64      { return clock.wall }
 func (clock *manualLocalClock) Monotonic() uint64 { return clock.monotonic }
+
+type atomicLocalClock struct {
+	wall      atomic.Uint64
+	monotonic atomic.Uint64
+}
+
+func (clock *atomicLocalClock) Wall() uint64      { return clock.wall.Load() }
+func (clock *atomicLocalClock) Monotonic() uint64 { return clock.monotonic.Load() }
+
+func TestClockSynchronizerConcurrentAccessAndObserverContract(t *testing.T) {
+	raw := &atomicLocalClock{}
+	raw.wall.Store(uint64(time.Hour))
+	raw.monotonic.Store(uint64(3 * time.Second))
+	clock, err := NewClockSynchronizer(raw, 0, 3, 2, DefaultProcessConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observer ClockObserver = clock
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			now := raw.Monotonic()
+			_ = observer.Observe(1, now-uint64(time.Millisecond), raw.Wall(), now)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			_ = clock.BeginPing()
+			_ = clock.Now()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 200 {
+			_, _ = clock.Interval()
+		}
+	}()
+	wg.Wait()
+}

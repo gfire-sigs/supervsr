@@ -68,7 +68,11 @@ func replyRecoveryFixture(t testing.TB) (*Replica, *crashStorage, *captureBus) {
 func completeReplyRecoveryIO(t testing.TB, replica *Replica) ioCompletion {
 	t.Helper()
 	var completion ioCompletion
-	if !replica.io.Poll(&completion) {
+	polled, err := replica.io.Poll(&completion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !polled {
 		t.Fatal("reply IO completion missing")
 	}
 	if !replica.handleReplyRepairIO(completion) {
@@ -98,8 +102,9 @@ func TestLatestReplyRepairRestoresDuplicateWithoutExecution(t *testing.T) {
 			}
 			replica.sendCachedReply(replyClient(&header), 1, replyRequest(&header))
 			var duplicate ioCompletion
-			if !replica.io.Poll(&duplicate) {
-				t.Fatal("duplicate read missing")
+			polled, pollErr := replica.io.Poll(&duplicate)
+			if pollErr != nil || !polled {
+				t.Fatalf("duplicate read missing: polled=%t err=%v", polled, pollErr)
 			}
 			replica.finishDuplicateRead(&replica.duplicateReads[0], duplicate)
 			if bus.clientCount() != 0 {
@@ -123,8 +128,8 @@ func TestLatestReplyRepairRestoresDuplicateWithoutExecution(t *testing.T) {
 			}
 			completeReplyRecoveryIO(t, replica)
 			replica.sendCachedReply(replyClient(&header), 1, replyRequest(&header))
-			if !replica.io.Poll(&duplicate) {
-				t.Fatal("repaired duplicate read missing")
+			if polled, pollErr := replica.io.Poll(&duplicate); pollErr != nil || !polled {
+				t.Fatalf("repaired duplicate read missing: polled=%t err=%v", polled, pollErr)
 			}
 			replica.finishDuplicateRead(&replica.duplicateReads[0], duplicate)
 			got, body, reason := protocol.DecodeFrame(bus.clientMessage(t, 0), replica.config.Group, uint32(replica.config.Cluster.MessageSizeMax), 2, protocol.ChecksumAEGIS128L)

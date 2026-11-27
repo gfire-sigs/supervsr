@@ -10,7 +10,7 @@ import (
 
 var (
 	ErrSessionCapacity = errors.New("replication: client session capacity exhausted")
-	ErrSessionEncoding = errors.New("replication: invalid session table encoding")
+	errSessionEncoding = errors.New("replication: invalid session table encoding")
 	ErrSessionChecksum = errors.New("replication: client session trailer checksum mismatch")
 )
 
@@ -159,13 +159,13 @@ func (table *sessionTable) Commit(reply protocol.Header, session protocol.Sessio
 
 func (table *sessionTable) CommitAt(plan sessionCommitPlan, reply protocol.Header, session protocol.Session) error {
 	if int(plan.Slot) >= len(table.records) || !table.busy[plan.Slot] {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if table.generations[plan.Slot] != plan.Generation || plan.Client != replyClient(&reply) {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if plan.Session != session || plan.ReplyChecksum != reply.HeaderChecksum {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if err := table.validateOccupied(reply, session); err != nil {
 		return err
@@ -212,7 +212,7 @@ func (table *sessionTable) TrailerSize() int {
 
 func (table *sessionTable) EncodeTrailer(destination []byte) (protocol.Checksum, error) {
 	if len(destination) != table.TrailerSize() {
-		return protocol.Checksum{}, ErrSessionEncoding
+		return protocol.Checksum{}, errSessionEncoding
 	}
 	for _, busy := range table.busy {
 		if busy {
@@ -229,7 +229,7 @@ func (table *sessionTable) EncodeTrailer(destination []byte) (protocol.Checksum,
 		header := record.Reply
 		start := slot * protocol.HeaderSize
 		if err := protocol.EncodeHeader(destination[start:start+protocol.HeaderSize], &header, table.config.ChecksumAlgorithm); err != nil || header.HeaderChecksum != record.Reply.HeaderChecksum {
-			return protocol.Checksum{}, ErrSessionEncoding
+			return protocol.Checksum{}, errSessionEncoding
 		}
 		binary.LittleEndian.PutUint64(destination[sessionsOffset+slot*8:], uint64(record.Session))
 	}
@@ -238,7 +238,7 @@ func (table *sessionTable) EncodeTrailer(destination []byte) (protocol.Checksum,
 
 func (table *sessionTable) DecodeTrailer(source []byte, expectedChecksum protocol.Checksum) error {
 	if len(source) != table.TrailerSize() {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	computed, err := protocol.ChecksumBytes(table.config.ChecksumAlgorithm, source)
 	if err != nil || computed != expectedChecksum {
@@ -252,18 +252,18 @@ func (table *sessionTable) DecodeTrailer(source []byte, expectedChecksum protoco
 		session := protocol.Session(binary.LittleEndian.Uint64(source[sessionsOffset+slot*8:]))
 		if session == 0 {
 			if !allZeroBytes(headerBytes) {
-				return ErrSessionEncoding
+				return errSessionEncoding
 			}
 			continue
 		}
 		header, reason := protocol.DecodeHeader(headerBytes, table.config.Group, table.config.MessageSizeMax, table.config.ActiveCount, table.config.ChecksumAlgorithm)
 		if reason != protocol.RejectNone || table.validateOccupied(header, session) != nil {
-			return ErrSessionEncoding
+			return errSessionEncoding
 		}
 		client := replyClient(&header)
 		for prior := range slot {
 			if decoded[prior].Session != 0 && replyClient(&decoded[prior].Reply) == client {
-				return ErrSessionEncoding
+				return errSessionEncoding
 			}
 		}
 		decoded[slot] = sessionRecord{Reply: header, Session: session}
@@ -313,21 +313,21 @@ func (table *sessionTable) evictionSlot() uint32 {
 
 func (table *sessionTable) validateOccupied(reply protocol.Header, session protocol.Session) error {
 	if session == 0 || reply.Command != protocol.CommandReply || reply.Protocol != protocol.ProtocolVersion || reply.Group != table.config.Group {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if reply.Size < protocol.HeaderSize || reply.Size > table.config.MessageSizeMax || uint32(reply.Size-protocol.HeaderSize) > table.config.ApplicationReplySizeMax {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if reply.Release == 0 || uint8(reply.Author) >= table.config.ActiveCount || replyClient(&reply).IsZero() {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	if replyCommit(&reply) < protocol.Op(session) || replyOp(&reply) != replyCommit(&reply) || replyTimestamp(&reply) == 0 {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	var encoded [protocol.HeaderSize]byte
 	copyOfReply := reply
 	if err := protocol.EncodeHeader(encoded[:], &copyOfReply, table.config.ChecksumAlgorithm); err != nil || copyOfReply.HeaderChecksum != reply.HeaderChecksum {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	context := protocol.ValidationContext{
 		Authenticated:           true,
@@ -342,7 +342,7 @@ func (table *sessionTable) validateOccupied(reply protocol.Header, session proto
 		ChecksumAlgorithm:       table.config.ChecksumAlgorithm,
 	}
 	if protocol.ValidateSemantics(&reply, nil, context) != protocol.RejectNone {
-		return ErrSessionEncoding
+		return errSessionEncoding
 	}
 	return nil
 }

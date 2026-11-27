@@ -138,7 +138,7 @@ func (replica *Replica) startScrubRead(address uint64) bool {
 		if !ok {
 			return false
 		}
-		handle, err := replica.io.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
+		handle, err := replica.io.Submit(ioOperation{Kind: ioRead, Offset: offset, Buffer: operation.buffer, Size: replica.config.Cluster.BlockSize})
 		if err != nil {
 			return false
 		}

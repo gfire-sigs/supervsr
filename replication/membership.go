@@ -61,7 +61,7 @@ func (membership Membership) LocalIndex() (protocol.ReplicaIndex, bool) {
 
 func (membership Membership) Primary(view protocol.View) protocol.ReplicaIndex {
 	if membership.ActiveCount == 0 {
-		panic(ErrInvalidMembership)
+		return 0
 	}
 	return protocol.ReplicaIndex(uint32(view) % uint32(membership.ActiveCount))
 }

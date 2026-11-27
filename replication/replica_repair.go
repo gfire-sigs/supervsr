@@ -2,6 +2,7 @@ package replication
 
 import (
 	"encoding/binary"
+	"errors"
 
 	"z.gfire.dev/supervsr/replication/protocol"
 )
@@ -17,7 +18,7 @@ const (
 type repairRead struct {
 	busy     bool
 	kind     repairReadKind
-	handle   IOHandle
+	handle   ioHandle
 	peer     protocol.ReplicaIndex
 	op       protocol.Op
 	client   protocol.ClientID
@@ -154,7 +155,7 @@ func (replica *Replica) startRepairRead(kind repairReadKind, peer protocol.Repli
 			continue
 		}
 		buffer := read.buffer[:size]
-		handle, err := replica.io.Submit(ioOperation{Kind: IORead, Offset: offset, Buffer: buffer, Size: size})
+		handle, err := replica.io.Submit(ioOperation{Kind: ioRead, Offset: offset, Buffer: buffer, Size: size})
 		if err != nil {
 			return false
 		}
@@ -272,11 +273,19 @@ func (replica *Replica) handleRepairTimeout(sample TimeSample) {
 	}
 	if replica.stateSync.repliesPending {
 		replica.continueReplyRepair(sample.Monotonic)
-		if replica.replyRepair.handle != (IOHandle{}) {
+		if replica.replyRepair.handle != (ioHandle{}) {
 			return
 		}
 	}
-	replica.repairBudget.Expire(sample.Monotonic)
+	expired, err := replica.repairBudget.Expire(sample.Monotonic)
+	if err != nil {
+		replica.fail(err)
+		return
+	}
+	if expired > 0 && replica.metrics != nil {
+		replica.metrics.repairStalls.Add(uint64(expired))
+		replica.metrics.repairPeerRotations.Add(uint64(expired))
+	}
 	if replica.repairViewValid {
 		replica.continueRecoveringViewWithRetry(sample.Monotonic, true)
 		return
@@ -353,6 +362,9 @@ func (replica *Replica) sendGetHeadersRange(peer protocol.ReplicaIndex, start, e
 	binary.LittleEndian.PutUint64(header.Fields[8:16], uint64(end))
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
+		if replica.metrics != nil {
+			replica.metrics.repairRequests.Add(1)
+		}
 	}
 	message.Release()
 }
@@ -378,6 +390,10 @@ func (replica *Replica) randomRepairPeer() (protocol.ReplicaIndex, bool) {
 func (replica *Replica) handleHeaders(header protocol.Header, body []byte) {
 	if replica.repairWrite.busy {
 		return
+	}
+	if replica.metrics != nil {
+		replica.metrics.repairResponses.Add(1)
+		replica.metrics.repairBytes.Add(uint64(header.Size))
 	}
 	if replica.repairViewWindow {
 		replica.handleRepairWindowHeaders(header, body)
@@ -530,12 +546,12 @@ func (replica *Replica) continueRecoveringView(now uint64) {
 }
 
 func (replica *Replica) continueRecoveringViewWithRetry(now uint64, retryPending bool) {
-	if replica.repairWrite.busy || replica.viewIO != (IOHandle{}) {
+	if replica.repairWrite.busy || replica.viewIO != (ioHandle{}) {
 		return
 	}
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
-		if entry.io != (IOHandle{}) || entry.stage != CommitStageIdle {
+		if entry.io != (ioHandle{}) || entry.stage != CommitStageIdle {
 			return
 		}
 	}
@@ -742,7 +758,7 @@ func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {
 	}
 	for offset := range replica.pipelineLen {
 		entry := replica.pipelineEntry(offset)
-		if prepareOp(&entry.header) > ancestor && (entry.io != (IOHandle{}) || entry.stage != CommitStageIdle) {
+		if prepareOp(&entry.header) > ancestor && (entry.io != (ioHandle{}) || entry.stage != CommitStageIdle) {
 			return false
 		}
 	}
@@ -751,7 +767,7 @@ func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {
 		if prepareOp(&entry.header) <= ancestor {
 			break
 		}
-		if entry.io != (IOHandle{}) || entry.stage != CommitStageIdle {
+		if entry.io != (ioHandle{}) || entry.stage != CommitStageIdle {
 			return false
 		}
 		if entry.prepare != nil {
@@ -772,13 +788,25 @@ func (replica *Replica) truncatePipelineAfter(ancestor protocol.Op) bool {
 
 func (replica *Replica) sendGetPrepare(now uint64) {
 	op := prepareOp(&replica.repairHeader)
-	peer, ok := replica.repairBudget.Reserve(op, now, &replica.random)
+	peer, ok, err := replica.repairBudget.Reserve(op, now, &replica.random)
+	if err != nil {
+		replica.fail(err)
+		return
+	}
 	if !ok {
+		if replica.metrics != nil {
+			replica.metrics.repairStalls.Add(1)
+		}
 		return
 	}
 	message, err := replica.frames.Acquire(0)
 	if err != nil {
-		replica.repairBudget.Complete(op, now)
+		if replica.metrics != nil && errors.Is(err, protocol.ErrFramePoolEmpty) {
+			replica.metrics.framePoolBackpressure.Add(1)
+		}
+		if _, budgetErr := replica.repairBudget.Complete(op, now); budgetErr != nil {
+			replica.fail(budgetErr)
+		}
 		return
 	}
 	header := protocol.Header{Group: replica.config.Group, Protocol: protocol.ProtocolVersion, Command: protocol.CommandGetPrepare, Author: replica.local}
@@ -786,8 +814,11 @@ func (replica *Replica) sendGetPrepare(now uint64) {
 	binary.LittleEndian.PutUint64(header.Fields[32:40], uint64(op))
 	if message.Seal(&header, replica.config.Cluster.ChecksumAlgorithm) == nil {
 		replica.deps.MessageBus.SendReplica(peer, message)
-	} else {
-		replica.repairBudget.Complete(op, now)
+		if replica.metrics != nil {
+			replica.metrics.repairRequests.Add(1)
+		}
+	} else if _, budgetErr := replica.repairBudget.Complete(op, now); budgetErr != nil {
+		replica.fail(budgetErr)
 	}
 	message.Release()
 }
@@ -802,13 +833,20 @@ func (replica *Replica) handleRepairPrepare(message *Message, header protocol.He
 		!replica.safeRepairHeader(header) {
 		return false
 	}
-	replica.repairBudget.Complete(op, sample.Monotonic)
+	if _, err := replica.repairBudget.Complete(op, sample.Monotonic); err != nil {
+		replica.fail(err)
+		return false
+	}
+	if replica.metrics != nil {
+		replica.metrics.repairResponses.Add(1)
+		replica.metrics.repairBytes.Add(uint64(header.Size))
+	}
 	frame, err := message.Bytes()
 	if err != nil {
 		return false
 	}
 	handle, err := replica.io.Submit(ioOperation{
-		Kind: IOWALAppend, Buffer: frame, walJournal: replica.wal,
+		Kind: ioWALAppend, Buffer: frame, walJournal: replica.wal,
 		ReusableThrough: replica.checkpoint.PrepareOp(),
 	})
 	if err != nil {

@@ -10,8 +10,8 @@ import (
 type replyRepairRuntime struct {
 	faults      []protocol.Checksum
 	buffer      []byte
-	handle      IOHandle
-	kind        IOKind
+	handle      ioHandle
+	kind        ioKind
 	header      protocol.Header
 	plan        sessionCommitPlan
 	message     *Message
@@ -53,14 +53,14 @@ func (replica *Replica) markReplyIdentityFault(client protocol.ClientID, op prot
 }
 
 func (replica *Replica) replyRepairBlocksCommit() bool {
-	return replica.replyRepair.kind == IOReplyWrite
+	return replica.replyRepair.kind == ioReplyWrite
 }
 
 func (replica *Replica) continueReplyRepair(now uint64) bool {
 	repair := &replica.replyRepair
 	waitingForBlocks := replica.stateSync.repairing && !replica.stateSync.repliesPending
 	waitingForReplay := replica.stateSync.replayRunning || (replica.stateSync.repliesPending && replica.commitMin < max(replica.stateSync.commit, replica.commitMax))
-	if replica.stateSync.stage != syncStageIdle || waitingForBlocks || waitingForReplay || repair.handle != (IOHandle{}) {
+	if replica.stateSync.stage != syncStageIdle || waitingForBlocks || waitingForReplay || repair.handle != (ioHandle{}) {
 		return false
 	}
 	if repair.scanning {
@@ -74,12 +74,12 @@ func (replica *Replica) continueReplyRepair(now uint64) bool {
 				repair.cursor++
 				continue
 			}
-			handle, err := replica.io.Submit(ioOperation{Kind: IOReplyRead, Offset: uint64(slot), Buffer: repair.buffer, durableReplyStore: replica.replies, ExpectedHeader: record.Reply})
+			handle, err := replica.io.Submit(ioOperation{Kind: ioReplyRead, Offset: uint64(slot), Buffer: repair.buffer, durableReplyStore: replica.replies, ExpectedHeader: record.Reply})
 			if err != nil {
 				return false
 			}
 			repair.cursor++
-			repair.handle, repair.kind, repair.header = handle, IOReplyRead, record.Reply
+			repair.handle, repair.kind, repair.header = handle, ioReplyRead, record.Reply
 			return true
 		}
 		repair.scanning = false
@@ -128,6 +128,9 @@ func (replica *Replica) continueReplyRepair(now uint64) bool {
 		repair.nextRequest = saturatingAdd(now, repair.delay)
 		repair.delay = min(repair.delay*2, uint64(replica.config.Process.BackoffMax))
 		replica.deps.MessageBus.SendReplica(peer, message)
+		if replica.metrics != nil {
+			replica.metrics.repairRequests.Add(1)
+		}
 		message.Release()
 		return true
 	}
@@ -136,13 +139,17 @@ func (replica *Replica) continueReplyRepair(now uint64) bool {
 		replica.stateSync.repliesPending = false
 		replica.stateSync.repairing = false
 		replica.syncRangeRepaired = true
+		if replica.metrics != nil && replica.stateSync.started != 0 {
+			replica.metrics.stateSyncDurationNanos.Store(elapsedSince(replica.stateSync.started, now))
+		}
+		replica.stateSync.started = 0
 	}
 	return false
 }
 
 func (replica *Replica) handleReplyRepair(message *Message, header protocol.Header) bool {
 	repair := &replica.replyRepair
-	if replica.stateSync.stage != syncStageIdle || repair.handle != (IOHandle{}) || replica.stage != CommitStageIdle || repair.requested.HeaderChecksum != header.HeaderChecksum {
+	if replica.stateSync.stage != syncStageIdle || repair.handle != (ioHandle{}) || replica.stage != CommitStageIdle || repair.requested.HeaderChecksum != header.HeaderChecksum {
 		return false
 	}
 	expected, slot, found := replica.sessions.RepairReply(replyClient(&header), replyOp(&header), header.HeaderChecksum)
@@ -164,25 +171,29 @@ func (replica *Replica) handleReplyRepair(message *Message, header protocol.Head
 	}
 	// Reserve the slot until the physical write finishes, not merely until its callback becomes obsolete.
 	repair.faults[slot] = protocol.Checksum{}
-	handle, err := replica.io.Submit(ioOperation{Kind: IOReplyWrite, Offset: uint64(slot), Buffer: frame, durableReplyStore: replica.replies})
+	handle, err := replica.io.Submit(ioOperation{Kind: ioReplyWrite, Offset: uint64(slot), Buffer: frame, durableReplyStore: replica.replies})
 	if err != nil {
 		replica.sessions.Abort(plan)
 		repair.faults[slot] = header.HeaderChecksum
 		return false
 	}
-	repair.handle, repair.kind, repair.header = handle, IOReplyWrite, expected
+	repair.handle, repair.kind, repair.header = handle, ioReplyWrite, expected
 	repair.plan, repair.message = plan, message
+	if replica.metrics != nil {
+		replica.metrics.repairResponses.Add(1)
+		replica.metrics.repairBytes.Add(uint64(header.Size))
+	}
 	return true
 }
 
 func (replica *Replica) handleReplyRepairIO(completion ioCompletion) bool {
 	repair := &replica.replyRepair
-	if repair.handle == (IOHandle{}) || repair.handle != completion.Handle || repair.kind != completion.Kind {
+	if repair.handle == (ioHandle{}) || repair.handle != completion.Handle || repair.kind != completion.Kind {
 		return false
 	}
 	header, kind := repair.header, repair.kind
-	repair.handle, repair.kind, repair.header = IOHandle{}, 0, protocol.Header{}
-	if kind == IOReplyWrite {
+	repair.handle, repair.kind, repair.header = ioHandle{}, 0, protocol.Header{}
+	if kind == ioReplyWrite {
 		replica.sessions.Abort(repair.plan)
 		repair.plan = sessionCommitPlan{}
 		repair.message.Release()
@@ -190,8 +201,10 @@ func (replica *Replica) handleReplyRepairIO(completion ioCompletion) bool {
 		repair.requested = protocol.Header{}
 		if completion.Err != nil {
 			replica.fail(completion.Err)
+		} else if replica.metrics != nil {
+			replica.metrics.replyRepairs.Add(1)
 		}
-	} else if !errors.Is(completion.Err, ErrIOCanceled) && (completion.Err != nil || completion.Size != uint64(header.Size)) {
+	} else if !errors.Is(completion.Err, errIOCanceled) && (completion.Err != nil || completion.Size != uint64(header.Size)) {
 		replica.markReplyFault(header)
 	}
 	return true

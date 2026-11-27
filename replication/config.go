@@ -181,7 +181,7 @@ func (cfg ClusterConfig) Validate(activeCount, standbyCount uint8) error {
 	return nil
 }
 
-func (cfg ClusterConfig) FingerprintEncoding() [136]byte {
+func (cfg ClusterConfig) fingerprintEncoding() [136]byte {
 	fields := [...]uint64{
 		cfg.CacheLineSize,
 		cfg.ClientsMax,
@@ -211,9 +211,13 @@ func (cfg ClusterConfig) FingerprintEncoding() [136]byte {
 // Fingerprint returns the 128-bit configuration checksum stored in superblocks
 // and verified on startup to detect incompatible cluster parameters.
 func (cfg ClusterConfig) Fingerprint() protocol.Checksum {
-	encoded := cfg.FingerprintEncoding()
+	encoded := cfg.fingerprintEncoding()
 	if cfg.ChecksumAlgorithm == ChecksumAEGIS128L {
-		return mustChecksumBytes(ChecksumAEGIS128L, encoded[:])
+		checksum, err := protocol.ChecksumBytes(ChecksumAEGIS128L, encoded[:])
+		if err != nil {
+			return protocol.Checksum{}
+		}
+		return checksum
 	}
 	if !cfg.ChecksumAlgorithm.Valid() {
 		return protocol.Checksum{}
@@ -221,13 +225,9 @@ func (cfg ClusterConfig) Fingerprint() protocol.Checksum {
 	var withAlgorithm [137]byte
 	copy(withAlgorithm[:], encoded[:])
 	withAlgorithm[136] = byte(cfg.ChecksumAlgorithm)
-	return mustChecksumBytes(cfg.ChecksumAlgorithm, withAlgorithm[:])
-}
-
-func mustChecksumBytes(algorithm ChecksumAlgorithm, input []byte) protocol.Checksum {
-	checksum, err := protocol.ChecksumBytes(algorithm, input)
+	checksum, err := protocol.ChecksumBytes(cfg.ChecksumAlgorithm, withAlgorithm[:])
 	if err != nil {
-		panic(err)
+		return protocol.Checksum{}
 	}
 	return checksum
 }

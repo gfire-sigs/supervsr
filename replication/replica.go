@@ -5,13 +5,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log/slog"
 	"math/bits"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/rs/zerolog"
-
+	"z.gfire.dev/supervsr/replication/internal/simhook"
 	"z.gfire.dev/supervsr/replication/protocol"
 )
 
@@ -37,9 +37,7 @@ type Dependencies struct {
 	ReleaseExecutor ReleaseExecutor
 	BlockValidator  BlockValidator
 	Metrics         *ReplicaMetrics
-	Logger          *zerolog.Logger
-	SynchronousIO   bool
-	IOController    *IOController
+	Logger          *slog.Logger
 }
 
 type replicaInitialState struct {
@@ -96,28 +94,29 @@ type queuedRequest struct {
 
 type duplicateRead struct {
 	busy   bool
-	handle IOHandle
+	handle ioHandle
 	header protocol.Header
 	client protocol.ClientID
 	buffer []byte
 }
 
 type pipelineEntry struct {
-	generation    uint64
-	prepare       *Message
-	header        protocol.Header
-	acks          uint16
-	durable       bool
-	quorum        bool
-	io            IOHandle
-	ioKind        IOKind
-	stage         CommitStage
-	token         PrefetchToken
-	completion    SMCompletion
-	reply         *Message
-	replyHeader   protocol.Header
-	replyPlan     sessionCommitPlan
-	lastBroadcast uint64
+	generation       uint64
+	prepare          *Message
+	header           protocol.Header
+	acks             uint16
+	durable          bool
+	quorum           bool
+	io               ioHandle
+	ioKind           ioKind
+	stage            CommitStage
+	token            PrefetchToken
+	completion       SMCompletion
+	reply            *Message
+	replyHeader      protocol.Header
+	replyPlan        sessionCommitPlan
+	createdMonotonic uint64
+	lastBroadcast    uint64
 }
 
 type joinRecord struct {
@@ -133,7 +132,7 @@ type joinRecord struct {
 
 type repairWrite struct {
 	busy    bool
-	handle  IOHandle
+	handle  ioHandle
 	message *Message
 	op      protocol.Op
 }
@@ -146,13 +145,14 @@ type upgradeWindow struct {
 }
 
 type Replica struct {
-	config     Config
-	membership Membership
-	local      protocol.ReplicaIndex
-	quorums    Quorums
-	deps       Dependencies
-	logger     zerolog.Logger
-	metrics    *ReplicaMetrics
+	config        Config
+	membership    Membership
+	local         protocol.ReplicaIndex
+	quorums       Quorums
+	deps          Dependencies
+	clockObserver ClockObserver
+	logger        *slog.Logger
+	metrics       *ReplicaMetrics
 
 	status                  Status
 	view                    protocol.View
@@ -211,10 +211,12 @@ type Replica struct {
 	exitViewAt             [ActiveMax]uint64
 	abdicated              bool
 	viewChangeStalled      bool
+	viewChangeStarted      uint64
+	lastTickMonotonic      uint64
 	joins                  []joinRecord
 	joinHeaders            []protocol.Header
 	canonicalHeaders       []protocol.Header
-	viewIO                 IOHandle
+	viewIO                 ioHandle
 	viewInstall            bool
 	pendingView            protocol.View
 	viewCommit             protocol.Op
@@ -260,7 +262,7 @@ type Replica struct {
 	joinViewBits           uint16
 
 	accepting          atomic.Bool
-	submitters         atomic.Int64
+	submitMu           sync.RWMutex
 	runState           atomic.Uint32
 	loopMu             sync.RWMutex
 	publishedSnapshot  atomic.Pointer[ReplicaSnapshot]
@@ -268,6 +270,8 @@ type Replica struct {
 	stop               chan struct{}
 	done               chan struct{}
 	shutdownStarted    atomic.Bool
+	shutdownCtx        context.Context
+	shutdownCancel     context.CancelCauseFunc
 	shutdownCompletion SMCompletion
 	shutdownGeneration uint64
 	shutdownErr        error
@@ -278,10 +282,10 @@ type Replica struct {
 }
 
 func newReplica(config Config, dependencies Dependencies, initial replicaInitialState, wal *walJournal, replyStore *durableReplyStore, sessions *sessionTable, superblocks *superblockStore) (*Replica, error) {
-	return newReplicaWithBlocks(config, dependencies, initial, wal, replyStore, sessions, superblocks, nil)
+	return newReplicaWithBlocks(config, dependencies, simhook.IOOptions{}, initial, wal, replyStore, sessions, superblocks, nil)
 }
 
-func newReplicaWithBlocks(config Config, dependencies Dependencies, initial replicaInitialState, wal *walJournal, replyStore *durableReplyStore, sessions *sessionTable, superblocks *superblockStore, blocks *blockRuntime) (*Replica, error) {
+func newReplicaWithBlocks(config Config, dependencies Dependencies, ioOptions simhook.IOOptions, initial replicaInitialState, wal *walJournal, replyStore *durableReplyStore, sessions *sessionTable, superblocks *superblockStore, blocks *blockRuntime) (*Replica, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -360,14 +364,11 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial repl
 	}
 	blockIOCount := max(config.Process.RepairReadsMax, config.Process.ScrubWriteConcurrency)
 	requestCount := config.Process.JournalWriteConcurrency + config.Process.ReplyReadConcurrency + config.Process.ReplyWriteConcurrency + config.Process.RepairReadsMax + blockIOCount + 4
-	ioEngine, err := newIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)), dependencies.SynchronousIO, dependencies.IOController)
+	ioEngine, err := newIOEngine(dependencies.Storage, requestCount, min(requestCount, uint32(4)), ioOptions.SynchronousIO, ioOptions.Controller)
 	if err != nil {
 		return nil, err
 	}
-	logger := zerolog.Nop()
-	if dependencies.Logger != nil {
-		logger = *dependencies.Logger
-	}
+	clockObserver, _ := dependencies.Clock.(ClockObserver)
 	metrics := dependencies.Metrics
 	if metrics == nil {
 		metrics = &ReplicaMetrics{}
@@ -448,13 +449,15 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial repl
 	if checkpointSession == nil {
 		checkpointSession = make([]byte, sessions.TrailerSize())
 	}
+	shutdownCtx, shutdownCancel := context.WithCancelCause(context.Background())
 	replica := &Replica{
 		config:               config,
 		membership:           config.Membership,
 		local:                local,
 		quorums:              quorums,
 		deps:                 dependencies,
-		logger:               logger,
+		clockObserver:        clockObserver,
+		logger:               dependencies.Logger,
 		metrics:              metrics,
 		status:               initial.Status,
 		view:                 initial.View,
@@ -512,6 +515,8 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial repl
 		stateSync:            stateSyncRuntime{headers: make([]protocol.Header, int(config.Cluster.PipelineMax+1))},
 		stop:                 make(chan struct{}),
 		done:                 make(chan struct{}),
+		shutdownCtx:          shutdownCtx,
+		shutdownCancel:       shutdownCancel,
 	}
 	replica.seedScrubCatalog(initial.Checkpoint)
 	if replica.blockAllocator != nil {
@@ -530,6 +535,9 @@ func newReplicaWithBlocks(config Config, dependencies Dependencies, initial repl
 		_ = ioEngine.Close(context.Background())
 		return nil, err
 	}
+	metrics.framePoolCapacity.Store(uint64(frames.Capacity()))
+	metrics.ioCapacity.Store(uint64(len(ioEngine.slots)))
+	replica.updateMetricGauges(initialTime.Monotonic)
 	replica.accepting.Store(true)
 	return replica, nil
 }
@@ -562,7 +570,7 @@ func (replica *Replica) computeSnapshot() ReplicaSnapshot {
 	if replica.pipelineLen > 0 {
 		entry := replica.pipelineEntry(0)
 		commitStage = entry.stage
-		prepareWritePending = entry.ioKind == IOWALAppend
+		prepareWritePending = entry.ioKind == ioWALAppend
 		committing = entry.stage >= CommitStageCheckpointDurable && prepareOp(&entry.header) == replica.commitMin
 	}
 	return ReplicaSnapshot{
@@ -591,8 +599,11 @@ func (replica *Replica) DurableChecksum(op protocol.Op) (protocol.Checksum, bool
 // frame ownership and releases it once processed; on error, the caller retains
 // ownership and must call Release. Safe for concurrent calls.
 func (replica *Replica) Submit(frame *protocol.Frame) error {
-	replica.submitters.Add(1)
-	defer replica.submitters.Add(-1)
+	if !replica.accepting.Load() {
+		return ErrReplicaClosed
+	}
+	replica.submitMu.RLock()
+	defer replica.submitMu.RUnlock()
 	if !replica.accepting.Load() {
 		return ErrReplicaClosed
 	}
@@ -712,7 +723,12 @@ func (replica *Replica) Process(limit int) (int, error) {
 		default:
 		}
 		var completion ioCompletion
-		if replica.io.Poll(&completion) {
+		polled, pollErr := replica.io.Poll(&completion)
+		if pollErr != nil {
+			replica.fail(pollErr)
+			return processed, pollErr
+		}
+		if polled {
 			if replica.stateSync.stage == syncStageCancelingStorage {
 				replica.handleStateSyncDrainIO(completion)
 			} else {
@@ -755,7 +771,7 @@ func (replica *Replica) Process(limit int) (int, error) {
 		drained, err := replica.processReleaseActivation(limit - processed)
 		return processed + drained, err
 	}
-	if !replica.stateSyncAwaitingOpen() && replica.pendingView > replica.view && replica.viewIO == (IOHandle{}) && !replica.commitInFlight() {
+	if !replica.stateSyncAwaitingOpen() && replica.pendingView > replica.view && replica.viewIO == (ioHandle{}) && !replica.commitInFlight() {
 		replica.resumePendingViewChange()
 	}
 	if replica.stateSync.stage == syncStageIdle && !replica.stateSync.replayRunning && !replica.stateSyncAwaitingOpen() {
@@ -768,6 +784,9 @@ func (replica *Replica) Process(limit int) (int, error) {
 		replica.advanceCommit()
 	}
 	replica.dispatchStateSync()
+	if processed > 0 && replica.deps.Clock != nil {
+		replica.updateMetricGauges(replica.deps.Clock.Now().Monotonic)
+	}
 	if replica.fatalErr != nil {
 		return processed, replica.fatalErr
 	}
@@ -780,17 +799,35 @@ func (replica *Replica) Process(limit int) (int, error) {
 
 // Close halts acceptance of new frames, resets the state machine, drains
 // I/O and worker goroutines, and closes both StateMachine and Storage.
+// Canceling ctx aborts waiting on pending reset or I/O without leaking
+// shutdown goroutines while still releasing owned frames and closing resources.
 func (replica *Replica) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	replica.accepting.Store(false)
 	if replica.runState.CompareAndSwap(0, 2) {
 		replica.startShutdown()
 	} else {
 		replica.stopOnce.Do(func() { close(replica.stop) })
 	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		if replica.shutdownCancel != nil {
+			replica.shutdownCancel(ctx.Err())
+		}
+	})
+	defer stopCancel()
 	select {
 	case <-replica.done:
 		return replica.shutdownErr
 	case <-ctx.Done():
+		if replica.shutdownCancel != nil {
+			replica.shutdownCancel(ctx.Err())
+		}
+		<-replica.done
+		if replica.shutdownErr != nil {
+			return replica.shutdownErr
+		}
 		return ctx.Err()
 	}
 }
@@ -804,29 +841,38 @@ func (replica *Replica) startShutdown() {
 }
 
 func (replica *Replica) finishShutdown() {
-	defer close(replica.done)
+	defer func() {
+		if replica.shutdownCancel != nil {
+			replica.shutdownCancel(nil)
+		}
+		close(replica.done)
+	}()
 	replica.accepting.Store(false)
-	for replica.submitters.Load() != 0 {
-		time.Sleep(time.Millisecond)
-	}
+	replica.submitMu.Lock()
+	replica.submitMu.Unlock()
 	replica.recoveryLifecycle.Lock()
 	if replica.recoveryCancel != nil {
 		replica.recoveryCancel()
 	}
 	replica.recoveryLifecycle.Unlock()
 	replica.recoveryWorkers.Wait()
+	shutdownCtx := replica.shutdownCtx
+	if shutdownCtx == nil {
+		shutdownCtx = context.Background()
+	}
 	replica.shutdownGeneration++
 	generation := replica.shutdownGeneration
 	replica.shutdownCompletion.prepare(generation, replica)
 	reset, err := replica.deps.StateMachine.StartReset(&replica.shutdownCompletion)
 	if err != nil {
+		replica.shutdownCompletion.release(generation)
 		replica.shutdownErr = errors.Join(ErrStateMachine, err)
 	} else if reset.IsReady() {
 		replica.shutdownCompletion.release(generation)
 	} else {
-		replica.waitForReset(generation)
+		replica.waitForReset(shutdownCtx, generation)
 	}
-	if err := replica.io.Close(context.Background()); err != nil && replica.shutdownErr == nil {
+	if err := replica.io.Close(shutdownCtx); err != nil && replica.shutdownErr == nil {
 		replica.shutdownErr = err
 	}
 	replica.drainShutdownEvents(generation)
@@ -839,7 +885,7 @@ func (replica *Replica) finishShutdown() {
 	}
 }
 
-func (replica *Replica) waitForReset(generation uint64) {
+func (replica *Replica) waitForReset(ctx context.Context, generation uint64) {
 	for {
 		if replica.drainShutdownEvents(generation) {
 			return
@@ -847,6 +893,12 @@ func (replica *Replica) waitForReset(generation uint64) {
 		select {
 		case <-replica.notify:
 		case <-replica.io.Ready():
+		case <-ctx.Done():
+			replica.shutdownCompletion.release(generation)
+			if replica.shutdownErr == nil {
+				replica.shutdownErr = context.Cause(ctx)
+			}
+			return
 		}
 	}
 }
@@ -854,7 +906,17 @@ func (replica *Replica) waitForReset(generation uint64) {
 func (replica *Replica) drainShutdownEvents(generation uint64) bool {
 	resetComplete := false
 	var completion ioCompletion
-	for replica.io.Poll(&completion) {
+	for {
+		polled, pollErr := replica.io.Poll(&completion)
+		if pollErr != nil {
+			if replica.shutdownErr == nil {
+				replica.shutdownErr = pollErr
+			}
+			break
+		}
+		if !polled {
+			break
+		}
 	}
 	var event replicaEvent
 	for replica.events.TryPop(&event) {
@@ -904,7 +966,7 @@ func (replica *Replica) releaseOwnedFrames() {
 
 func (replica *Replica) transition(to Status, cause transitionCause) error {
 	if !validStatusTransition(replica.status, to, cause) {
-		return ErrStatusTransition
+		return errStatusTransition
 	}
 	replica.status = to
 	return replica.checkInvariants()
@@ -972,16 +1034,71 @@ func (replica *Replica) fail(err error) {
 	if replica.fatalErr == nil {
 		replica.fatalErr = err
 		replica.accepting.Store(false)
-		event := replica.logger.Error()
-		event.Err(err)
-		event.Uint32("view", uint32(replica.view))
-		event.Uint64("head", uint64(replica.headOp))
-		event.Msg("replica fail-stop")
+		if replica.logger != nil && replica.logger.Enabled(context.Background(), slog.LevelError) {
+			replica.logger.LogAttrs(
+				context.Background(),
+				slog.LevelError,
+				"replica fail-stop",
+				slog.Any("error", err),
+				slog.Uint64("view", uint64(replica.view)),
+				slog.Uint64("head", uint64(replica.headOp)),
+			)
+		}
 	}
 }
 
 func (replica *Replica) handleTick(sample TimeSample) {
+	if replica.lastTickMonotonic != 0 && sample.Monotonic > replica.lastTickMonotonic {
+		elapsed := sample.Monotonic - replica.lastTickMonotonic
+		expected := uint64(replica.config.Process.Tick)
+		if expected != 0 && elapsed > expected && replica.metrics != nil {
+			replica.metrics.eventLoopLagNanos.Store(elapsed - expected)
+		} else if replica.metrics != nil {
+			replica.metrics.eventLoopLagNanos.Store(0)
+		}
+	}
+	replica.lastTickMonotonic = sample.Monotonic
 	replica.tickTimers(sample)
+	replica.updateMetricGauges(sample.Monotonic)
+}
+
+func (replica *Replica) updateMetricGauges(now uint64) {
+	metrics := replica.metrics
+	if metrics == nil {
+		return
+	}
+	metrics.status.Store(uint64(replica.status))
+	metrics.view.Store(uint64(replica.view))
+	metrics.logView.Store(uint64(replica.logView))
+	metrics.headOp.Store(uint64(replica.headOp))
+	metrics.commitMin.Store(uint64(replica.commitMin))
+	metrics.commitMax.Store(uint64(replica.commitMax))
+	metrics.checkpointOp.Store(uint64(replica.checkpoint.PrepareOp()))
+	metrics.pipelineDepth.Store(uint64(replica.pipelineLen))
+	metrics.stateSyncStage.Store(uint64(replica.stateSync.stage))
+	metrics.faultDetectorEWMANanos.Store(replica.failureDetector.ewma)
+	metrics.faultDetectorLevel.Store(uint64(replica.failureDetector.Level(now)))
+	if replica.frames != nil {
+		metrics.framePoolAvailable.Store(uint64(replica.frames.Available()))
+	}
+	if replica.io != nil {
+		metrics.ioInFlight.Store(uint64(len(replica.io.slots) - replica.io.Available()))
+	}
+	blockDebt := uint64(0)
+	for index := range replica.blockRepairTargets {
+		state := replica.blockRepairTargets[index].state
+		if state != 0 && state != blockRepairDurable {
+			blockDebt++
+		}
+	}
+	metrics.stateSyncBlockDebt.Store(blockDebt)
+	replyDebt := uint64(0)
+	for index := range replica.replyRepair.faults {
+		if !replica.replyRepair.faults[index].IsZero() {
+			replyDebt++
+		}
+	}
+	metrics.stateSyncReplyDebt.Store(replyDebt)
 }
 
 func (replica *Replica) handleSMCompletion(event replicaEvent) {

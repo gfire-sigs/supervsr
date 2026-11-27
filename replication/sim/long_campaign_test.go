@@ -238,7 +238,7 @@ func (world *ledgerWorld) final() {
 	world.check(world.cluster.CheckInvariants())
 }
 
-func (world *ledgerWorld) waitIO(member protocol.ReplicaIndex, kind replication.IOKind, phase replication.IOPhase) ScheduledIO {
+func (world *ledgerWorld) waitIO(member protocol.ReplicaIndex, kind IOKind, phase IOPhase) ScheduledIO {
 	for range 20_000 {
 		for range 32 {
 			count := world.cluster.PendingIO(world.events)
@@ -319,7 +319,7 @@ func runLongFaultCampaign(t *testing.T, seed uint64) {
 	})
 	world.phase = "sync_crash_at_barrier"
 	world.cluster.Network().HealAll()
-	barrier := world.waitIO(lagging, replication.IOSuperblockPersist, replication.IOPhaseSync)
+	barrier := world.waitIO(lagging, IOSuperblockPersist, IOPhaseSync)
 	world.advance(barrier)
 	world.check(world.cluster.Crash(t.Context(), lagging))
 	world.check(world.cluster.Restart(t.Context(), lagging))
@@ -327,9 +327,9 @@ func runLongFaultCampaign(t *testing.T, seed uint64) {
 		world.fail("old incarnation IO accepted: %v", err)
 	}
 	world.phase = "sync_suffix_write_error"
-	write := world.waitIO(lagging, replication.IOWALAppend, replication.IOPhaseWrite)
+	write := world.waitIO(lagging, IOWALAppend, IOPhaseWrite)
 	storage := world.cluster.Storage(lagging)
-	world.check(storage.Arm(StorageFault{At: storage.NextOperation(), Kind: replication.IOWrite, Effect: FaultFail}))
+	world.check(storage.Arm(StorageFault{At: storage.NextOperation(), Kind: IOWrite, Effect: FaultFail}))
 	world.expectedFault = &lagging
 	world.advance(write)
 	world.until(20_000, func() bool { return world.faults == 1 })
@@ -366,7 +366,7 @@ func TestControlledSmallTopologiesRecoverWithoutDuplicateEffects(t *testing.T) {
 			world.phase = "pending_append_crash"
 			victim := world.primary()
 			world.submit(client)
-			barrier := world.waitIO(victim, replication.IOWALAppend, replication.IOPhaseSync)
+			barrier := world.waitIO(victim, IOWALAppend, IOPhaseSync)
 			world.advance(barrier)
 			world.check(world.cluster.Crash(t.Context(), victim))
 			completed := world.history.Completed()
