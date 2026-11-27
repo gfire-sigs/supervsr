@@ -808,7 +808,8 @@ func TestTransportLoopbackClusterAndClient(t *testing.T) {
 	cluster.CompactionOps = 16
 
 	process := replication.DefaultProcessConfig()
-	process.Tick = 5 * time.Millisecond
+	process.Tick = 25 * time.Millisecond
+	process.BackoffMin = 25 * time.Millisecond
 	process.BackoffMax = 250 * time.Millisecond
 	clock := testClock{start: time.Now().Add(-time.Second)}
 

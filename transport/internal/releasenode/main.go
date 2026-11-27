@@ -227,8 +227,8 @@ func runMain() error {
 	}
 
 	process := replication.DefaultProcessConfig()
-	process.Tick = 5 * time.Millisecond
-	process.BackoffMin = 10 * time.Millisecond
+	process.Tick = 25 * time.Millisecond
+	process.BackoffMin = 25 * time.Millisecond
 	process.BackoffMax = 500 * time.Millisecond
 
 	sm := &taggedStateMachine{

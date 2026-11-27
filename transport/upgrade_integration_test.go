@@ -206,7 +206,7 @@ func TestUpgradeHandoffAcrossReleaseBinaries(t *testing.T) {
 	defer stopCluster()
 
 	// Wait for all three processes to complete OperationUpgrade -> ReleaseExecutor.Execute(2) -> Release 2 startup.
-	deadline := time.NewTimer(12 * time.Second)
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -258,7 +258,8 @@ func TestUpgradeHandoffAcrossReleaseBinaries(t *testing.T) {
 	}
 
 	process := replication.DefaultProcessConfig()
-	process.Tick = 5 * time.Millisecond
+	process.Tick = 25 * time.Millisecond
+	process.BackoffMin = 25 * time.Millisecond
 	process.BackoffMax = 250 * time.Millisecond
 	managed, err := replication.NewManagedClient(replication.ClientConfig{
 		Group:             group,

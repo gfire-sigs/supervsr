@@ -164,7 +164,8 @@ func TestReplaceEnforcesFencingAndFormatsReplacementAgainstLiveCluster(t *testin
 	copy(peerAddrs[:3], addrs[:])
 
 	process := replication.DefaultProcessConfig()
-	process.Tick = 5 * time.Millisecond
+	process.Tick = 25 * time.Millisecond
+	process.BackoffMin = 25 * time.Millisecond
 	clock := systemClock{start: time.Now().Add(-time.Second)}
 
 	runCtx, cancelRun := context.WithCancel(t.Context())
