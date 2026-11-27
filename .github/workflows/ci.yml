@@ -39,7 +39,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Check formatting
-        run: test -z "$(gofmt -l replication cmd)"
+        run: test -z "$(gofmt -l replication cmd transport)"
       - name: Static analysis
         run: |
           go vet ./...

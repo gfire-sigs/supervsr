@@ -2,13 +2,13 @@
 
 Viewstamped Replication (VSR) consensus, WAL storage, and block checkpointing in Go.
 
-`supervsr` is a replicated state-machine engine modeled on TigerBeetle's VSR design. It injects storage, networking, clocks, randomness, and application execution through interfaces so production servers and deterministic fault simulations run the same state transitions. Callers supply their own network transport, authenticating and forwarding `protocol.Frame` buffers through `MessageBus` and `Replica.Submit`.
+`supervsr` is a replicated state-machine engine modeled on TigerBeetle's VSR design. It injects storage, networking, clocks, randomness, and application execution through interfaces so production servers and deterministic fault simulations run the same state transitions. Deployments can use the reference TCP `transport` package (with opt-in mutual TLS in `transport/mtls`) or supply a custom `MessageBus` that authenticates and forwards `protocol.Frame` buffers through `Replica.Submit`.
 
 - **Cluster topology**: 1 to 6 active replicas plus up to 6 standbys (`MembersMax = 12`) with validated quorum intersection.
 - **Single-file layout**: Preallocated replica file holding 4, 6, or 8 superblock copies, WAL header rings and prepare slots, client reply slots, and block-addressed checkpoints.
-- **Platforms and storage**: Go 1.27.4+ with platform-native `FileStorage` on Linux (`O_DIRECT`, `fallocate`), macOS (`F_NOCACHE`, `F_FULLFSYNC`, `F_PREALLOCATE`), Windows (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, `FileAllocationInfo`, `FlushFileBuffers`), and portable buffered fallback on other OSes.
+- **Platforms and storage**: Go 1.25+ with platform-native `FileStorage` on Linux (`O_DIRECT`, `fallocate`), macOS (`F_NOCACHE`, `F_FULLFSYNC`, `F_PREALLOCATE`), Windows (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`, `FileAllocationInfo`, `FlushFileBuffers`), and portable buffered fallback on other OSes.
 - **Checksums**: 128-bit `ChecksumAEGIS128L` by default (hardware AES on x86-64/ARM64 with automatic portable fallback, plus opt-in `RequireHardwareChecksum` on `FormatConfig` and `ProcessConfig`) or `ChecksumWyhash128` (`ClusterConfig.ChecksumAlgorithm`), bound into the superblock configuration fingerprint.
-- **Dependencies**: Only `github.com/rs/zerolog` and `golang.org/x/sys`.
+- **Dependencies**: Only `golang.org/x/sys` (logging uses stdlib `log/slog`, and `transport` avoids `crypto/tls` unless `transport/mtls` is imported).
 
 ```sh
 go run ./cmd/toykv -data ./toykv-data -replicas 3
@@ -41,7 +41,7 @@ Enter `put KEY VALUE`, `get KEY`, `delete KEY` (`del`), or `quit` at the prompt.
 - Pipelined consensus (`PipelineMax` up to 15) with `ExitView`, `JoinView`, and `View` failover, canonical suffix selection, and log truncation.
 - Exactly-once client sessions with request hash chaining, durable reply caching, and cross-replica reply repair.
 - Incremental compaction boundaries (`CompactionOps`), block-addressed checkpoints via `CheckpointBlockTransaction`, and peer state sync when a replica lags behind retained WAL.
-- Background storage scrubbing (`ScrubCycle`) and `ReplaceLostReplica` for fencing failed nodes before formatting replacements.
+- Background storage scrubbing (`ScrubCycle`), read-only superblock inspection (`InspectStorage`), and `ReplaceLostReplica` for fencing failed nodes before formatting replacements (exposed safely via `cmd/vsradm`).
 - Deterministic fault simulator in `replication/sim` covering network partitions, clock drift, storage faults, controlled I/O scheduling, and per-step invariant checks.
 
 ## Usage
@@ -255,9 +255,12 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 
 | Path | Responsibility |
 | --- | --- |
-| `replication/` | VSR `Replica`, `Client`, `ManagedClient`, `FileStorage`, `ClockSynchronizer`, `CheckpointBlockTransaction`, scrubbing, and `ReplaceLostReplica`, backed by an internal WAL, superblock store, block store/allocator, I/O engine, and MPSC ring. |
+| `replication/` | VSR `Replica`, `Client`, `ManagedClient`, `FileStorage`, `ClockSynchronizer`, `CheckpointBlockTransaction`, scrubbing, `InspectStorage`, and `ReplaceLostReplica`, backed by an internal WAL, superblock store, block store/allocator, I/O engine, and MPSC ring. |
 | `replication/protocol/` | 256-byte fixed headers, `FramePool`, source binding, semantic validation, and 128-bit checksums (`ChecksumAEGIS128L` with AVX-AES, NEON-AES, and portable fallback; `ChecksumWyhash128`). |
-| `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`, `IOController`), `LedgerMachine`, and global invariant checks. |
+| `replication/sim/` | Deterministic simulator (`Cluster`, `Network`, `Storage`, `Clock`), `LedgerMachine`, and global invariant checks. |
+| `transport/` | TCP `ReplicaTransport` and `ClientTransport` implementing `MessageBus`, header-first frame validation, bounded send queues, reconnect backoff, and `PlainAuthenticator` (zero `crypto/tls` dependency). |
+| `transport/mtls/` | Opt-in TLS 1.3 mutual-certificate `Authenticator` binding verified peer certificates to `MemberID`/`ReplicaIndex` and `ClientID`. |
+| `cmd/vsradm/` | Operational CLI for confirmed `format`, read-only `inspect`, and fence-enforced `replace`. |
 | `cmd/toykv/` | Local multi-replica in-process cluster demo and KV REPL. |
 | `docs/` | Step-by-step VSR guide ([docs/vsr-guide.md](docs/vsr-guide.md)) and editorial SVG/HTML architecture diagrams (`docs/diagrams/`). |
 | `formal/` | TLA+ specifications (`VSR.tla`, `VSRConsensus`, `MPSCRing.tla`) verified in CI. |
@@ -268,7 +271,7 @@ Compaction and checkpoint persistence are intentionally offset by one `Compactio
 ### Verification
 
 ```sh
-gofmt -l replication cmd
+gofmt -l replication cmd transport
 go vet ./...
 go install github.com/gosuda/JustGoodPractices/cmd/gojgp@v1.3.0
 gojgp lint ./...
@@ -286,7 +289,7 @@ VSR_LONG_SEED_START=1 VSR_LONG_SEED_COUNT=2 go test ./replication/sim -run '^Tes
 - TLA+/TLC runs only in CI; finite model bounds do not establish refinement of the Go implementation. `MPSCRing.tla` models `mpscRing` 1:1, whereas `VSR.tla` models active voting replicas across `normal`, `view-change`, and `crashed` states; `StatusRecovering`, `StatusRecoveringHead`, non-voting standbys, checkpoint compaction, and state sync are verified by `replication/sim` rather than TLC.
 - `TestFoundationDBFaultCampaign` exercises swizzle-clogging, correlated reboots, overlapping stalls, and 14 storage fault modes below the first checkpoint; `TestLongDeterministicFaultCampaign` crosses at least eight checkpoint boundaries and four journal wraps per seed against a non-idempotent `LedgerMachine` and bounded history oracle.
 - With `sim.Config.ControlledIO`, `PendingIO` and `AdvanceIO` drive queued `IOEngine` work deterministically, while `Format`, `Open`, and synchronous state-machine block calls stay immediate.
-- `FileStorage` fault tests inject errors over real files; they do not simulate physical power loss or prove a device's `fsync` contract. Process tests exercise replacement, backup/restore, and release handoff using a single executable rather than mixed-version binaries.
+- `FileStorage` fault tests inject errors over real files; they do not simulate physical power loss or prove a device's `fsync` contract. Multi-process release handoff and rollback rejection are exercised over loopback TCP in `transport` (`TestUpgradeHandoffAcrossReleaseBinaries`) using two separately compiled release binaries.
 
 ### Contributing
 
