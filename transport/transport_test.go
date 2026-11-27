@@ -809,6 +809,7 @@ func TestTransportLoopbackClusterAndClient(t *testing.T) {
 
 	process := replication.DefaultProcessConfig()
 	process.Tick = 5 * time.Millisecond
+	process.BackoffMax = 250 * time.Millisecond
 	clock := testClock{start: time.Now().Add(-time.Second)}
 
 	var listeners [3]net.Listener
@@ -900,7 +901,7 @@ func TestTransportLoopbackClusterAndClient(t *testing.T) {
 	}
 
 	clientID := protocol.ClientID{77}
-	var managed *replication.ManagedClient
+	var managedPtr atomic.Pointer[replication.ManagedClient]
 	clientTr, err := NewClientTransport(ClientConfig{
 		Group:             group,
 		ClientID:          clientID,
@@ -912,18 +913,15 @@ func TestTransportLoopbackClusterAndClient(t *testing.T) {
 		BackoffMin:        10 * time.Millisecond,
 		BackoffMax:        50 * time.Millisecond,
 		OnFrame: func(from protocol.ReplicaIndex, raw []byte) {
-			if managed != nil {
-				managed.HandleFrame(from, raw)
+			if client := managedPtr.Load(); client != nil {
+				client.HandleFrame(from, raw)
 			}
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clientTr.Start(runCtx); err != nil {
-		t.Fatal(err)
-	}
-	managed, err = replication.NewManagedClient(replication.ClientConfig{
+	managed, err := replication.NewManagedClient(replication.ClientConfig{
 		Group:             group,
 		ID:                clientID,
 		Release:           1,
@@ -935,8 +933,12 @@ func TestTransportLoopbackClusterAndClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	managedPtr.Store(managed)
+	if err := clientTr.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
 
-	opCtx, cancelOp := context.WithTimeout(t.Context(), 5*time.Second)
+	opCtx, cancelOp := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancelOp()
 	if err := managed.Register(opCtx); err != nil {
 		t.Fatalf("Register over TCP transport failed: %v", err)

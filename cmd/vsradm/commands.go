@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"z.gfire.dev/supervsr/replication"
@@ -204,7 +205,7 @@ func runReplace(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		clientID[0] = 1
 	}
 
-	var managed *replication.ManagedClient
+	var managedPtr atomic.Pointer[replication.ManagedClient]
 	clientTr, err := transport.NewClientTransport(transport.ClientConfig{
 		Group:             resolved.Group,
 		ClientID:          clientID,
@@ -216,26 +217,19 @@ func runReplace(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		BackoffMin:        20 * time.Millisecond,
 		BackoffMax:        250 * time.Millisecond,
 		OnFrame: func(from protocol.ReplicaIndex, raw []byte) {
-			if managed != nil {
-				managed.HandleFrame(from, raw)
+			if client := managedPtr.Load(); client != nil {
+				client.HandleFrame(from, raw)
 			}
 		},
 	})
 	if err != nil {
 		return err
 	}
-	if err := clientTr.Start(opCtx); err != nil {
-		return err
-	}
-	defer func() {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer closeCancel()
-		_ = clientTr.Close(closeCtx)
-	}()
 
 	process := replication.DefaultProcessConfig()
 	process.Tick = 10 * time.Millisecond
-	managed, err = replication.NewManagedClient(replication.ClientConfig{
+	process.BackoffMax = time.Second
+	managed, err := replication.NewManagedClient(replication.ClientConfig{
 		Group:             resolved.Group,
 		ID:                clientID,
 		Release:           resolved.Release,
@@ -247,7 +241,17 @@ func runReplace(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	if err != nil {
 		return err
 	}
-	defer func() { _ = managed.Close() }()
+	managedPtr.Store(managed)
+	if err := clientTr.Start(opCtx); err != nil {
+		_ = managed.Close()
+		return err
+	}
+	defer func() {
+		_ = managed.Close()
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer closeCancel()
+		_ = clientTr.Close(closeCtx)
+	}()
 
 	if err := replication.ReplaceLostReplica(opCtx, replication.ReplacementConfig{
 		Group:                 resolved.Group,

@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,7 +236,7 @@ func TestUpgradeHandoffAcrossReleaseBinaries(t *testing.T) {
 	clientID := protocol.ClientID{0x42}
 	var peerAddrs [replication.MembersMax]string
 	copy(peerAddrs[:3], addrs[:])
-	var managed *replication.ManagedClient
+	var managedPtr atomic.Pointer[replication.ManagedClient]
 	clientTr, err := NewClientTransport(ClientConfig{
 		Group:             group,
 		ClientID:          clientID,
@@ -247,26 +248,19 @@ func TestUpgradeHandoffAcrossReleaseBinaries(t *testing.T) {
 		BackoffMin:        10 * time.Millisecond,
 		BackoffMax:        50 * time.Millisecond,
 		OnFrame: func(from protocol.ReplicaIndex, raw []byte) {
-			if managed != nil {
-				managed.HandleFrame(from, raw)
+			if client := managedPtr.Load(); client != nil {
+				client.HandleFrame(from, raw)
 			}
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := clientTr.Start(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = clientTr.Close(closeCtx)
-	}()
 
 	process := replication.DefaultProcessConfig()
 	process.Tick = 5 * time.Millisecond
-	managed, err = replication.NewManagedClient(replication.ClientConfig{
+	process.BackoffMax = 250 * time.Millisecond
+	managed, err := replication.NewManagedClient(replication.ClientConfig{
 		Group:             group,
 		ID:                clientID,
 		Release:           2,
@@ -278,9 +272,18 @@ func TestUpgradeHandoffAcrossReleaseBinaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = managed.Close() }()
+	managedPtr.Store(managed)
+	if err := clientTr.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		managed.Close()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = clientTr.Close(closeCtx)
+	}()
 
-	opCtx, cancelOp := context.WithTimeout(t.Context(), 12*time.Second)
+	opCtx, cancelOp := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancelOp()
 	if err := managed.Register(opCtx); err != nil {
 		t.Fatalf("post-upgrade Register failed: %v", err)
